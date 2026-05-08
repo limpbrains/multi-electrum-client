@@ -170,8 +170,19 @@ export class ElectrumManager {
     return this.lifecycle;
   }
 
-  /** Connect every server in parallel. Errors do not throw; they fire `error` events. */
+  /**
+   * Connect every server in parallel. Errors do not throw; they fire
+   * `error` events. Only valid from `created` (fresh manager) or
+   * `stopped` (re-init after a terminal stop). To wake from `suspended`
+   * use `resume()`; calling `start()` instead would re-install the
+   * tip subscription on top of a live one and skip queue draining.
+   */
   async start(): Promise<void> {
+    if (this.lifecycle !== 'created' && this.lifecycle !== 'stopped') {
+      throw new SuspendedError(
+        `cannot start from ${this.lifecycle}; use resume() to wake a suspended manager`,
+      );
+    }
     this.stopped = false;
     this.lifecycle = 'running';
     const tasks = [...this.clients.values()].map(async (c) => {
@@ -295,7 +306,12 @@ export class ElectrumManager {
     );
     // Clear discover timers — they'd fire against dead sockets and route
     // via policy.pick to a different server. The next `resume()` re-arms
-    // them on every `connected` transition.
+    // them on every `connected` transition. Caveat: a client that fails
+    // to reconnect on resume() never fires `connected` and therefore
+    // never re-arms its discover timer; peer discovery for that endpoint
+    // dies until the user manually `removeServer` + `addServer`s, or the
+    // client eventually reconnects via the underlying transport's
+    // backoff.
     for (const t of this.discoverTimers.values()) clearTimeout(t);
     this.discoverTimers.clear();
     // Tip becomes stale across suspend; cache writes are gated until
@@ -306,7 +322,13 @@ export class ElectrumManager {
     this.tipHeight = undefined;
     this.tipUnsub = null;
     // Note: registry / suspendQueue / cache state preserved.
-    this.lifecycle = 'suspended';
+    // Race: a concurrent `stop()` may have flipped lifecycle to 'stopped'
+    // while we were awaiting the disconnect. Don't clobber that — the
+    // stopped flag is terminal. Cast widens the TS-narrowed literal so the
+    // runtime check survives the type system's view.
+    if ((this.lifecycle as LifecycleState) !== 'stopped') {
+      this.lifecycle = 'suspended';
+    }
   }
 
   /**
@@ -335,6 +357,20 @@ export class ElectrumManager {
         }
       }),
     );
+    // Race check: a concurrent `stop()` may have flipped lifecycle to
+    // 'stopped' while we awaited reconnects. Bail before re-installing
+    // the headers subscription / draining the queue (which would
+    // dispatch through call() against soon-to-be-disconnected clients).
+    // Cast through LifecycleState because TS narrows `lifecycle` from the
+    // earlier `=== 'suspended'` check and doesn't know a concurrent stop()
+    // can mutate it across awaits.
+    if ((this.lifecycle as LifecycleState) === 'stopped') {
+      while (this.suspendQueue.length > 0) {
+        const item = this.suspendQueue.shift()!;
+        item.def.reject(new SuspendedError('manager stopped during resume'));
+      }
+      return;
+    }
     // Re-install the tip subscription if a cache was configured. `tipUnsub`
     // was cleared inside `suspend()`; it should always be `null` here.
     if (this.cache && this.tipUnsub === null) {
@@ -351,6 +387,17 @@ export class ElectrumManager {
       } catch (e) {
         this.emit('error', e);
       }
+    }
+    // Re-check after the second await for the same race window.
+    // Cast through LifecycleState because TS narrows `lifecycle` from the
+    // earlier `=== 'suspended'` check and doesn't know a concurrent stop()
+    // can mutate it across awaits.
+    if ((this.lifecycle as LifecycleState) === 'stopped') {
+      while (this.suspendQueue.length > 0) {
+        const item = this.suspendQueue.shift()!;
+        item.def.reject(new SuspendedError('manager stopped during resume'));
+      }
+      return;
     }
     // Drain order matters: splice the queue while we're still `resuming`
     // (so any call() that lands between this line and the lifecycle flip
@@ -415,6 +462,12 @@ export class ElectrumManager {
     // calls submitted between the state flip to `resuming` and the final
     // flip to `running` don't race ahead of items already in the queue —
     // ordering would otherwise break.
+    //
+    // `failOnSuspend` is consumed at queue-time only: a call that joins
+    // the queue without it set will not be re-checked at drain time
+    // (lifecycle is `running` then anyway). If the caller wants to abort
+    // a queued call mid-suspend, use `opts.signal` (AbortSignal) — the
+    // same signal ref is forwarded into the re-issued call on drain.
     if (
       this.lifecycle === 'suspending' ||
       this.lifecycle === 'suspended' ||
