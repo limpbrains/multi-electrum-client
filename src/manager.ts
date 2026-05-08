@@ -1,9 +1,10 @@
 // ElectrumManager — orchestrates a pool of ElectrumClient instances behind a
 // RoutingPolicy. Single entry point for callers; transparent failover, partial-
-// batch retry, microtask auto-batch coalescing, per-client telemetry. M2 ships
-// the orchestration core; subscriptions (M4), cache (M3), lifecycle suspend/
-// resume (M5), and TCP/TLS transports (M6) plug in here in subsequent
-// milestones.
+// batch retry, microtask auto-batch coalescing, per-client telemetry, typed
+// method registry + namespace API (M3). Subscriptions + classifier + peer
+// discovery (M4), cache (also M4 — needs the headers subscription to track
+// finality), lifecycle suspend/resume (M5), and TCP/TLS transports (M6) plug
+// in here in subsequent milestones.
 
 import type { ClientId, ClientView, ConnectionState, Endpoint, Telemetry } from './client.js';
 import { ElectrumClient } from './client.js';
@@ -15,12 +16,16 @@ import {
   type ErrorKind,
 } from './errors/types.js';
 import type { PickContext, RoutingPolicy } from './policy/types.js';
+import type { MethodName, ParamsOf, ResultOf } from './protocol/methods.js';
 import type {
   BatchRequest,
   CallOpts,
   ManagerOptions,
   Network,
+  RawTxHex,
+  Scripthash,
   ServerSpec,
+  TxId,
 } from './protocol/types.js';
 import type { Transport } from './transport/types.js';
 import { WsTransport } from './transport/ws.js';
@@ -139,12 +144,23 @@ export class ElectrumManager {
     this.meta.delete(id);
   }
 
-  /** Direct or auto-batched single call. */
-  async call<T = unknown>(
-    method: string,
-    params: readonly unknown[] = [],
+  /**
+   * Typed call. The single conditional signature picks param/result types from
+   * the method registry when `method` is a known wire name and falls back to
+   * `readonly unknown[]` / `unknown` otherwise. This shape is necessary —
+   * splitting into two overloads would let bad params for a known method
+   * silently fall through to the escape-hatch overload.
+   *
+   *   const bal = await manager.call('blockchain.scripthash.get_balance', [hash]);
+   *   //    ^? Balance
+   *   const x = (await manager.call('vendor.specific', [1, 2])) as MyType;
+   */
+  call<M extends string>(
+    method: M,
+    params: M extends MethodName ? ParamsOf<M> : readonly unknown[],
     opts?: CallOpts,
-  ): Promise<T> {
+  ): Promise<M extends MethodName ? ResultOf<M> : unknown>;
+  async call(method: string, params: readonly unknown[] = [], opts?: CallOpts): Promise<unknown> {
     const useBatch = opts?.autoBatch ?? this.autoBatchEnabled;
     if (useBatch) {
       const def = deferred<unknown>();
@@ -156,15 +172,53 @@ export class ElectrumManager {
         attempt: 0,
         excluded: new Set(),
       });
-      return def.promise as Promise<T>;
+      return def.promise;
     }
-    return this.runAttempts(
-      method,
-      params,
-      new Set<ClientId>(),
-      this.maxAttemptsFor(opts),
-      0,
-    ) as Promise<T>;
+    return this.runAttempts(method, params, new Set<ClientId>(), this.maxAttemptsFor(opts), 0);
+  }
+
+  /**
+   * Friendly camelCase namespace API generated from the method registry.
+   * Each member is a thin `call` wrapper with the right param tuple typed in.
+   * Both arrow functions and the underlying `call` resolve through the same
+   * routing pipeline (auto-batch coalescing, retry, telemetry).
+   */
+  readonly scripthash = {
+    getBalance: (hash: Scripthash, opts?: CallOpts) =>
+      this.call('blockchain.scripthash.get_balance', [hash], opts),
+    getHistory: (hash: Scripthash, opts?: CallOpts) =>
+      this.call('blockchain.scripthash.get_history', [hash], opts),
+    listUnspent: (hash: Scripthash, opts?: CallOpts) =>
+      this.call('blockchain.scripthash.listunspent', [hash], opts),
+    subscribe: (hash: Scripthash, opts?: CallOpts) =>
+      this.call('blockchain.scripthash.subscribe', [hash], opts),
+    unsubscribe: (hash: Scripthash, opts?: CallOpts) =>
+      this.call('blockchain.scripthash.unsubscribe', [hash], opts),
+  };
+
+  readonly transaction = {
+    get: (txid: TxId, opts?: CallOpts) => this.call('blockchain.transaction.get', [txid], opts),
+    broadcast: (rawTx: RawTxHex, opts?: CallOpts) =>
+      this.call('blockchain.transaction.broadcast', [rawTx], opts),
+    getMerkle: (txid: TxId, height: number, opts?: CallOpts) =>
+      this.call('blockchain.transaction.get_merkle', [txid, height], opts),
+  };
+
+  readonly headers = {
+    subscribe: (opts?: CallOpts) => this.call('blockchain.headers.subscribe', [], opts),
+    getHeader: (height: number, opts?: CallOpts) =>
+      this.call('blockchain.block.header', [height], opts),
+  };
+
+  readonly server = {
+    ping: (opts?: CallOpts) => this.call('server.ping', [], opts),
+    version: (clientName: string, protocolVersion: string, opts?: CallOpts) =>
+      this.call('server.version', [clientName, protocolVersion], opts),
+    banner: (opts?: CallOpts) => this.call('server.banner', [], opts),
+  };
+
+  estimateFee(confirmationTarget: number, opts?: CallOpts) {
+    return this.call('blockchain.estimatefee', [confirmationTarget], opts);
   }
 
   /**
@@ -177,7 +231,10 @@ export class ElectrumManager {
     return Promise.all(
       reqs.map(async (r): Promise<Result<T>> => {
         try {
-          const v = await this.call<T>(r.method, r.params, opts);
+          // r.method is a runtime string (not a literal), so call resolves to
+          // Promise<unknown> via the conditional return type. Caller asserts
+          // the per-request result via the batch's `<T>`.
+          const v = (await this.call(r.method, r.params, opts)) as T;
           return ok(v);
         } catch (e) {
           return err(e as Error);
