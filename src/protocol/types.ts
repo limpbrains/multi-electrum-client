@@ -11,6 +11,7 @@
 
 import type { CacheStore } from '../cache/types.js';
 import type { ClientId, Protocol } from '../client.js';
+import type { DiscoverOptions } from '../discovery.js';
 import type { ErrorClassifier } from '../errors/types.js';
 import type { RoutingPolicy } from '../policy/types.js';
 
@@ -228,4 +229,10 @@ export interface ManagerOptions {
   reconnectBackoff?: ReconnectBackoff;
   cooldownMs?: number;
   finalizedConfs?: number;
+  /**
+   * Optional peer discovery. When `enabled`, the manager calls
+   * `server.peers.subscribe` on every connect (and periodically afterward)
+   * and admits ws/wss peers it doesn't already have. See `DiscoverOptions`.
+   */
+  discover?: DiscoverOptions;
 }
