@@ -494,10 +494,27 @@ export class ElectrumManager {
     }
   }
 
+  /**
+   * Add a server to the pool. Coordinated with lifecycle:
+   *  - `running`: connect immediately.
+   *  - `created`: install only; `start()` will connect.
+   *  - `suspending` / `suspended`: install only; the next `resume()` will
+   *    connect along with the rest of the pool. An eager connect here
+   *    would defeat suspend (a fresh socket goes live while the manager
+   *    is supposed to be paused).
+   *  - `resuming`: connect immediately. resume()'s reconnect snapshot was
+   *    already captured, so we wire this one up ourselves.
+   *  - `stopped`: throws — terminal state.
+   */
   addServer(spec: ServerSpec): void {
+    if (this.lifecycle === 'stopped') {
+      throw new SuspendedError('cannot addServer on a stopped manager');
+    }
     this.installServer(spec);
     const client = this.clients.get(spec.id);
     if (!client) return;
+    if (this.lifecycle === 'created') return;
+    if (this.lifecycle === 'suspending' || this.lifecycle === 'suspended') return;
     client.connect().catch((e) => this.emit('error', e));
   }
 
