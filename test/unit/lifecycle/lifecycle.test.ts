@@ -449,6 +449,46 @@ describe('Manager lifecycle — suspend / resume', () => {
     await manager.stop();
   });
 
+  it('cross-direction transition: resume() during in-flight suspend() lands on running', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    // Issue an in-flight call so suspend has work to do during its grace.
+    void manager.call('server.ping', []).catch(() => undefined);
+    await delay(0);
+
+    const a = manager.suspend({ graceMs: 50 });
+    const b = manager.resume(); // should chain after suspend, not return its promise
+    await Promise.all([a, b]);
+    expect(manager.state).toBe('running');
+    await manager.stop();
+  });
+
+  it('cross-direction transition: suspend() during in-flight resume() lands on suspended', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.suspend({ graceMs: 0 });
+    const r = manager.resume();
+    const s = manager.suspend({ graceMs: 0 });
+    await Promise.all([r, s]);
+    expect(manager.state).toBe('suspended');
+    await manager.stop();
+  });
+
   it('does not accumulate duplicate tip handlers across suspend/resume cycles', async () => {
     const h = buildHarness();
     const cache = new (await import('../../../src/cache/memory.js')).MemoryCache();

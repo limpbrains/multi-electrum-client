@@ -124,12 +124,13 @@ export class ElectrumManager {
    */
   private lifecycle: LifecycleState = 'created';
   /**
-   * Cached promise for the current in-flight transition. Concurrent
-   * `suspend()` / `resume()` callers share the same promise so an
-   * `await` reflects the *actual* completion of the transition, not a
-   * fast-path return on observing the intermediate state.
+   * Tagged in-flight transition. Same-kind concurrent callers share the
+   * promise; opposite-kind callers chain after the current transition
+   * completes (so `m.resume()` issued during a `m.suspend()` actually
+   * runs the resume after the suspend lands, rather than returning the
+   * suspend's promise verbatim).
    */
-  private inFlightTransition: Promise<void> | null = null;
+  private inFlightTransition: { kind: 'suspend' | 'resume'; promise: Promise<void> } | null = null;
   /**
    * Calls submitted while `suspended` — replayed in order during `resume()`.
    * Each entry's deferred is resolved with the eventual wire result (or
@@ -225,8 +226,23 @@ export class ElectrumManager {
 
   /** Disconnect every server and drop all subscriptions. Terminal. */
   async stop(): Promise<void> {
+    // If a suspend / resume transition is in flight, let it observe the
+    // stopped flag and unwind cleanly before we rip down the rest of the
+    // manager. Without this, runSuspend's tail (e.g. `await tipUnsub()`)
+    // could still fire after `await m.stop()` returns to the caller —
+    // observable to anyone listening on the `error` event.
     this.stopped = true;
     this.lifecycle = 'stopped';
+    const pending = this.inFlightTransition?.promise;
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // Swallow — the transition's own race-checks short-circuit on
+        // stopped; any rejection is purely informational and already
+        // surfaced via the manager `error` event.
+      }
+    }
     // Reject anything queued during a prior suspend so callers don't dangle.
     while (this.suspendQueue.length > 0) {
       const item = this.suspendQueue.shift()!;
@@ -267,12 +283,23 @@ export class ElectrumManager {
    * `cancelInFlight: true` skips the wait entirely.
    */
   async suspend(opts: SuspendOptions = {}): Promise<void> {
-    // Idempotent re-entry: a second concurrent caller observes the
-    // in-flight transition and awaits its actual completion rather than
-    // resolving on the intermediate state. Without this, `await
-    // m.suspend()` while another suspend was already running would return
-    // immediately and `m.state` could still read 'suspending'.
-    if (this.inFlightTransition) return this.inFlightTransition;
+    // Same-kind re-entry: share the in-flight promise so `await` reflects
+    // the actual completion, not the intermediate state.
+    if (this.inFlightTransition?.kind === 'suspend') {
+      return this.inFlightTransition.promise;
+    }
+    // Opposite-kind re-entry: chain after the running resume completes,
+    // then run our own suspend. Without this, calling suspend() during
+    // resume() would observe the resume's promise and return as if the
+    // suspend had run — leaving the manager 'running' instead of
+    // 'suspended'.
+    if (this.inFlightTransition) {
+      const prev = this.inFlightTransition.promise;
+      return prev.then(
+        () => this.suspend(opts),
+        () => this.suspend(opts),
+      );
+    }
     if (this.lifecycle === 'suspended') return;
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot suspend a stopped manager');
@@ -286,7 +313,7 @@ export class ElectrumManager {
       return;
     }
     const task = this.runSuspend(opts);
-    this.inFlightTransition = task;
+    this.inFlightTransition = { kind: 'suspend', promise: task };
     try {
       await task;
     } finally {
@@ -369,9 +396,16 @@ export class ElectrumManager {
    * see the `running` gate path once the state flips.
    */
   async resume(): Promise<void> {
-    // Same in-flight sharing as `suspend()` — a second caller awaits the
-    // actual completion rather than the intermediate state.
-    if (this.inFlightTransition) return this.inFlightTransition;
+    if (this.inFlightTransition?.kind === 'resume') {
+      return this.inFlightTransition.promise;
+    }
+    if (this.inFlightTransition) {
+      const prev = this.inFlightTransition.promise;
+      return prev.then(
+        () => this.resume(),
+        () => this.resume(),
+      );
+    }
     if (this.lifecycle === 'running') return;
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot resume a stopped manager');
@@ -384,7 +418,7 @@ export class ElectrumManager {
       );
     }
     const task = this.runResume();
-    this.inFlightTransition = task;
+    this.inFlightTransition = { kind: 'resume', promise: task };
     try {
       await task;
     } finally {
@@ -1365,13 +1399,17 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Best-effort extraction of an AbortSignal's `reason`. Falls back to a
- * generic `Error` for older runtimes that don't populate `reason`.
+ * Best-effort extraction of an AbortSignal's `reason`. Falls back to an
+ * `Error` whose `name === 'AbortError'` so callers writing the idiomatic
+ * `if (err.name === 'AbortError')` check still hit on older runtimes
+ * that don't populate `signal.reason`.
  */
 function signalAbortReason(signal: AbortSignal): unknown {
   const reason: unknown = (signal as { reason?: unknown }).reason;
   if (reason !== undefined) return reason;
-  return new Error('aborted');
+  const e = new Error('aborted');
+  e.name = 'AbortError';
+  return e;
 }
 
 function defaultTransportFactory(endpoint: Endpoint): Transport {
