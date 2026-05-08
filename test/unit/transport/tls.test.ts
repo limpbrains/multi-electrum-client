@@ -64,7 +64,7 @@ describe('TlsTransport', () => {
     });
 
     const connectPromise = t.connect();
-    queueMicrotask(() => socket.emit('connect'));
+    queueMicrotask(() => socket.emit('secureConnect'));
     await connectPromise;
 
     await t.send('{"id":1}');
@@ -87,6 +87,30 @@ describe('TlsTransport', () => {
     await expect(t.connect()).rejects.toBeInstanceOf(TransportError);
   });
 
+  it('does NOT resolve on the bare TCP connect event — waits for secureConnect', async () => {
+    const socket = new MockSocket();
+    const t = new TlsTransport({
+      endpoint: { host: 'h', port: 50002, protocol: 'tls' },
+      connect: () => socket,
+      connectTimeoutMs: 50,
+    });
+
+    let resolved = false;
+    const p = t.connect().then(() => {
+      resolved = true;
+    });
+    // Simulate the underlying TCP layer firing 'connect' before the TLS
+    // handshake completes. Connect must NOT resolve on this — that would
+    // let an unverified cert through.
+    queueMicrotask(() => socket.emit('connect'));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(resolved).toBe(false);
+    // Now fire secureConnect — connect resolves.
+    socket.emit('secureConnect');
+    await p;
+    expect(resolved).toBe(true);
+  });
+
   it('forwards send / close to the underlying socket', async () => {
     const socket = new MockSocket();
     const t = new TlsTransport({
@@ -94,7 +118,7 @@ describe('TlsTransport', () => {
       connect: () => socket,
     });
     const connectPromise = t.connect();
-    queueMicrotask(() => socket.emit('connect'));
+    queueMicrotask(() => socket.emit('secureConnect'));
     await connectPromise;
     await t.send('hello');
     expect(socket.writes).toEqual(['hello\n']);

@@ -158,6 +158,22 @@ describe('TcpTransport', () => {
     await expect(t.connect()).rejects.toBeInstanceOf(TransportError);
   });
 
+  it('connect timeout: a transport.on listener attached before connect does not see a stray close', async () => {
+    // Wire a listener BEFORE connect (matches Client's order). With the
+    // pre-fix code, the timeout-driven destroy would emit { type: 'close' }
+    // on top of the connect rejection.
+    const t = new TcpTransport({
+      endpoint: { host: '10.255.255.1', port: 1, protocol: 'tcp' },
+      connectTimeoutMs: 50,
+    });
+    const events: TransportEvent[] = [];
+    t.on((e) => events.push(e));
+    await expect(t.connect()).rejects.toBeInstanceOf(TransportError);
+    // Allow any post-rejection async events to settle.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(events.find((e) => e.type === 'close')).toBeUndefined();
+  });
+
   it('rejects send before connect', async () => {
     const t = new TcpTransport({
       endpoint: { host: '127.0.0.1', port: 1, protocol: 'tcp' },
