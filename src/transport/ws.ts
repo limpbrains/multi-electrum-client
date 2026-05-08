@@ -15,6 +15,7 @@
 
 import type { Endpoint } from '../client.js';
 import { TransportError } from '../errors/types.js';
+import { LineFramer } from './lineFramer.js';
 import type { Transport, TransportEvent, TransportListener } from './types.js';
 
 type WebSocketCtor = new (url: string) => WebSocket;
@@ -176,15 +177,5 @@ export class WsTransport implements Transport {
       return data.toString('utf-8');
     }
     return undefined;
-  }
-}
-
-class LineFramer {
-  private buf = '';
-  push(chunk: string): string[] {
-    this.buf += chunk;
-    const parts = this.buf.split(/\r?\n/);
-    this.buf = parts.pop() ?? '';
-    return parts.filter((p) => p.length > 0);
   }
 }

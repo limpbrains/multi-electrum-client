@@ -38,6 +38,14 @@
     "./transport/ws": {
       "types": "./dist/transport/ws.d.ts",
       "default": "./dist/transport/ws.js"
+    },
+    "./transport/tcp": {
+      "types": "./dist/transport/tcp.d.ts",
+      "default": "./dist/transport/tcp.js"
+    },
+    "./transport/tls": {
+      "types": "./dist/transport/tls.d.ts",
+      "default": "./dist/transport/tls.js"
     }
   },
   "scripts": {

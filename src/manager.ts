@@ -37,6 +37,8 @@ import type {
 } from './protocol/types.js';
 import { SubscriptionRegistry } from './subscriptions/registry.js';
 import type { SubscriptionHandler } from './subscriptions/types.js';
+import { TcpTransport } from './transport/tcp.js';
+import { TlsTransport } from './transport/tls.js';
 import type { Transport } from './transport/types.js';
 import { WsTransport } from './transport/ws.js';
 import { deferred, type Deferred } from './util/deferred.js';
@@ -1446,7 +1448,19 @@ function signalAbortReason(signal: AbortSignal): unknown {
 }
 
 function defaultTransportFactory(endpoint: Endpoint): Transport {
-  return new WsTransport({ endpoint });
+  switch (endpoint.protocol) {
+    case 'ws':
+    case 'wss':
+      return new WsTransport({ endpoint });
+    case 'tcp':
+      return new TcpTransport({ endpoint });
+    case 'tls':
+      return new TlsTransport({ endpoint });
+    default: {
+      const _exhaustive: never = endpoint.protocol;
+      throw new ProtocolError(`unsupported transport protocol: ${String(_exhaustive)}`);
+    }
+  }
 }
 
 /**
