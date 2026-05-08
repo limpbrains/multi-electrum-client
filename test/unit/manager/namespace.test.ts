@@ -78,9 +78,9 @@ describe('namespace API → call() → wire', () => {
 
     h.reply('a', (req: { id: number }) => ({
       id: req.id,
-      result: { blockHeight: 700_000, pos: 3, merkle: ['abc', 'def'] },
+      result: { block_height: 700_000, pos: 3, merkle: ['abc', 'def'] },
     }));
-    expect(await p).toEqual({ blockHeight: 700_000, pos: 3, merkle: ['abc', 'def'] });
+    expect(await p).toEqual({ block_height: 700_000, pos: 3, merkle: ['abc', 'def'] });
 
     await manager.stop();
   });

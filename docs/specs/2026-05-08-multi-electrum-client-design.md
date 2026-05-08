@@ -134,21 +134,39 @@ interface UnconfirmedTx { status: 'unconfirmed'; txid: string; height: 0 | -1; f
 
 ### Public method surface
 
+The shape evolves across milestones:
+
+**M3 (shipped) — one-shot wrappers.** Each namespace method is a thin `call`
+wrapper. `subscribe` calls return the *initial* status / tip; M3 has no
+handler routing, so server-pushed notifications are silently dropped.
+
 ```ts
 manager.scripthash.getBalance(hash)              // -> blockchain.scripthash.get_balance
 manager.scripthash.getHistory(hash)
 manager.scripthash.listUnspent(hash)
-manager.scripthash.subscribe(hash, handler)       // returns unsub fn
-manager.transaction.get(txid)
+manager.scripthash.subscribe(hash)                // returns Promise<ScripthashStatus>; M4 reshapes
+manager.scripthash.unsubscribe(hash)
+manager.transaction.get(txid)                     // raw hex
+manager.transaction.getVerbose(txid)              // TxVerbose
 manager.transaction.broadcast(rawHex)
 manager.transaction.getMerkle(txid, height)
-manager.headers.subscribe(handler)
+manager.headers.getTip()                          // blockchain.headers.subscribe; one-shot
+manager.headers.getHeader(height)
 manager.estimateFee(blocks)
-manager.server.version()
+manager.server.version(clientName, protocolVersion)
 manager.server.ping()
+manager.server.banner()
 
-manager.call(method, params, opts?)
+manager.call(method, params?, opts?)              // params optional for empty-tuple methods
 manager.batch(requests, opts?)
+```
+
+**M4 (planned) — handler-based subscriptions.** `headers.getTip()` becomes a
+shorthand; the handler-registering form lives at:
+
+```ts
+manager.headers.subscribe(handler)                // -> () => unsub
+manager.scripthash.subscribe(hash, handler)       // -> () => unsub; status pushed via handler
 ```
 
 ### Constructor
@@ -327,8 +345,8 @@ Vitest snapshot tests against real server responses, recorded once per server ty
 - **M0 — Skeleton (~1 wk).** Repo, tsconfig (strict), ESLint, Prettier, Vitest, tsup, GH Actions skeleton, exports map for Node/RN/browser/Bun, public types stubbed.
 - **M1 — Single-client WS happy path (~2 wks).** `WsTransport`, `ElectrumClient`, framing, `server.version` + `server.ping` against ElectrumX in compose. Unit on framing + client. Integration ping test.
 - **M2 — Manager + routing + auto-batch (~2 wks).** `ElectrumManager`, `RoutingPolicy` + 4 built-ins, microtask coalescing, batch splitter with auto-redirect. Unit on policies + splitter. Integration on failover under toxiproxy.
-- **M3 — Method coverage + types + cache (~2 wks).** Full MVP method set. Domain types. `CacheStore` + `MemoryCache`, finality-gated writes via headers subscription. Cross-impl parity snapshot tests.
-- **M4 — Subscriptions + classifier + discovery (~2.5 wks).** `SubscriptionRegistry` with restore + catch-up diff. Pluggable `ErrorClassifier`. Optional peer discovery (`server.peers.subscribe`) with `onDiscover` callback. Integration: catch-up under disconnect, ban detection on strict configs.
+- **M3 — Method coverage + types (~2 wks).** Full MVP method set. Typed method registry (single source of truth for `Manager.call(...)` overloads and the namespace API). Domain types. Cross-impl parity snapshot tests slip to M4.
+- **M4 — Subscriptions + classifier + discovery + cache (~3 wks).** `SubscriptionRegistry` with restore + catch-up diff (handler-based `manager.headers.subscribe(handler)` and `manager.scripthash.subscribe(hash, handler)` reshape from M3 one-shots). Pluggable `ErrorClassifier`. Optional peer discovery (`server.peers.subscribe`) with `onDiscover` callback. `CacheStore` + `MemoryCache`, finality-gated writes (now possible because the headers subscription tracks tip). Integration: catch-up under disconnect, ban detection on strict configs.
 - **M5 — Lifecycle + RN parity (~2 wks).** `suspend` / `resume`, queue semantics, `bindAppState`. `react-native-harness` in CI. Same subset green in Node and RN. RN-specific tests.
 - **M6 — TCP + TLS transports (~1.5 wks).** `tcp.ts` + `tls.ts`. Confirm RN works via metro alias to `react-native-tcp-socket`. Integration matrix expands to all three transports.
 - **M7 — Polish + 0.1 release (~1 wk).** README, examples (Node, RN, browser, Bun), API docs, npm + JSR publish, semver baseline.
