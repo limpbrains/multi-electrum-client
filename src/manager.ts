@@ -6,6 +6,8 @@
 // finality), lifecycle suspend/resume (M5), and TCP/TLS transports (M6) plug
 // in here in subsequent milestones.
 
+import { buildKey, cacheSpec } from './cache/keys.js';
+import type { CacheStore } from './cache/types.js';
 import type { ClientId, ClientView, ConnectionState, Endpoint, Telemetry } from './client.js';
 import { ElectrumClient } from './client.js';
 import { defaultClassifier } from './errors/classifier.js';
@@ -97,6 +99,17 @@ export class ElectrumManager {
   private readonly transportFactory: (endpoint: Endpoint) => Transport;
   private readonly batcher: MicrotaskBatcher<BatchItem>;
   private readonly registry: SubscriptionRegistry;
+  private readonly cache: CacheStore | undefined;
+  private readonly finalizedConfs: number;
+  /**
+   * Latest tip height, populated from the internal headers subscription.
+   * `undefined` until the first header arrives — manager treats that as
+   * "no tip known", which means cache writes are skipped (safer than
+   * caching potentially-non-final data).
+   */
+  private tipHeight: number | undefined;
+  /** Disposer for the internal headers subscription. */
+  private tipUnsub: (() => Promise<void>) | null = null;
   // Standard typed-event-emitter pattern: store opaquely, cast at the API edge.
   private readonly listeners = new Map<keyof ManagerEvents, Set<(p: unknown) => void>>();
 
@@ -108,6 +121,8 @@ export class ElectrumManager {
     this.cooldownMs = opts.cooldownMs ?? 60_000;
     this.requestTimeoutMs = opts.requestTimeoutMs;
     this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
+    this.cache = opts.cache;
+    this.finalizedConfs = opts.finalizedConfs ?? 6;
     this.batcher = new MicrotaskBatcher<BatchItem>((items) => {
       this.flushBatch(items).catch((e) => this.emit('error', e));
     });
@@ -135,10 +150,40 @@ export class ElectrumManager {
       }
     });
     await Promise.all(tasks);
+    // If a cache is configured we need a tip to gate finalized writes.
+    // Wire an internal headers subscription whose handler updates
+    // `tipHeight`. Best-effort: errors surface as `error` events, the
+    // cache simply remains read-only until the tip is known.
+    if (this.cache && this.tipUnsub === null) {
+      try {
+        this.tipUnsub = await this.registry.subscribe<BlockHeader>(
+          'blockchain.headers.subscribe',
+          [],
+          (h) => {
+            // Validate at the boundary; an arbitrary registry handler
+            // shape shouldn't be trusted to be a BlockHeader.
+            if (h && typeof (h as BlockHeader).height === 'number') {
+              this.tipHeight = (h as BlockHeader).height;
+            }
+          },
+        );
+      } catch (e) {
+        this.emit('error', e);
+      }
+    }
   }
 
   /** Disconnect every server and drop all subscriptions. */
   async stop(): Promise<void> {
+    if (this.tipUnsub) {
+      try {
+        await this.tipUnsub();
+      } catch (e) {
+        this.emit('error', e);
+      }
+      this.tipUnsub = null;
+    }
+    this.tipHeight = undefined;
     this.registry.clear();
     await Promise.all(
       [...this.clients.values()].map(async (c) => {
@@ -191,6 +236,37 @@ export class ElectrumManager {
     ...args: CallArgs<M>
   ): Promise<M extends MethodName ? ResultOf<M> : unknown>;
   async call(method: string, params: readonly unknown[] = [], opts?: CallOpts): Promise<unknown> {
+    // Cache lookup happens up-front: if the method is on the cacheable
+    // allow-list and we already have a value, return it without ever
+    // touching the wire. Cache writes happen after a successful wire call
+    // (see `runAttempts` resolution + `dispatchGroup`). `bypassCache` opts
+    // out of both the read and the write.
+    const spec = opts?.bypassCache ? null : this.cacheSpecFor(method, params);
+    if (spec && this.cache) {
+      const hit = await this.readCache(spec);
+      if (hit !== undefined) return hit;
+    }
+
+    const value = await this.callInner(method, params, opts);
+    if (spec && this.cache && this.isFinalized(spec.finalityHeight) && !opts?.bypassCache) {
+      // Fire-and-forget: a slow cache adapter must not block the caller.
+      // A failed cache write just means the next call refetches.
+      void this.writeCache(spec, value).catch((e) => this.emit('error', e));
+    }
+    return value;
+  }
+
+  /**
+   * The pre-cache call path. Same logic as the public `call` body but
+   * without the cache layer — used internally by the cache wrapper above
+   * and by the namespace API when a method needs to bypass the cache
+   * (e.g. mempool-sensitive lookups).
+   */
+  private async callInner(
+    method: string,
+    params: readonly unknown[],
+    opts?: CallOpts,
+  ): Promise<unknown> {
     // `preferClient` pins to a specific server; batching groups by policy.pick
     // and would lose the pin, so always take the direct path when set.
     const useBatch = opts?.preferClient === undefined && (opts?.autoBatch ?? this.autoBatchEnabled);
@@ -505,6 +581,63 @@ export class ElectrumManager {
     const meta = this.meta.get(id);
     if (meta?.bannedUntil !== undefined && meta.bannedUntil > Date.now()) return false;
     return true;
+  }
+
+  // --- Cache helpers -----------------------------------------------------
+
+  /** Public wrapper kept stable so the cache module remains side-effect-free. */
+  private cacheSpecFor(method: string, params: readonly unknown[]): ReturnType<typeof cacheSpec> {
+    if (!this.cache) return null;
+    return cacheSpec(method, params);
+  }
+
+  /** True iff the cache has been populated past `finalizedConfs` for this height. */
+  private isFinalized(height: number): boolean {
+    if (this.tipHeight === undefined) return false;
+    return this.tipHeight - height >= this.finalizedConfs;
+  }
+
+  private async readCache(
+    spec: NonNullable<ReturnType<typeof cacheSpec>>,
+  ): Promise<unknown | undefined> {
+    if (!this.cache) return undefined;
+    const key = buildKey(this.network, spec.bucket, spec.id);
+    let raw: string | null;
+    try {
+      raw = await this.cache.get(key);
+    } catch (e) {
+      // Cache failure must not break the request — caller injected the
+      // store, manager just falls back to a wire call. Surface for visibility.
+      this.emit('error', e);
+      return undefined;
+    }
+    if (raw === null) return undefined;
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      // Corrupted entry. Remove it best-effort and miss the read.
+      this.emit('error', e);
+      void this.cache.del(key).catch(() => undefined);
+      return undefined;
+    }
+  }
+
+  private async writeCache(
+    spec: NonNullable<ReturnType<typeof cacheSpec>>,
+    value: unknown,
+  ): Promise<void> {
+    if (!this.cache) return;
+    const key = buildKey(this.network, spec.bucket, spec.id);
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(value);
+    } catch (e) {
+      // Non-serializable response (circular ref, BigInt) — skip the
+      // write rather than throwing out of the post-success path.
+      this.emit('error', e);
+      return;
+    }
+    await this.cache.set(key, serialized);
   }
 
   /**

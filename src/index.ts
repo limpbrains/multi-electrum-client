@@ -13,6 +13,7 @@ export type {
 export type { RoutingPolicy, PickContext, Outcome } from './policy/types.js';
 
 export type { CacheStore } from './cache/types.js';
+export { MemoryCache } from './cache/memory.js';
 
 export type { ErrorKind, ErrorClassifier, ClassifyContext } from './errors/types.js';
 

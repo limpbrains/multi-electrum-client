@@ -56,11 +56,7 @@ const FULCRUM_RATE_LIMIT_SUBSTRINGS = [
  * socket. When it does emit messages they tend to be terse. Source:
  * https://github.com/romanz/electrs — `src/electrum.rs`.
  */
-const ELECTRS_RATE_LIMIT_SUBSTRINGS = [
-  'too many requests',
-  'rate limit',
-  'connection rejected',
-];
+const ELECTRS_RATE_LIMIT_SUBSTRINGS = ['too many requests', 'rate limit', 'connection rejected'];
 
 /** Common across all three (used when `serverSoftware` is unknown). */
 const GENERIC_RATE_LIMIT_SUBSTRINGS = [
