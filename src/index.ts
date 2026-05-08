@@ -45,10 +45,18 @@ export type {
 } from './protocol/types.js';
 
 // Method registry (M3): one-source-of-truth for typed `manager.call(...)`
-// and the namespace API. Re-exported for type-level consumers (custom
-// policies that key off MethodName, etc.).
-export type { Methods, MethodName, MethodSpec, ParamsOf, ResultOf } from './protocol/methods.js';
-export { methods } from './protocol/methods.js';
+// and the namespace API. Type-only — there is no runtime registry to
+// dereference. `methodNames` is the runtime list (allow-listing in custom
+// policies, metrics, discovery UIs).
+export type {
+  Methods,
+  MethodName,
+  MethodNames,
+  MethodSpec,
+  ParamsOf,
+  ResultOf,
+} from './protocol/methods.js';
+export { methodNames } from './protocol/methods.js';
 
 export {
   SuspendedError,

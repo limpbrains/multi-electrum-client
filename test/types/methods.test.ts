@@ -62,12 +62,18 @@ describe('manager.call typed overload', () => {
     expectTypeOf(m.call('server.ping', [])).toEqualTypeOf<Promise<null>>();
   });
 
+  it('lets params be omitted for empty-tuple methods', () => {
+    const m = makeManager();
+    // No second arg — allowed because ParamsOf<'server.ping'> is readonly [].
+    expectTypeOf(m.call('server.ping')).toEqualTypeOf<Promise<null>>();
+    expectTypeOf(m.call('server.banner')).toEqualTypeOf<Promise<string>>();
+    expectTypeOf(m.call('blockchain.headers.subscribe')).toEqualTypeOf<Promise<BlockHeader>>();
+  });
+
   it('returns Promise<unknown> for non-literal method names (escape hatch)', () => {
     const m = makeManager();
     const dynamic: string = 'vendor.specific';
     expectTypeOf(m.call(dynamic, [1, 2, 3])).toEqualTypeOf<Promise<unknown>>();
-    // Caller-asserted result via `as`-cast on the awaited value.
-    expectTypeOf(m.call(dynamic, [1, 2, 3])).resolves.toBeUnknown();
   });
 
   it('rejects wrong param shapes for known methods', () => {
@@ -76,8 +82,8 @@ describe('manager.call typed overload', () => {
     m.call('blockchain.transaction.get_merkle', ['txid']);
     // @ts-expect-error -- scripthash must be a string
     m.call('blockchain.scripthash.get_balance', [42]);
-    // @ts-expect-error -- empty params not accepted for required-arg method
-    m.call('blockchain.scripthash.get_balance', []);
+    // @ts-expect-error -- params required for non-empty-tuple method
+    m.call('blockchain.scripthash.get_balance');
   });
 });
 
@@ -93,8 +99,9 @@ describe('manager namespace API', () => {
     expectTypeOf(m.transaction.get('txid')).toEqualTypeOf<Promise<RawTxHex>>();
     expectTypeOf(m.transaction.broadcast('hex')).toEqualTypeOf<Promise<TxId>>();
     expectTypeOf(m.transaction.getMerkle('txid', 100)).toEqualTypeOf<Promise<MerkleProof>>();
+    expectTypeOf(m.transaction.getVerbose('txid')).resolves.toMatchTypeOf<{ txid: string }>();
 
-    expectTypeOf(m.headers.subscribe()).toEqualTypeOf<Promise<BlockHeader>>();
+    expectTypeOf(m.headers.getTip()).toEqualTypeOf<Promise<BlockHeader>>();
     expectTypeOf(m.headers.getHeader(100)).toEqualTypeOf<Promise<string>>();
 
     expectTypeOf(m.server.ping()).toEqualTypeOf<Promise<null>>();

@@ -63,9 +63,11 @@ export interface UnconfirmedTx {
 
 /**
  * Verbose form of `blockchain.transaction.get` (when called with `verbose=true`).
- * The server forwards bitcoind's RPC-decoded transaction shape verbatim, which
- * is large and not stable across server software versions. We type the few
- * widely-used fields and leave the rest as a permissive index signature.
+ * The server forwards bitcoind's RPC-decoded transaction shape verbatim.
+ * Server-software versions occasionally add fields beyond what's typed here;
+ * consumers who need them `as`-cast to a wider shape rather than reaching
+ * through an index signature (which would weaken the named-field types to
+ * `unknown`).
  */
 export interface TxVerbose {
   txid: TxId;
@@ -82,7 +84,6 @@ export interface TxVerbose {
   confirmations?: number;
   time?: number;
   blocktime?: number;
-  [key: string]: unknown;
 }
 
 export interface TxVin {
@@ -92,7 +93,6 @@ export interface TxVin {
   txinwitness?: readonly string[];
   sequence: number;
   coinbase?: string;
-  [key: string]: unknown;
 }
 
 export interface TxVout {
@@ -104,9 +104,7 @@ export interface TxVout {
     type?: string;
     address?: string;
     addresses?: readonly string[];
-    [key: string]: unknown;
   };
-  [key: string]: unknown;
 }
 
 // --- Scripthash queries ----------------------------------------------------
@@ -129,7 +127,7 @@ export interface HistoryEntry {
 export interface Unspent {
   txid: TxId;
   /** Output index. */
-  tx_pos: number;
+  txPos: number;
   /** Satoshis. */
   value: number;
   /** Block height; 0 if unconfirmed. */
@@ -150,7 +148,7 @@ export interface BlockHeader {
 }
 
 export interface MerkleProof {
-  block_height: number;
+  blockHeight: number;
   pos: number;
   merkle: readonly string[];
 }
@@ -161,8 +159,15 @@ export interface MerkleProof {
 export type ServerVersion = readonly [serverSoftware: string, protocolVersion: string];
 
 /**
- * Fee estimate from `blockchain.estimatefee` — BTC per kvB. `-1` means the
- * server has no estimate for the requested confirmation target.
+ * Fee estimate from `blockchain.estimatefee` — BTC per kvB.
+ *
+ * **Sentinel:** the server returns `-1` (literally negative one) when it has
+ * no estimate for the requested confirmation target — typically because it
+ * just started, the mempool is empty, or the depth is past its cache. Callers
+ * MUST treat any negative value as "no estimate available" and fall back to a
+ * floor / cached value. We keep the wire-truthful `number` type rather than
+ * normalizing to `number | null` so consumers see the raw signal; future
+ * decoders may add a `getFeeEstimate(): number | null` helper if useful.
  */
 export type FeeEstimate = number;
 

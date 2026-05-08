@@ -26,6 +26,7 @@ import type {
   Scripthash,
   ServerSpec,
   TxId,
+  TxVerbose,
 } from './protocol/types.js';
 import type { Transport } from './transport/types.js';
 import { WsTransport } from './transport/ws.js';
@@ -65,6 +66,19 @@ type AttemptOutcome =
   // policy named a client we no longer have (race with removeServer or a
   // stale id from a custom policy) → exclude + retry.
   | { kind: 'client-missing'; clientId: ClientId; error: Error };
+
+/**
+ * Trailing-args shape for `Manager.call`. Methods whose registry entry has an
+ * empty params tuple (e.g. `server.ping`) accept `params` as optional;
+ * everything else requires it. Unknown methods fall back to `readonly
+ * unknown[]`. Conditional rest tuple is the only way to express "second arg
+ * is required for some literal first args, optional for others" in TS.
+ */
+type CallArgs<M extends string> = M extends MethodName
+  ? ParamsOf<M> extends readonly []
+    ? [params?: readonly [], opts?: CallOpts]
+    : [params: ParamsOf<M>, opts?: CallOpts]
+  : [params: readonly unknown[], opts?: CallOpts];
 
 export class ElectrumManager {
   readonly network: Network;
@@ -147,18 +161,18 @@ export class ElectrumManager {
   /**
    * Typed call. The single conditional signature picks param/result types from
    * the method registry when `method` is a known wire name and falls back to
-   * `readonly unknown[]` / `unknown` otherwise. This shape is necessary —
-   * splitting into two overloads would let bad params for a known method
-   * silently fall through to the escape-hatch overload.
+   * `readonly unknown[]` / `unknown` otherwise. The trailing rest tuple lets
+   * us drop `params` for empty-tuple methods (`m.call('server.ping')`) while
+   * keeping it required for everything else.
    *
    *   const bal = await manager.call('blockchain.scripthash.get_balance', [hash]);
    *   //    ^? Balance
+   *   await manager.call('server.ping');                  // params optional
    *   const x = (await manager.call('vendor.specific', [1, 2])) as MyType;
    */
   call<M extends string>(
     method: M,
-    params: M extends MethodName ? ParamsOf<M> : readonly unknown[],
-    opts?: CallOpts,
+    ...args: CallArgs<M>
   ): Promise<M extends MethodName ? ResultOf<M> : unknown>;
   async call(method: string, params: readonly unknown[] = [], opts?: CallOpts): Promise<unknown> {
     const useBatch = opts?.autoBatch ?? this.autoBatchEnabled;
@@ -198,6 +212,15 @@ export class ElectrumManager {
 
   readonly transaction = {
     get: (txid: TxId, opts?: CallOpts) => this.call('blockchain.transaction.get', [txid], opts),
+    /**
+     * Verbose form of `blockchain.transaction.get` — server-decoded tx shape.
+     * Routed via the escape hatch since the verbose-form wire signature
+     * (`[txid, true]`) doesn't fit the registry's positional tuple.
+     */
+    getVerbose: async (txid: TxId, opts?: CallOpts): Promise<TxVerbose> => {
+      const verboseMethod: string = 'blockchain.transaction.get';
+      return (await this.call(verboseMethod, [txid, true], opts)) as TxVerbose;
+    },
     broadcast: (rawTx: RawTxHex, opts?: CallOpts) =>
       this.call('blockchain.transaction.broadcast', [rawTx], opts),
     getMerkle: (txid: TxId, height: number, opts?: CallOpts) =>
@@ -205,7 +228,14 @@ export class ElectrumManager {
   };
 
   readonly headers = {
-    subscribe: (opts?: CallOpts) => this.call('blockchain.headers.subscribe', [], opts),
+    /**
+     * Fetches the current tip and registers a wire-level subscription with
+     * the chosen server. Returns the initial header. Notifications fired by
+     * the server after subscription are silently dropped until M4 wires the
+     * SubscriptionRegistry with handler routing — at which point this method
+     * is replaced by `subscribe(handler)` and a separate `getTip()` shorthand.
+     */
+    getTip: (opts?: CallOpts) => this.call('blockchain.headers.subscribe', [], opts),
     getHeader: (height: number, opts?: CallOpts) =>
       this.call('blockchain.block.header', [height], opts),
   };

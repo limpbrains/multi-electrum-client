@@ -204,7 +204,7 @@ Optional, off by default. When `discover.enabled === true` the manager calls `se
 
 For each candidate not already in the pool:
 
-1. Manager calls `discover.onDiscover(peer)` if provided. The callback returns `boolean | Promise<boolean>`. `true` → admit; `false` or thrown → skip. Callback can also persist the peer to the user's storage (e.g., write to AsyncStorage) before returning.
+1. Manager calls `discover.onDiscover(peer)` if provided. The callback returns `boolean | Promise<boolean>`. `true` → admit; `false` → skip silently. A thrown / rejected callback also skips, but the manager emits the thrown value on the `error` event so a buggy `onDiscover` is observable rather than silently dropping every candidate. Callback can also persist the peer to the user's storage (e.g., write to AsyncStorage) before returning.
 2. If admitted, manager `addServer(peer)`. The new client connects on the next event loop turn and joins the routing pool.
 
 The default policy when `onDiscover` is omitted is "admit everything". Users that want a curated list pass an `onDiscover` that returns `false` for entries that don't match their allow-rules.
