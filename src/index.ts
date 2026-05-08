@@ -41,5 +41,10 @@ export {
   ProtocolError,
 } from './errors/types.js';
 
+// Single-client surface (M1):
+export { ElectrumClient, type ElectrumClientOpts } from './client.js';
+export { WsTransport, type WsTransportOpts } from './transport/ws.js';
+export type { Transport, TransportEvent, TransportListener } from './transport/types.js';
+
 // Manager + namespace API land in M2.
 // export { ElectrumManager } from './manager.js';

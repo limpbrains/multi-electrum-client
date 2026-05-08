@@ -26,6 +26,9 @@ export default [
       ],
       '@typescript-eslint/consistent-type-imports': 'error',
       'no-console': ['warn', { allow: ['warn', 'error'] }],
+      // TypeScript handles undefined identifiers; no-undef misclassifies platform globals
+      // (setTimeout, MessageEvent, ...) that are typed via DOM / Node lib.
+      'no-undef': 'off',
     },
   },
   {
