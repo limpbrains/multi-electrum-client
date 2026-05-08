@@ -20,18 +20,35 @@ export type {
   Tx,
   ConfirmedTx,
   UnconfirmedTx,
+  TxVerbose,
+  TxVin,
+  TxVout,
   Balance,
   HistoryEntry,
   Unspent,
   BlockHeader,
   MerkleProof,
   ScripthashStatus,
+  ServerVersion,
+  FeeEstimate,
+  Scripthash,
+  TxId,
+  RawTxHex,
+  BlockHash,
+  HeaderHex,
   Network,
   ServerSpec,
   CallOpts,
   BatchRequest,
   ManagerOptions,
+  ReconnectBackoff,
 } from './protocol/types.js';
+
+// Method registry (M3): one-source-of-truth for typed `manager.call(...)`
+// and the namespace API. Re-exported for type-level consumers (custom
+// policies that key off MethodName, etc.).
+export type { Methods, MethodName, MethodSpec, ParamsOf, ResultOf } from './protocol/methods.js';
+export { methods } from './protocol/methods.js';
 
 export {
   SuspendedError,

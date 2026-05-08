@@ -19,6 +19,7 @@ Target environments: Node, React Native (callstackincubator/react-native-harness
 - RN-friendly lifecycle: `suspend()` / `resume()` and `bindAppState()` helper.
 - Single npm package with conditional exports per platform.
 - Strong test story: unit (Vitest), integration against a multi-server Docker compose stack with toxiproxy fault injection, RN parity via react-native-harness, type-level tests via `tsd`, snapshot tests for cross-impl response shapes.
+- Optional peer discovery via `server.peers.subscribe`: when enabled, manager harvests peers from connected servers and grows its pool automatically; an `onDiscover` callback lets callers persist the peer list and veto entries.
 
 ## Non-Goals (MVP)
 
@@ -164,6 +165,11 @@ new ElectrumManager({
   reconnectBackoff?: { minMs, maxMs, factor, jitter },
   cooldownMs?: number,                           // default 60_000
   finalizedConfs?: number,                       // default 6
+  discover?: {
+    enabled: boolean,                            // default false
+    onDiscover?: (peer: ServerSpec) => boolean | Promise<boolean>,
+    intervalMs?: number,                         // re-poll interval, default 6h
+  },
 });
 ```
 
@@ -191,6 +197,22 @@ class ProtocolError  extends Error {}
 - Multiple callers subscribing to the same `(method, params)` share one wire subscription; manager fans out to all handlers.
 - Last `unsub` triggers `blockchain.scripthash.unsubscribe` on servers that support it (ElectrumX ≥ 1.4.2, Fulcrum, electrs); on older servers manager stops dispatching but cannot tell server to stop pushing — documented.
 - Idempotency contract: handlers may receive the same status more than once across rebinds; document that handlers should be idempotent. We do not deduplicate beyond "skip notification if new status equals stored last-known".
+
+### Server discovery
+
+Optional, off by default. When `discover.enabled === true` the manager calls `server.peers.subscribe` against each connected server (one-shot on connect, plus a periodic re-poll every `intervalMs`, default 6h). The response is parsed into a list of `ServerSpec` candidates.
+
+For each candidate not already in the pool:
+
+1. Manager calls `discover.onDiscover(peer)` if provided. The callback returns `boolean | Promise<boolean>`. `true` → admit; `false` or thrown → skip. Callback can also persist the peer to the user's storage (e.g., write to AsyncStorage) before returning.
+2. If admitted, manager `addServer(peer)`. The new client connects on the next event loop turn and joins the routing pool.
+
+The default policy when `onDiscover` is omitted is "admit everything". Users that want a curated list pass an `onDiscover` that returns `false` for entries that don't match their allow-rules.
+
+Notes:
+- Only `ws` and `wss` peers are admitted by default; TCP/TLS peers are skipped until M6 wires those transports. The `onDiscover` callback can override.
+- Manager never removes discovered servers automatically. Caller drives `removeServer(id)` based on telemetry / their own logic.
+- `server.peers.subscribe` returns a tuple shape (`[host, ip, features[]]`); the manager converts it to a `ServerSpec`. Servers that don't support peer discovery (e.g., some `electrs` configs) emit a JSON-RPC error which the manager swallows silently — discovery is best-effort.
 
 ### Cache rules
 
@@ -306,7 +328,7 @@ Vitest snapshot tests against real server responses, recorded once per server ty
 - **M1 — Single-client WS happy path (~2 wks).** `WsTransport`, `ElectrumClient`, framing, `server.version` + `server.ping` against ElectrumX in compose. Unit on framing + client. Integration ping test.
 - **M2 — Manager + routing + auto-batch (~2 wks).** `ElectrumManager`, `RoutingPolicy` + 4 built-ins, microtask coalescing, batch splitter with auto-redirect. Unit on policies + splitter. Integration on failover under toxiproxy.
 - **M3 — Method coverage + types + cache (~2 wks).** Full MVP method set. Domain types. `CacheStore` + `MemoryCache`, finality-gated writes via headers subscription. Cross-impl parity snapshot tests.
-- **M4 — Subscriptions + classifier (~2 wks).** `SubscriptionRegistry` with restore + catch-up diff. Pluggable `ErrorClassifier`. Integration: catch-up under disconnect, ban detection on strict configs.
+- **M4 — Subscriptions + classifier + discovery (~2.5 wks).** `SubscriptionRegistry` with restore + catch-up diff. Pluggable `ErrorClassifier`. Optional peer discovery (`server.peers.subscribe`) with `onDiscover` callback. Integration: catch-up under disconnect, ban detection on strict configs.
 - **M5 — Lifecycle + RN parity (~2 wks).** `suspend` / `resume`, queue semantics, `bindAppState`. `react-native-harness` in CI. Same subset green in Node and RN. RN-specific tests.
 - **M6 — TCP + TLS transports (~1.5 wks).** `tcp.ts` + `tls.ts`. Confirm RN works via metro alias to `react-native-tcp-socket`. Integration matrix expands to all three transports.
 - **M7 — Polish + 0.1 release (~1 wk).** README, examples (Node, RN, browser, Bun), API docs, npm + JSR publish, semver baseline.
