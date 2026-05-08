@@ -213,17 +213,15 @@ export class ElectrumManager {
   readonly transaction = {
     get: (txid: TxId, opts?: CallOpts) => this.call('blockchain.transaction.get', [txid], opts),
     /**
-     * Verbose form of `blockchain.transaction.get` — server-decoded tx shape.
+     * Verbose form of `blockchain.transaction.get` — returns the server-
+     * decoded tx shape (`TxVerbose`) instead of raw hex.
      *
-     * Routed deliberately via the unknown-method overload because the wire
-     * method has *two* legitimate response shapes (`RawTxHex` for `[txid]`,
-     * `TxVerbose` for `[txid, true]`) keyed on the second param. Encoding
-     * that as a registry param-union would force every plain
-     * `manager.call('blockchain.transaction.get', [txid])` caller to narrow
-     * `string | TxVerbose`, defeating the whole point of typed `call`. The
-     * `verboseMethod: string` cast is the price; the `as TxVerbose` is
-     * unchecked at runtime (same caveat as every other shape we type — the
-     * post-M4 decoder pass will validate it).
+     * **Caveat:** the result is `as`-cast unchecked. The wire method has two
+     * response shapes keyed on a second `verbose=true` param; the registry
+     * can't elegantly express that without forcing every plain caller to
+     * narrow `string | TxVerbose`, so we route via the unknown-method
+     * overload and trust the cast. The post-M4 decoder pass will validate
+     * the shape at runtime.
      */
     getVerbose: async (txid: TxId, opts?: CallOpts): Promise<TxVerbose> => {
       const verboseMethod: string = 'blockchain.transaction.get';

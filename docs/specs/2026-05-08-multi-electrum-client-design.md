@@ -355,12 +355,12 @@ Total ≈ 11.5 wks of work; realistic solo calendar 14–16 wks.
 
 ## Verification (end-to-end)
 
-1. **Unit:** `pnpm vitest run test/unit` — all green.
-2. **Type:** `pnpm tsc --noEmit` and `pnpm vitest run test/types` — no errors; tsd assertions pass.
-3. **Integration boot:** `docker compose -f docker/compose.yml up -d --wait` then `pnpm vitest run test/integration`.
+1. **Unit:** `pnpm test` — all green.
+2. **Type:** `pnpm typecheck` (alias `pnpm test:types`) — no errors. `test/types/**` is type-only; assertions live in unused functions and are validated by `tsc`, not vitest.
+3. **Integration boot:** `docker compose -f docker/compose.yml up -d --wait` then `pnpm test:integration`.
 4. **RN parity:** `pnpm test:rn` (driven by `react-native-harness`).
 5. **Manual smoke (per milestone demo):** failover, subscription, suspend/resume scripted scenarios.
-6. **Build + publish dry-run:** `pnpm build && npm pack` — package contents match conditional exports; no test files, no zod, no `react-native` import shipped to non-RN consumers.
+6. **Build + publish dry-run:** `pnpm build && npm pack` — package contents match conditional exports; no test files, no `react-native` import shipped to non-RN consumers.
 
 ## Research pointers (read before coding)
 
