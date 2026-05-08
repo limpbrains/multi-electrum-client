@@ -33,6 +33,10 @@ declare const m: ElectrumManager;
 // Wrapped in an unused function so vitest can ignore the file but tsc still
 // validates every assertion (function bodies are type-checked even when never
 // called).
+//
+// DO NOT add top-level statements that reference `m` outside this function.
+// `declare const m` has no runtime value; any top-level `m.x` access would
+// throw ReferenceError if vitest ever included this file by accident.
 function _typeAssertions(): void {
   // --- manager.call typed overload ---
 
