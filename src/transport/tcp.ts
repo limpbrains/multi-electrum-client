@@ -9,6 +9,10 @@
 // Framing: newline-delimited messages via the shared `LineFramer`. Outgoing
 // payloads are appended `\n`; incoming chunks are split on `\r?\n` with
 // partial lines buffered across reads.
+//
+// TODO(M7): close()-during-in-flight-connect leaks the in-flight socket.
+// Same gap WsTransport flags. Worth a coordinated abort path before
+// reconnect logic starts retrying connects.
 
 import type { Socket as NodeSocket } from 'node:net';
 import { connect as netConnect } from 'node:net';
@@ -20,14 +24,18 @@ import type { Transport, TransportEvent, TransportListener } from './types.js';
 
 /**
  * Subset of `net.Socket` we actually use. Lets RN's
- * `react-native-tcp-socket` Socket sub in via metro alias without import
- * gymnastics.
+ * `react-native-tcp-socket` Socket and `tls.TLSSocket` (which extends
+ * `net.Socket`) sub in via metro alias / TLS factory without import
+ * gymnastics. `off` is declared optional and informational — currently
+ * unused; transport instances are one-shot, so listener removal is
+ * handled by socket destruction rather than explicit unbind.
  */
 export interface TcpSocketLike {
   on(event: 'data', listener: (chunk: Buffer | string) => void): this;
   on(event: 'close', listener: (hadError: boolean) => void): this;
   on(event: 'error', listener: (err: Error) => void): this;
-  on(event: 'connect' | 'ready', listener: () => void): this;
+  on(event: 'connect' | 'ready' | 'secureConnect', listener: () => void): this;
+  once?(event: string, listener: (...args: unknown[]) => void): this;
   off?(event: string, listener: (...args: unknown[]) => void): this;
   setEncoding(encoding: BufferEncoding): this;
   write(chunk: string | Uint8Array): boolean;
@@ -47,6 +55,22 @@ export interface TcpTransportOpts {
   connectTimeoutMs?: number;
 }
 
+/**
+ * Internal extension used by `TlsTransport` to retarget the protocol guard
+ * and switch the connect-resolution event. NOT exported — the public
+ * surface is `TcpTransportOpts`.
+ */
+interface InternalOpts extends TcpTransportOpts {
+  /** Allowed `endpoint.protocol` values. Default: `['tcp']`. */
+  allowProtocols?: readonly string[];
+  /**
+   * Socket event to await for "connect succeeded". `'connect'` for raw
+   * TCP; `'secureConnect'` for TLS (fires after the handshake completes,
+   * not just the underlying TCP setup).
+   */
+  readyEvent?: 'connect' | 'secureConnect';
+}
+
 export class TcpTransport implements Transport {
   readonly endpoint: Endpoint;
   private socket: TcpSocketLike | null = null;
@@ -54,10 +78,13 @@ export class TcpTransport implements Transport {
   private readonly framer = new LineFramer();
   private readonly connectFn: (host: string, port: number) => TcpSocketLike;
   private readonly connectTimeoutMs: number;
-  private closing = false;
+  private readonly readyEvent: 'connect' | 'secureConnect';
+  /** True after `connect()` resolves. Gates emit() so pre-connect / post-timeout close events don't surface. */
+  private opened = false;
 
-  constructor(opts: TcpTransportOpts & { allowProtocols?: readonly string[] }) {
-    const allowed = opts.allowProtocols ?? ['tcp'];
+  constructor(opts: TcpTransportOpts) {
+    const internal = opts as InternalOpts;
+    const allowed = internal.allowProtocols ?? ['tcp'];
     if (!allowed.includes(opts.endpoint.protocol)) {
       throw new TransportError(
         `TcpTransport requires protocol in [${allowed.join(', ')}], got '${opts.endpoint.protocol}'`,
@@ -67,6 +94,7 @@ export class TcpTransport implements Transport {
     this.connectFn =
       opts.connect ?? ((host, port) => netConnect({ host, port }) as unknown as TcpSocketLike);
     this.connectTimeoutMs = opts.connectTimeoutMs ?? 10_000;
+    this.readyEvent = internal.readyEvent ?? 'connect';
   }
 
   async connect(): Promise<void> {
@@ -75,6 +103,10 @@ export class TcpTransport implements Transport {
 
     // Wire data / close / error handlers BEFORE awaiting connect so we
     // don't drop bytes the server may push as soon as the socket opens.
+    // setEncoding('utf-8') above means `chunk` is always a string in
+    // practice, but `Buffer.toString` is kept as a defensive fallback for
+    // socket implementations (e.g. RN's react-native-tcp-socket on some
+    // platforms) that ignore the encoding hint.
     socket.on('data', (chunk) => {
       const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
       for (const line of this.framer.push(text)) {
@@ -83,6 +115,11 @@ export class TcpTransport implements Transport {
     });
     socket.on('close', (hadError) => {
       this.framer.reset();
+      // Pre-connect / post-timeout close: the connect promise has already
+      // been rejected (or is about to be). Emitting `close` here would
+      // surface as a stray transport event to a caller that already
+      // failed the connect attempt.
+      if (!this.opened) return;
       this.emit({
         type: 'close',
         ...(hadError ? { reason: 'transport error' } : {}),
@@ -99,7 +136,7 @@ export class TcpTransport implements Transport {
           // ignore
         }
       }, this.connectTimeoutMs);
-      socket.on('connect', () => {
+      socket.on(this.readyEvent, () => {
         clearTimeout(timer);
         connected = true;
         resolve();
@@ -115,6 +152,7 @@ export class TcpTransport implements Transport {
     });
 
     this.socket = socket;
+    this.opened = true;
   }
 
   async send(text: string): Promise<void> {
@@ -128,10 +166,18 @@ export class TcpTransport implements Transport {
   async close(): Promise<void> {
     const socket = this.socket;
     if (!socket) return;
-    this.closing = true;
+    this.socket = null;
+    this.opened = false;
     await new Promise<void>((resolve) => {
-      const onClose = (): void => resolve();
-      socket.on('close', onClose);
+      // Use `once` if the socket implementation supports it so calling
+      // close() repeatedly doesn't stack listeners. Falls back to `on`
+      // for socket shims that don't expose `once`.
+      const handler = (): void => resolve();
+      if (typeof socket.once === 'function') {
+        socket.once('close', handler);
+      } else {
+        socket.on('close', handler);
+      }
       try {
         socket.end();
       } catch {
@@ -143,8 +189,6 @@ export class TcpTransport implements Transport {
         resolve();
       }
     });
-    this.socket = null;
-    this.closing = false;
   }
 
   on(listener: TransportListener): () => void {
@@ -155,13 +199,12 @@ export class TcpTransport implements Transport {
   }
 
   private emit(ev: TransportEvent): void {
-    // Suppress emit while we're cooperatively closing — the caller
-    // initiated the disconnect; surfacing the resulting `close` event
-    // again would cause Manager's onStateChange to fire twice.
-    if (this.closing && ev.type !== 'close') return;
     for (const l of this.listeners) l(ev);
   }
 }
 
 // Type alias re-export for ergonomics if someone wants the precise node type.
 export type { NodeSocket };
+// Internal options type — exported for `TlsTransport` only. Not part of the
+// public surface; do not document in README.
+export type { InternalOpts as InternalTcpTransportOpts };

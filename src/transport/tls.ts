@@ -1,19 +1,24 @@
 // TLS transport for Electrum's JSON-RPC over an encrypted socket.
 //
 // Wraps the same socket-handling pipeline as `TcpTransport` — only the
-// connect call differs. Imports node:tls statically; RN consumers point
-// metro at `react-native-tcp-socket` (its `tls` shim mirrors the same
-// API surface). The shared `LineFramer` handles message delimiting; the
-// shared `TcpSocketLike` interface covers both `net.Socket` and
-// `tls.TLSSocket` since the latter extends the former.
+// connect call and the ready-event differ. `tls.TLSSocket` extends
+// `net.Socket`, but its connect-completed signal is `'secureConnect'`
+// (post-handshake), not `'connect'` (which fires after the underlying
+// TCP setup but BEFORE the TLS handshake). Resolving on `'connect'`
+// would clear the connect-timeout and let the caller proceed before the
+// cert is verified — a self-signed test server would appear to connect.
+//
+// Imports node:tls statically; RN consumers point metro at
+// `react-native-tcp-socket` (its `tls` shim mirrors the same API
+// surface).
 
 import type { TLSSocket, ConnectionOptions } from 'node:tls';
 import { connect as tlsConnect } from 'node:tls';
 
 import type { Endpoint } from '../client.js';
 import { TransportError } from '../errors/types.js';
-import { TcpTransport, type TcpSocketLike } from './tcp.js';
-import type { Transport } from './types.js';
+import { TcpTransport, type TcpSocketLike, type InternalTcpTransportOpts } from './tcp.js';
+import type { Transport, TransportListener } from './types.js';
 
 export interface TlsTransportOpts {
   endpoint: Endpoint;
@@ -35,9 +40,10 @@ export interface TlsTransportOpts {
 
 /**
  * Convenience factory: implements the same `Transport` shape as
- * `TcpTransport` but routes through `tls.connect`. Constructed via a
- * delegated `TcpTransport` so all the framing / error / close logic stays
- * in one place.
+ * `TcpTransport` but routes through `tls.connect` and awaits
+ * `'secureConnect'` (TLS-handshake-complete) before resolving the connect
+ * promise. Constructed via a delegated `TcpTransport` so all the framing /
+ * error / close logic stays in one place.
  */
 export class TlsTransport implements Transport {
   readonly endpoint: Endpoint;
@@ -46,16 +52,18 @@ export class TlsTransport implements Transport {
   constructor(opts: TlsTransportOpts) {
     if (opts.endpoint.protocol !== 'tls') {
       // `wss` belongs to WsTransport; this transport handles raw
-      // JSON-RPC-over-TLS only.
+      // JSON-RPC-over-TLS only. (TcpTransport's protocol guard would
+      // also reject this, but a TLS-specific message is friendlier.)
       throw new TransportError(
         `TlsTransport requires protocol 'tls', got '${opts.endpoint.protocol}'`,
       );
     }
     this.endpoint = opts.endpoint;
     const { tlsOptions } = opts;
-    const innerOpts: ConstructorParameters<typeof TcpTransport>[0] = {
+    const innerOpts: InternalTcpTransportOpts = {
       endpoint: opts.endpoint,
       allowProtocols: ['tls'],
+      readyEvent: 'secureConnect',
       connect:
         opts.connect ??
         ((host, port) => {
@@ -83,7 +91,7 @@ export class TlsTransport implements Transport {
     return this.inner.close();
   }
 
-  on(listener: Parameters<Transport['on']>[0]): () => void {
+  on(listener: TransportListener): () => void {
     return this.inner.on(listener);
   }
 }
