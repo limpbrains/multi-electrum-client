@@ -90,6 +90,7 @@ export class ElectrumClient {
   private state: ConnectionState = 'disconnected';
   private connectedAt: number | undefined;
   private notifListener: ((n: JsonRpcNotification) => void) | undefined;
+  private stateListener: ((state: ConnectionState) => void) | undefined;
   private detachTransport: (() => void) | undefined;
 
   constructor(opts: ElectrumClientOpts) {
@@ -118,26 +119,26 @@ export class ElectrumClient {
     if (this.state === 'connecting') {
       throw new TransportError('connect already in progress');
     }
-    this.state = 'connecting';
+    this.setState('connecting');
     this.detachTransport = this.transport.on((ev) => this.handle(ev));
     try {
       await this.transport.connect();
-      this.state = 'connected';
       this.connectedAt = Date.now();
+      this.setState('connected');
     } catch (e) {
-      this.state = 'disconnected';
       this.detachTransport?.();
       this.detachTransport = undefined;
+      this.setState('disconnected');
       throw e;
     }
   }
 
   async disconnect(): Promise<void> {
-    this.state = 'disconnected';
     this.connectedAt = undefined;
     this.detachTransport?.();
     this.detachTransport = undefined;
     this.failAllInFlight(new TransportError('disconnected by client'));
+    this.setState('disconnected');
     await this.transport.close();
   }
 
@@ -203,6 +204,26 @@ export class ElectrumClient {
     this.notifListener = listener;
   }
 
+  /**
+   * Set a listener fired on every state transition. Used by Manager to drive
+   * SubscriptionRegistry rebinds when a client connects / disconnects.
+   * Replaces the previous listener if called twice.
+   */
+  onStateChange(listener: (state: ConnectionState) => void): void {
+    this.stateListener = listener;
+  }
+
+  private setState(s: ConnectionState): void {
+    if (this.state === s) return;
+    this.state = s;
+    try {
+      this.stateListener?.(s);
+    } catch {
+      // Listener errors are observable through Manager's `error` event, but
+      // for clients we swallow to keep state-machine progress unblocked.
+    }
+  }
+
   private registerInFlight(id: JsonRpcId, def: Deferred<unknown>, method: string): void {
     const timer = setTimeout(() => {
       const inflight = this.inFlight.get(id);
@@ -222,13 +243,13 @@ export class ElectrumClient {
 
   private handle(ev: TransportEvent): void {
     if (ev.type === 'close') {
-      this.state = 'disconnected';
       this.connectedAt = undefined;
       const reason =
         ev.code !== undefined
           ? `socket closed (code=${ev.code}${ev.reason ? `, reason=${ev.reason}` : ''})`
           : 'socket closed';
       this.failAllInFlight(new TransportError(reason));
+      this.setState('disconnected');
       return;
     }
     if (ev.type === 'error') {

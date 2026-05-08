@@ -19,15 +19,19 @@ import type { PickContext, RoutingPolicy } from './policy/types.js';
 import type { MethodName, ParamsOf, ResultOf } from './protocol/methods.js';
 import type {
   BatchRequest,
+  BlockHeader,
   CallOpts,
   ManagerOptions,
   Network,
   RawTxHex,
   Scripthash,
+  ScripthashStatus,
   ServerSpec,
   TxId,
   TxVerbose,
 } from './protocol/types.js';
+import { SubscriptionRegistry } from './subscriptions/registry.js';
+import type { SubscriptionHandler } from './subscriptions/types.js';
 import type { Transport } from './transport/types.js';
 import { WsTransport } from './transport/ws.js';
 import { deferred, type Deferred } from './util/deferred.js';
@@ -55,6 +59,7 @@ interface BatchItem {
 export interface ManagerEvents {
   'client-state': { clientId: ClientId; state: ConnectionState };
   'client-banned': { clientId: ClientId; until: number; reason: ErrorKind };
+  'subscription-restored': { method: string; params: readonly unknown[]; drift: boolean };
   error: unknown;
 }
 
@@ -91,6 +96,7 @@ export class ElectrumManager {
   private readonly requestTimeoutMs: number | undefined;
   private readonly transportFactory: (endpoint: Endpoint) => Transport;
   private readonly batcher: MicrotaskBatcher<BatchItem>;
+  private readonly registry: SubscriptionRegistry;
   // Standard typed-event-emitter pattern: store opaquely, cast at the API edge.
   private readonly listeners = new Map<keyof ManagerEvents, Set<(p: unknown) => void>>();
 
@@ -104,6 +110,14 @@ export class ElectrumManager {
     this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
     this.batcher = new MicrotaskBatcher<BatchItem>((items) => {
       this.flushBatch(items).catch((e) => this.emit('error', e));
+    });
+    this.registry = new SubscriptionRegistry({
+      call: (method, params, callOpts) =>
+        // Subscribe wire calls bypass auto-batch — they need an immediate
+        // round-trip so we have the initial status to compare against.
+        this.callDirect(method, params, callOpts),
+      emit: (event, payload) => this.emit(event, payload),
+      pickConnectedClient: () => this.firstConnectedClient(),
     });
     for (const spec of opts.servers) {
       this.installServer(spec);
@@ -122,8 +136,9 @@ export class ElectrumManager {
     await Promise.all(tasks);
   }
 
-  /** Disconnect every server. */
+  /** Disconnect every server and drop all subscriptions. */
   async stop(): Promise<void> {
+    this.registry.clear();
     await Promise.all(
       [...this.clients.values()].map(async (c) => {
         try {
@@ -204,8 +219,27 @@ export class ElectrumManager {
       this.call('blockchain.scripthash.get_history', [hash], opts),
     listUnspent: (hash: Scripthash, opts?: CallOpts) =>
       this.call('blockchain.scripthash.listunspent', [hash], opts),
-    subscribe: (hash: Scripthash, opts?: CallOpts) =>
-      this.call('blockchain.scripthash.subscribe', [hash], opts),
+    /**
+     * Subscribe to scripthash status changes. The handler is invoked once
+     * with the initial status and then on every server-pushed change. The
+     * returned `Unsubscribe` removes this handler; when the last handler for
+     * a given scripthash is gone the manager sends
+     * `blockchain.scripthash.unsubscribe` to the bound server.
+     *
+     * Multiple callers asking for the same scripthash share one wire
+     * subscription — handlers fan out from a single notification stream.
+     */
+    subscribe: (hash: Scripthash, handler: SubscriptionHandler<ScripthashStatus>) =>
+      this.registry.subscribe(
+        'blockchain.scripthash.subscribe',
+        [hash],
+        handler as SubscriptionHandler,
+      ),
+    /**
+     * Direct wire `blockchain.scripthash.unsubscribe`. Bypasses the
+     * SubscriptionRegistry; use the `Unsubscribe` returned from
+     * `subscribe(...)` for the registry-managed path.
+     */
     unsubscribe: (hash: Scripthash, opts?: CallOpts) =>
       this.call('blockchain.scripthash.unsubscribe', [hash], opts),
   };
@@ -235,12 +269,15 @@ export class ElectrumManager {
 
   readonly headers = {
     /**
-     * Fetches the current tip and registers a wire-level subscription with
-     * the chosen server. Returns the initial header. Notifications fired by
-     * the server after subscription are silently dropped until M4 wires the
-     * SubscriptionRegistry with handler routing — at which point this method
-     * is replaced by `subscribe(handler)` and a separate `getTip()` shorthand.
+     * Subscribe to new chain tips. Handler fires immediately with the
+     * current tip and on every header notification. Returns `Unsubscribe`
+     * (last handler removed → manager stops dispatching; the wire
+     * `blockchain.headers.subscribe` has no paired unsubscribe so the
+     * server keeps pushing for the session — documented quirk).
      */
+    subscribe: (handler: SubscriptionHandler<BlockHeader>) =>
+      this.registry.subscribe('blockchain.headers.subscribe', [], handler as SubscriptionHandler),
+    /** Shorthand for "fetch the current tip without subscribing." */
     getTip: (opts?: CallOpts) => this.call('blockchain.headers.subscribe', [], opts),
     getHeader: (height: number, opts?: CallOpts) =>
       this.call('blockchain.block.header', [height], opts),
@@ -317,6 +354,24 @@ export class ElectrumManager {
       transport,
       ...(this.requestTimeoutMs !== undefined ? { requestTimeoutMs: this.requestTimeoutMs } : {}),
     });
+    client.onNotification((notif) => {
+      const { subParams, status } = decodeNotification(notif.method, notif.params);
+      this.registry.notify(spec.id, notif.method, subParams, status);
+    });
+    client.onStateChange((state) => {
+      this.emit('client-state', { clientId: spec.id, state });
+      if (state === 'connected') {
+        // Fire-and-forget: rebind any orphaned subs onto the new connection.
+        // Errors surface through the manager `error` event via runAttempts.
+        this.registry.restoreOrphans().catch((e) => this.emit('error', e));
+      } else if (state === 'disconnected') {
+        this.registry.clientDisconnected(spec.id);
+        // Subs bound to this client are now orphaned — immediately try to
+        // re-bind them onto any other already-connected client without
+        // waiting for the next state transition.
+        this.registry.restoreOrphans().catch((e) => this.emit('error', e));
+      }
+    });
     this.clients.set(spec.id, client);
     this.meta.set(spec.id, {
       bannedUntil: undefined,
@@ -375,6 +430,36 @@ export class ElectrumManager {
       if (!isRetryable(outcome.errorKind)) throw outcome.error;
     }
     throw lastErr ?? new NoClientAvailableError('exhausted retry budget');
+  }
+
+  /**
+   * Direct-path call (no auto-batch). Used by SubscriptionRegistry for
+   * subscribe/unsubscribe wire calls — those need a guaranteed round-trip
+   * on a known client so we have the initial status to compare against,
+   * which auto-batch coalescing would obscure.
+   */
+  private callDirect(
+    method: string,
+    params: readonly unknown[],
+    opts?: CallOpts,
+  ): Promise<unknown> {
+    return this.runAttempts(method, params, new Set<ClientId>(), this.maxAttemptsFor(opts), 0);
+  }
+
+  /**
+   * Return the id of any client currently in `connected` state, or `null`.
+   * SubscriptionRegistry uses this to bind / re-bind subs without consulting
+   * the routing policy (subs are pinned, not load-balanced).
+   */
+  private firstConnectedClient(): ClientId | null {
+    const now = Date.now();
+    for (const [id, client] of this.clients) {
+      if (client.getState() !== 'connected') continue;
+      const meta = this.meta.get(id);
+      if (meta?.bannedUntil !== undefined && meta.bannedUntil > now) continue;
+      return id;
+    }
+    return null;
   }
 
   /**
@@ -651,4 +736,34 @@ function isRetryable(kind: ErrorKind): boolean {
 
 function defaultTransportFactory(endpoint: Endpoint): Transport {
   return new WsTransport({ endpoint });
+}
+
+/**
+ * Map a server-pushed notification's wire shape onto the (subParams, status)
+ * pair that SubscriptionRegistry indexes by.
+ *
+ * Wire shapes are method-specific:
+ *
+ *  - `blockchain.scripthash.subscribe` notification: `params = [scripthash, status]`
+ *    → registry key params = [scripthash], status payload = the second element.
+ *  - `blockchain.headers.subscribe` notification: `params = [BlockHeader]`
+ *    → registry key params = [], status payload = the first element.
+ *
+ * For unrecognized notification methods we fall through to `[]` key + first-
+ * element status; nothing matches in the registry so the notification is
+ * silently dropped (intentional — only methods we know how to subscribe to
+ * have records).
+ */
+function decodeNotification(
+  method: string,
+  params: readonly unknown[],
+): { subParams: readonly unknown[]; status: unknown } {
+  switch (method) {
+    case 'blockchain.scripthash.subscribe':
+      return { subParams: [params[0]], status: params[1] };
+    case 'blockchain.headers.subscribe':
+      return { subParams: [], status: params[0] };
+    default:
+      return { subParams: [], status: params[0] };
+  }
 }

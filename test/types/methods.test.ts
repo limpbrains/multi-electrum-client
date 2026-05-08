@@ -14,7 +14,7 @@
 
 import { expectTypeOf } from 'vitest';
 
-import type { ElectrumManager, TxVerbose } from '../../src/index.js';
+import type { ElectrumManager, TxVerbose, Unsubscribe } from '../../src/index.js';
 import type {
   Balance,
   BlockHeader,
@@ -87,8 +87,14 @@ function _typeAssertions(): void {
   expectTypeOf(m.scripthash.getBalance('hash')).toEqualTypeOf<Promise<Balance>>();
   expectTypeOf(m.scripthash.getHistory('hash')).toEqualTypeOf<Promise<readonly HistoryEntry[]>>();
   expectTypeOf(m.scripthash.listUnspent('hash')).toEqualTypeOf<Promise<readonly Unspent[]>>();
-  expectTypeOf(m.scripthash.subscribe('hash')).toEqualTypeOf<Promise<ScripthashStatus>>();
+  // M4: handler-based subscription returns Unsubscribe.
+  expectTypeOf(
+    m.scripthash.subscribe('hash', (_status: ScripthashStatus) => undefined),
+  ).toEqualTypeOf<Promise<Unsubscribe>>();
   expectTypeOf(m.scripthash.unsubscribe('hash')).toEqualTypeOf<Promise<boolean>>();
+  expectTypeOf(m.headers.subscribe((_h: BlockHeader) => undefined)).toEqualTypeOf<
+    Promise<Unsubscribe>
+  >();
 
   expectTypeOf(m.transaction.get('txid')).toEqualTypeOf<Promise<RawTxHex>>();
   expectTypeOf(m.transaction.broadcast('hex')).toEqualTypeOf<Promise<TxId>>();
