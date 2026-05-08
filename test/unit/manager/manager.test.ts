@@ -87,6 +87,25 @@ describe('ElectrumManager — basic call routing', () => {
     await manager.stop();
   });
 
+  it('aborts when a buggy policy keeps returning the same stale id forever', async () => {
+    const h = buildHarness();
+    const stuckPolicy = {
+      pick() {
+        return 'gone'; // ignores `excluded`
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: stuckPolicy,
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await expect(manager.call('server.ping', [])).rejects.toThrow(/stale client ids/);
+    await manager.stop();
+  });
+
   it('forwards a consistent ctx.attempt to the policy across call paths', async () => {
     const h = buildHarness();
     const seen: number[] = [];
