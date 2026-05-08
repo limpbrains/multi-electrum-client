@@ -124,4 +124,24 @@ describe('bindAppState', () => {
     bindAppState(manager, appState);
     expect(() => appState.fire('background')).not.toThrow();
   });
+
+  it('auto-disposes the listener when the manager hits stopped', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    const appState = fakeAppState();
+    bindAppState(manager, appState);
+    expect(appState.listenerCount()).toBe(1);
+
+    await manager.stop();
+    // First fire after stop: listener observes 'stopped' and removes itself.
+    appState.fire('background');
+    expect(appState.listenerCount()).toBe(0);
+  });
 });

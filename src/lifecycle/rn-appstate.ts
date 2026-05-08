@@ -29,8 +29,23 @@ export interface BindAppStateOptions {
 
 /**
  * Bind manager lifecycle to RN AppState transitions. Returns a disposer.
- * Errors from `suspend`/`resume` are swallowed (manager already emits them
- * via `error`); we don't want a flaky transition to crash the listener.
+ *
+ * Errors from `suspend`/`resume` are swallowed inside the listener so a
+ * flaky transition can't crash the AppState pipeline; the manager surfaces
+ * the underlying cause on its own `error` event.
+ *
+ * The listener auto-disposes itself the first time it observes
+ * `manager.state === 'stopped'`. Without this, a stopped manager paired
+ * with a long-lived AppState (the user forgot to `dispose()`) would
+ * receive a spam of `SuspendedError('cannot suspend a stopped manager')`
+ * on every foreground/background flip for the rest of the process.
+ *
+ * Caveat: RN can emit `inactive` then `background` within ~50 ms on iOS,
+ * and a quick app-switcher glance can produce
+ * `active → inactive → active`. Both `suspend()` and `resume()` are
+ * idempotent on their target states; rapid back-to-back transitions
+ * settle on the last one. There is no internal debounce — if you need
+ * one for telemetry / battery reasons, wrap your own.
  */
 export function bindAppState(
   manager: ElectrumManager,
@@ -39,12 +54,23 @@ export function bindAppState(
 ): () => void {
   const suspendOn = opts.suspendOn ?? ['background', 'inactive'];
   const resumeOn = opts.resumeOn ?? ['active'];
+  let disposed = false;
   const sub = appState.addEventListener('change', (state) => {
+    if (disposed) return;
+    if (manager.state === 'stopped') {
+      disposed = true;
+      sub.remove();
+      return;
+    }
     if (suspendOn.includes(state)) {
       manager.suspend().catch(() => undefined);
     } else if (resumeOn.includes(state)) {
       manager.resume().catch(() => undefined);
     }
   });
-  return () => sub.remove();
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    sub.remove();
+  };
 }
