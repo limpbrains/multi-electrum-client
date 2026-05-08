@@ -190,7 +190,9 @@ export class ElectrumManager {
     ...args: CallArgs<M>
   ): Promise<M extends MethodName ? ResultOf<M> : unknown>;
   async call(method: string, params: readonly unknown[] = [], opts?: CallOpts): Promise<unknown> {
-    const useBatch = opts?.autoBatch ?? this.autoBatchEnabled;
+    // `preferClient` pins to a specific server; batching groups by policy.pick
+    // and would lose the pin, so always take the direct path when set.
+    const useBatch = opts?.preferClient === undefined && (opts?.autoBatch ?? this.autoBatchEnabled);
     if (useBatch) {
       const def = deferred<unknown>();
       this.batcher.enqueue({
@@ -203,7 +205,14 @@ export class ElectrumManager {
       });
       return def.promise;
     }
-    return this.runAttempts(method, params, new Set<ClientId>(), this.maxAttemptsFor(opts), 0);
+    return this.runAttempts(
+      method,
+      params,
+      new Set<ClientId>(),
+      this.maxAttemptsFor(opts),
+      0,
+      opts,
+    );
   }
 
   /**
@@ -230,11 +239,7 @@ export class ElectrumManager {
      * subscription — handlers fan out from a single notification stream.
      */
     subscribe: (hash: Scripthash, handler: SubscriptionHandler<ScripthashStatus>) =>
-      this.registry.subscribe(
-        'blockchain.scripthash.subscribe',
-        [hash],
-        handler as SubscriptionHandler,
-      ),
+      this.registry.subscribe<ScripthashStatus>('blockchain.scripthash.subscribe', [hash], handler),
     /**
      * Direct wire `blockchain.scripthash.unsubscribe`. Bypasses the
      * SubscriptionRegistry; use the `Unsubscribe` returned from
@@ -276,7 +281,7 @@ export class ElectrumManager {
      * server keeps pushing for the session — documented quirk).
      */
     subscribe: (handler: SubscriptionHandler<BlockHeader>) =>
-      this.registry.subscribe('blockchain.headers.subscribe', [], handler as SubscriptionHandler),
+      this.registry.subscribe<BlockHeader>('blockchain.headers.subscribe', [], handler),
     /** Shorthand for "fetch the current tip without subscribing." */
     getTip: (opts?: CallOpts) => this.call('blockchain.headers.subscribe', [], opts),
     getHeader: (height: number, opts?: CallOpts) =>
@@ -396,6 +401,7 @@ export class ElectrumManager {
     excluded: Set<ClientId>,
     maxAttempts: number,
     initialAttempt: number,
+    opts?: CallOpts,
     seed?: Error,
   ): Promise<unknown> {
     let lastErr: Error | undefined = seed;
@@ -407,7 +413,7 @@ export class ElectrumManager {
     let missCount = 0;
     const missCap = this.clients.size + 4;
     while (attempt < maxAttempts) {
-      const outcome = await this.attemptOnce(method, params, excluded, attempt);
+      const outcome = await this.attemptOnce(method, params, excluded, attempt, opts);
       if (outcome.kind === 'success') return outcome.value;
       if (outcome.kind === 'no-pick') throw lastErr ?? outcome.error;
       if (outcome.kind === 'client-missing') {
@@ -443,7 +449,14 @@ export class ElectrumManager {
     params: readonly unknown[],
     opts?: CallOpts,
   ): Promise<unknown> {
-    return this.runAttempts(method, params, new Set<ClientId>(), this.maxAttemptsFor(opts), 0);
+    return this.runAttempts(
+      method,
+      params,
+      new Set<ClientId>(),
+      this.maxAttemptsFor(opts),
+      0,
+      opts,
+    );
   }
 
   /**
@@ -474,15 +487,35 @@ export class ElectrumManager {
     params: readonly unknown[],
     excluded: ReadonlySet<ClientId>,
     attempt: number,
+    opts?: CallOpts,
   ): Promise<AttemptOutcome> {
-    const ctx: PickContext = {
-      request: { method, params },
-      attempt,
-      excluded,
-      candidates: this.buildCandidates(),
-      now: Date.now(),
-    };
-    const clientId = this.policy.pick(ctx);
+    const candidates = this.buildCandidates();
+    const now = Date.now();
+
+    // `preferClient` lets the registry route an unsubscribe (or any other
+    // pinned call) at the exact server we're targeting without consulting
+    // the policy. Honored only when the client is in the pool, connected,
+    // not banned, and not in `excluded`. Falls through to `policy.pick`
+    // otherwise.
+    const preferred = opts?.preferClient;
+    let clientId: ClientId | null = null;
+    if (preferred !== undefined && !excluded.has(preferred)) {
+      const view = candidates.find((c) => c.id === preferred);
+      if (view && view.state === 'connected' && (view.bannedUntil ?? 0) <= now) {
+        clientId = preferred;
+      }
+    }
+    if (clientId === null) {
+      const ctx: PickContext = {
+        request: { method, params },
+        attempt,
+        excluded,
+        candidates,
+        now,
+        ...(opts?.stickyKey !== undefined ? { stickyKey: opts.stickyKey } : {}),
+      };
+      clientId = this.policy.pick(ctx);
+    }
     if (clientId === null) {
       return {
         kind: 'no-pick',
@@ -526,6 +559,7 @@ export class ElectrumManager {
         excluded: item.excluded,
         candidates,
         now,
+        ...(item.opts?.stickyKey !== undefined ? { stickyKey: item.opts.stickyKey } : {}),
       };
       const clientId = this.policy.pick(ctx);
       if (clientId === null) {
@@ -560,6 +594,7 @@ export class ElectrumManager {
           item.excluded,
           this.maxAttemptsFor(item.opts),
           item.attempt,
+          item.opts,
         ).then(
           (v) => item.def.resolve(v),
           (e) => item.def.reject(e),
@@ -624,6 +659,7 @@ export class ElectrumManager {
       item.excluded,
       this.maxAttemptsFor(item.opts),
       item.attempt,
+      item.opts,
       lastError,
     ).then(
       (v) => item.def.resolve(v),

@@ -91,6 +91,14 @@ const UNSUB_METHOD: Record<string, string> = {
 export class SubscriptionRegistry {
   private readonly env: SubscriptionEnv;
   private readonly subs = new Map<string, SubscriptionRecord>();
+  /**
+   * In-flight first-subscribe wire calls keyed by canonical key. Two callers
+   * subscribing in the same tick must share the same wire call: without this
+   * gate both would see `subs.get(key) === undefined`, both would issue
+   * `env.call`, and the second `subs.set` would overwrite the first record
+   * (orphaning the first handler). Cleared once the wire call settles.
+   */
+  private readonly pending = new Map<string, Promise<SubscriptionRecord>>();
 
   constructor(env: SubscriptionEnv) {
     this.env = env;
@@ -105,22 +113,34 @@ export class SubscriptionRegistry {
    * subscribe call AND for every subsequent server-pushed notification on
    * the same key.
    */
-  async subscribe(
+  async subscribe<T = unknown>(
     method: string,
     params: readonly unknown[],
-    handler: SubscriptionHandler,
+    handler: SubscriptionHandler<T>,
   ): Promise<Unsubscribe> {
     const key = canonicalKey(method, params);
+    const h = handler as SubscriptionHandler;
     const existing = this.subs.get(key);
 
     if (existing) {
-      existing.handlers.add(handler);
+      existing.handlers.add(h);
       // New handler joining a live subscription gets the most recently seen
       // status synchronously, so it doesn't have to wait for the next event.
       if (existing.lastKnownStatus !== undefined) {
-        this.invokeHandler(handler, existing.lastKnownStatus);
+        this.invokeHandler(h, existing.lastKnownStatus);
       }
-      return this.makeUnsub(key, handler);
+      return this.makeUnsub(key, h);
+    }
+
+    // Coalesce concurrent first-subscribes onto one wire call.
+    const inflight = this.pending.get(key);
+    if (inflight) {
+      const record = await inflight;
+      record.handlers.add(h);
+      if (record.lastKnownStatus !== undefined) {
+        this.invokeHandler(h, record.lastKnownStatus);
+      }
+      return this.makeUnsub(key, h);
     }
 
     const clientId = this.env.pickConnectedClient();
@@ -128,19 +148,32 @@ export class SubscriptionRegistry {
       throw new Error(`subscribe(${method}): no connected client to bind to`);
     }
 
-    const status = await this.env.call(method, params, { preferClient: clientId });
-    const record: SubscriptionRecord = {
-      key,
-      method,
-      params,
-      handlers: new Set([handler]),
-      clientId,
-      lastKnownStatus: status,
-      generation: 1,
-    };
-    this.subs.set(key, record);
-    this.invokeHandler(handler, status);
-    return this.makeUnsub(key, handler);
+    const task = (async () => {
+      const status = await this.env.call(method, params, {
+        preferClient: clientId,
+        stickyKey: key,
+      });
+      const record: SubscriptionRecord = {
+        key,
+        method,
+        params,
+        handlers: new Set([h]),
+        clientId,
+        lastKnownStatus: status,
+        generation: 1,
+      };
+      this.subs.set(key, record);
+      return record;
+    })();
+    this.pending.set(key, task);
+    let record: SubscriptionRecord;
+    try {
+      record = await task;
+    } finally {
+      this.pending.delete(key);
+    }
+    this.invokeHandler(h, record.lastKnownStatus);
+    return this.makeUnsub(key, h);
   }
 
   /**
@@ -231,7 +264,10 @@ export class SubscriptionRegistry {
     }
     let status: unknown;
     try {
-      status = await this.env.call(record.method, record.params, { preferClient: clientId });
+      status = await this.env.call(record.method, record.params, {
+        preferClient: clientId,
+        stickyKey: record.key,
+      });
     } catch {
       // Rebind failed (e.g. server doesn't support the method). Leave
       // orphaned for the next connect to retry. Manager 'error' event has

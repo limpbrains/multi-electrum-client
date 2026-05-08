@@ -151,6 +151,10 @@ describe('Manager subscriptions — restore on reconnect', () => {
     });
     await manager.start();
 
+    // Listener registered up front so we don't race with the rebind path.
+    const restored: { method: string; params: readonly unknown[]; drift: boolean }[] = [];
+    manager.on('subscription-restored', (p) => restored.push(p));
+
     // First subscribe lands on `a` (round-robin first eligible).
     const handler = vi.fn();
     const subPromise = manager.scripthash.subscribe('HASH', handler);
@@ -162,19 +166,21 @@ describe('Manager subscriptions — restore on reconnect', () => {
     // Server `a` drops the connection.
     handler.mockClear();
     h.transports.get('a')!.pushClose(1006, 'abnormal');
+    // Let state-change listener fire and restoreOrphans send the rebind to `b`.
     await delay(0);
-    // Wait a tick for restoreOrphans to run.
     await delay(0);
-
-    // Manager rebinds to `b`. Status drifted in the gap.
-    const restored: unknown[] = [];
-    manager.on('subscription-restored', (p) => restored.push(p));
-
     h.reply('b', (req: { id: number }) => ({ id: req.id, result: 'AFTER' }));
-    // Need another tick for restore promise chain to settle.
+    // Settle the restore promise chain so the synthetic notify + emit run.
     await delay(10);
 
     expect(handler).toHaveBeenCalledWith('AFTER');
+    expect(restored).toEqual([
+      {
+        method: 'blockchain.scripthash.subscribe',
+        params: ['HASH'],
+        drift: true,
+      },
+    ]);
 
     await unsub();
     await manager.stop();

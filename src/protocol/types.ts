@@ -186,7 +186,21 @@ export interface CallOpts {
   timeoutMs?: number;
   autoBatch?: boolean;
   retry?: 'auto' | 'none' | { maxAttempts: number };
+  /**
+   * Hint to bypass `policy.pick` and route to this exact client. Honored by
+   * the manager when the client is connected, non-banned, and not in the
+   * `excluded` set; otherwise the call falls through to the normal pick.
+   * Used internally by SubscriptionRegistry to send wire-level
+   * unsubscribes to the same server we subscribed on.
+   */
   preferClient?: ClientId;
+  /**
+   * Forwarded into `PickContext.stickyKey` so user policies wrapped in
+   * `withSticky(...)` can pin requests beyond the scripthash heuristic.
+   * Default: undefined (the policy receives the field as undefined and
+   * falls back to its own heuristics).
+   */
+  stickyKey?: string;
   bypassCache?: boolean;
   failOnSuspend?: boolean;
 }
