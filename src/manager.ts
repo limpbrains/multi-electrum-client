@@ -55,7 +55,11 @@ export interface ManagerEvents {
 type AttemptOutcome =
   | { kind: 'success'; clientId: ClientId; value: unknown }
   | { kind: 'error'; clientId: ClientId; error: Error; errorKind: ErrorKind }
-  | { kind: 'no-client'; error: Error };
+  // policy returned null → no eligible client at all; bail.
+  | { kind: 'no-pick'; error: Error }
+  // policy named a client we no longer have (race with removeServer or a
+  // stale id from a custom policy) → exclude + retry.
+  | { kind: 'client-missing'; clientId: ClientId; error: Error };
 
 export class ElectrumManager {
   readonly network: Network;
@@ -229,10 +233,14 @@ export class ElectrumManager {
   }
 
   /**
-   * Loop attemptOnce until success, non-retryable error, or budget exhausted.
-   * Single source of routing logic for both the direct call path and the
-   * partial-batch retry path. `seed` lets the retry path carry the original
-   * failure cause through to a final NoClientAvailableError.
+   * Loop attemptOnce until success, non-retryable error, no-pick, or budget
+   * exhausted. Single source of routing logic for both the direct call path
+   * and the partial-batch retry path. `seed` lets the retry path carry the
+   * original failure cause through to a final NoClientAvailableError.
+   *
+   * `client-missing` outcomes (policy named a client we no longer have) are
+   * recovered transparently — exclude that id and try again without burning
+   * a real attempt. Retries are reserved for actual failures.
    */
   private async runAttempts(
     method: string,
@@ -245,9 +253,15 @@ export class ElectrumManager {
     let lastErr: Error | undefined = seed;
     let attempt = initialAttempt;
     while (attempt < maxAttempts) {
-      const outcome = await this.attemptOnce(method, params, excluded);
+      const outcome = await this.attemptOnce(method, params, excluded, attempt);
       if (outcome.kind === 'success') return outcome.value;
-      if (outcome.kind === 'no-client') throw lastErr ?? outcome.error;
+      if (outcome.kind === 'no-pick') throw lastErr ?? outcome.error;
+      if (outcome.kind === 'client-missing') {
+        excluded.add(outcome.clientId);
+        // Don't bump `attempt`: missing-client doesn't count as a real try.
+        continue;
+      }
+      // 'error'
       lastErr = outcome.error;
       excluded.add(outcome.clientId);
       attempt++;
@@ -259,16 +273,19 @@ export class ElectrumManager {
   /**
    * One pick-and-call cycle: ask the policy, send the request, classify the
    * outcome, record telemetry, ban on rate-limit. Caller decides whether to
-   * loop based on the returned outcome kind.
+   * loop based on the returned outcome kind. `attempt` is forwarded into
+   * `PickContext.attempt` verbatim so user policies see one consistent value
+   * regardless of which call path drove the pick.
    */
   private async attemptOnce(
     method: string,
     params: readonly unknown[],
     excluded: ReadonlySet<ClientId>,
+    attempt: number,
   ): Promise<AttemptOutcome> {
     const ctx: PickContext = {
       request: { method, params },
-      attempt: excluded.size,
+      attempt,
       excluded,
       candidates: this.buildCandidates(),
       now: Date.now(),
@@ -276,14 +293,15 @@ export class ElectrumManager {
     const clientId = this.policy.pick(ctx);
     if (clientId === null) {
       return {
-        kind: 'no-client',
+        kind: 'no-pick',
         error: new NoClientAvailableError(`no eligible client for ${method}`),
       };
     }
     const client = this.clients.get(clientId);
     if (!client) {
       return {
-        kind: 'no-client',
+        kind: 'client-missing',
+        clientId,
         error: new NoClientAvailableError(`client ${clientId} no longer in pool`),
       };
     }

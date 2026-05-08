@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ElectrumManager } from '../../../src/manager.js';
 import { failover, preferFastest, roundRobin } from '../../../src/policy/builtins.js';
+import type { PickContext } from '../../../src/policy/types.js';
 import type { ServerSpec } from '../../../src/protocol/types.js';
 import { buildHarness } from '../../helpers/managerHarness.js';
 
@@ -53,6 +54,66 @@ describe('ElectrumManager — basic call routing', () => {
     const a = views.find((v) => v.id === 'a')!;
     expect(a.telemetry.success.count).toBe(1);
     expect(a.telemetry.errors.consecutive).toBe(0);
+
+    await manager.stop();
+  });
+
+  it('recovers when policy returns a stale id (client no longer in pool)', async () => {
+    const h = buildHarness();
+    let calls = 0;
+    const stalePolicy = {
+      pick({ excluded }: { excluded: ReadonlySet<string> }) {
+        calls++;
+        if (calls === 1) return 'gone'; // not in pool
+        if (excluded.has('gone')) return 'a';
+        return null;
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [{ id: 'a', host: 'a', port: 1, protocol: 'ws' }],
+      policy: stalePolicy,
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    const p = manager.call('server.ping', []);
+    await delay(0);
+    h.reply('a', (req: { id: number }) => ({ id: req.id, result: 'pong' }));
+    expect(await p).toBe('pong');
+    expect(calls).toBeGreaterThanOrEqual(2);
+
+    await manager.stop();
+  });
+
+  it('forwards a consistent ctx.attempt to the policy across call paths', async () => {
+    const h = buildHarness();
+    const seen: number[] = [];
+    const recordingPolicy = {
+      pick({ candidates, excluded, now, attempt }: PickContext) {
+        seen.push(attempt);
+        const usable = candidates.find(
+          (c) => c.state === 'connected' && !excluded.has(c.id) && (c.bannedUntil ?? 0) <= now,
+        );
+        return usable ? usable.id : null;
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: recordingPolicy,
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    const p = manager.call('server.ping', []);
+    await delay(0);
+    h.reply('a', (req: { id: number }) => ({ id: req.id, result: 'pong' }));
+    await p;
+
+    expect(seen[0]).toBe(0);
 
     await manager.stop();
   });
