@@ -77,6 +77,15 @@ export type { Transport, TransportEvent, TransportListener } from './transport/t
 // Manager + RoutingPolicy built-ins (M2) + subscriptions (M4):
 export { ElectrumManager, type ManagerEvents } from './manager.js';
 export type { SubscriptionHandler, Unsubscribe } from './subscriptions/types.js';
+
+// Lifecycle (M5):
+export type { LifecycleState, SuspendOptions } from './lifecycle/types.js';
+export {
+  bindAppState,
+  type AppStateLike,
+  type AppStateStatus,
+  type BindAppStateOptions,
+} from './lifecycle/rn-appstate.js';
 export {
   roundRobin,
   failover,
