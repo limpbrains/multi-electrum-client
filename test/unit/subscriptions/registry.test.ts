@@ -433,3 +433,55 @@ describe('SubscriptionRegistry — last-handler unsub gating', () => {
     expect(reg.size()).toBe(0);
   });
 });
+
+describe('SubscriptionRegistry — same-ref handler dedup (Set semantics)', () => {
+  it('subscribing the same function reference twice yields one slot; first unsub kills both', async () => {
+    const env = fakeEnv();
+    env.setStatus('blockchain.scripthash.subscribe', ['H'], 'INIT');
+    const reg = new SubscriptionRegistry(env);
+
+    const handler = vi.fn();
+    const unsubA = await reg.subscribe('blockchain.scripthash.subscribe', ['H'], handler);
+    const unsubB = await reg.subscribe('blockchain.scripthash.subscribe', ['H'], handler);
+    // Set, not multiset — second subscribe is a no-op for the handler set.
+    expect(env.callLog).toHaveLength(1);
+
+    handler.mockClear();
+    reg.notify('A', 'blockchain.scripthash.subscribe', ['H'], 'NEW');
+    expect(handler).toHaveBeenCalledTimes(1); // not 2
+
+    // First unsub removes the handler entirely; record drops + wire unsub fires.
+    await unsubA();
+    expect(reg.size()).toBe(0);
+    // Second unsub is a no-op (record already gone).
+    await unsubB();
+    expect(reg.size()).toBe(0);
+  });
+});
+
+describe('SubscriptionRegistry — removeServer-style flow', () => {
+  it('orphan + restoreOrphans rebinds onto a remaining connected client', async () => {
+    const env = fakeEnv();
+    env.setStatus('blockchain.scripthash.subscribe', ['H'], 'INIT');
+    const reg = new SubscriptionRegistry(env);
+
+    const handler = vi.fn();
+    await reg.subscribe('blockchain.scripthash.subscribe', ['H'], handler);
+
+    // Simulate manager.removeServer('A'): orphan + flip pickConnectedClient
+    // to a different client. restoreOrphans should bind on the new client.
+    handler.mockClear();
+    reg.clientDisconnected('A');
+    env.setConnected('B');
+    env.setStatus('blockchain.scripthash.subscribe', ['H'], 'AFTER');
+    await reg.restoreOrphans();
+
+    expect(handler).toHaveBeenCalledWith('AFTER');
+    // Notification on the new client now dispatches; old client's would not.
+    handler.mockClear();
+    reg.notify('B', 'blockchain.scripthash.subscribe', ['H'], 'NEXT');
+    expect(handler).toHaveBeenCalledWith('NEXT');
+    reg.notify('A', 'blockchain.scripthash.subscribe', ['H'], 'STALE');
+    expect(handler).not.toHaveBeenCalledWith('STALE');
+  });
+});

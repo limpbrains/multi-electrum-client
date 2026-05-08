@@ -98,6 +98,13 @@ interface SubscriptionRecord {
   key: string;
   method: string;
   params: readonly unknown[];
+  /**
+   * Set, not multiset: subscribing the *same function reference* twice
+   * occupies one slot, so the first `unsub` removes it for both callers.
+   * This matches `EventTarget.addEventListener` semantics. Callers who
+   * truly want two independent subscriptions should pass two distinct
+   * handler functions (e.g. wrap with arrow functions).
+   */
   handlers: Set<SubscriptionHandler>;
   /** Client we last subscribed on; `null` if orphaned. */
   clientId: ClientId | null;
