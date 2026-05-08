@@ -253,6 +253,14 @@ export class ElectrumManager {
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot suspend a stopped manager');
     }
+    // `created` is reachable when bindAppState fires before start() — app
+    // launches in the background and the AppState listener races ahead of
+    // the user's start() call. No sockets / no in-flight to drain; just
+    // record the state flip so resume() works as expected.
+    if (this.lifecycle === 'created') {
+      this.lifecycle = 'suspended';
+      return;
+    }
     this.lifecycle = 'suspending';
     const graceMs = opts.graceMs ?? 2000;
     const cancelInFlight = opts.cancelInFlight ?? false;
@@ -291,8 +299,12 @@ export class ElectrumManager {
     for (const t of this.discoverTimers.values()) clearTimeout(t);
     this.discoverTimers.clear();
     // Tip becomes stale across suspend; cache writes are gated until
-    // `resume()` re-establishes the headers subscription.
+    // `resume()` re-establishes the headers subscription. The unsub handle
+    // is dropped (not invoked) — registry.clientDisconnected fired during
+    // disconnect already orphaned the underlying record, and resume() will
+    // create a fresh subscription rather than reusing this one.
     this.tipHeight = undefined;
+    this.tipUnsub = null;
     // Note: registry / suspendQueue / cache state preserved.
     this.lifecycle = 'suspended';
   }
@@ -323,9 +335,8 @@ export class ElectrumManager {
         }
       }),
     );
-    // Re-install the tip subscription if a cache was configured. The user
-    // may have closed it via stop+start cycle; if `tipUnsub` is non-null
-    // we left a stale handle around — reset it.
+    // Re-install the tip subscription if a cache was configured. `tipUnsub`
+    // was cleared inside `suspend()`; it should always be `null` here.
     if (this.cache && this.tipUnsub === null) {
       try {
         this.tipUnsub = await this.registry.subscribe<BlockHeader>(
@@ -341,10 +352,15 @@ export class ElectrumManager {
         this.emit('error', e);
       }
     }
-    this.lifecycle = 'running';
-    // Drain queued calls in arrival order. Re-issue via the public path so
-    // they flow through cache, batch, retry, and timeout from this moment.
+    // Drain order matters: splice the queue while we're still `resuming`
+    // (so any call() that lands between this line and the lifecycle flip
+    // joins the queue rather than dispatching ahead of the drained
+    // items), then flip to `running`, then re-issue. The for-loop is
+    // synchronous, so all drained calls hit the lifecycle gate (now
+    // `running`) and dispatch in arrival order before any subsequent
+    // microtask-scheduled caller can sneak in.
     const queued = this.suspendQueue.splice(0);
+    this.lifecycle = 'running';
     for (const item of queued) {
       this.call(item.method, item.params, item.opts).then(
         (v) => item.def.resolve(v),
@@ -393,11 +409,17 @@ export class ElectrumManager {
     ...args: CallArgs<M>
   ): Promise<M extends MethodName ? ResultOf<M> : unknown>;
   async call(method: string, params: readonly unknown[] = [], opts?: CallOpts): Promise<unknown> {
-    // Lifecycle gate: while the manager is in (or transitioning into)
-    // `suspended`, calls either reject (when `failOnSuspend` is set) or
-    // queue and replay on `resume()`. The queue preserves ordering and
-    // resets the timeout clock to start ticking only after resume.
-    if (this.lifecycle === 'suspending' || this.lifecycle === 'suspended') {
+    // Lifecycle gate: while the manager is in (or transitioning through)
+    // a non-running state, calls either reject (when `failOnSuspend` is
+    // set) or queue and replay on `resume()`. `resuming` is included so
+    // calls submitted between the state flip to `resuming` and the final
+    // flip to `running` don't race ahead of items already in the queue —
+    // ordering would otherwise break.
+    if (
+      this.lifecycle === 'suspending' ||
+      this.lifecycle === 'suspended' ||
+      this.lifecycle === 'resuming'
+    ) {
       if (opts?.failOnSuspend) {
         throw new SuspendedError(`manager is ${this.lifecycle}`);
       }

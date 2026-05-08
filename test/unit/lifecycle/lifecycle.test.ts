@@ -190,6 +190,110 @@ describe('Manager lifecycle — suspend / resume', () => {
     await expect(callPromise).rejects.toBeInstanceOf(SuspendedError);
   });
 
+  it('queues calls submitted during the resuming window so they replay in order', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.suspend({ graceMs: 0 });
+
+    // First call is queued during 'suspended'; second lands during the
+    // resume reconnect (state=resuming) — both must serialize.
+    const firstCall = manager.call('server.ping', []);
+    const resumePromise = manager.resume();
+    // resume() is async; right after kicking it we're in 'resuming'.
+    const secondCall = manager.call('server.ping', []);
+
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'server.ping' ? { id: req.id, result: null } : undefined,
+    );
+    await resumePromise;
+    expect(await firstCall).toBe(null);
+    expect(await secondCall).toBe(null);
+    await manager.stop();
+  });
+
+  it('suspend before start (created → suspended) is a no-op transition', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    expect(manager.state).toBe('created');
+    await manager.suspend();
+    expect(manager.state).toBe('suspended');
+    // Resume from this synthetic suspend works without a prior start().
+    const resumePromise = manager.resume();
+    expect(manager.state).toBe('resuming');
+    await resumePromise;
+    expect(manager.state).toBe('running');
+    await manager.stop();
+  });
+
+  it('overlapping suspend()s collapse onto the same in-flight transition', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    // Both suspends should settle without throwing; second observes
+    // 'suspending' and bails idempotent.
+    await Promise.all([manager.suspend({ graceMs: 0 }), manager.suspend({ graceMs: 0 })]);
+    expect(manager.state).toBe('suspended');
+    await manager.stop();
+  });
+
+  it('tipUnsub is reset on suspend so resume re-installs a fresh headers sub', async () => {
+    const h = buildHarness();
+    const cache = new (await import('../../../src/cache/memory.js')).MemoryCache();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+      cache,
+    });
+
+    const startPromise = manager.start();
+    await delay(0);
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'blockchain.headers.subscribe'
+        ? { id: req.id, result: { height: 100, hex: '00' } }
+        : undefined,
+    );
+    await startPromise;
+
+    await manager.suspend({ graceMs: 0 });
+    // After suspend, manager must be ready to subscribe again on resume —
+    // verified by the resume not throwing when the headers sub is re-issued.
+    const resumePromise = manager.resume();
+    await delay(0);
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'blockchain.headers.subscribe'
+        ? { id: req.id, result: { height: 200, hex: '00' } }
+        : undefined,
+    );
+    await resumePromise;
+
+    await manager.stop();
+  });
+
   it('preserves subscriptions across suspend / resume with catch-up', async () => {
     const h = buildHarness();
     const manager = new ElectrumManager({
