@@ -4,10 +4,10 @@
 //
 // Framing: Electrum servers that expose WebSocket commonly bridge to the
 // underlying TCP protocol's newline-delimited JSON-RPC framing. We follow that
-// convention: outbound bytes are appended with `\n`; inbound text is split on
+// convention: outbound text is appended with `\n`; inbound text is split on
 // `\r?\n` and emitted one logical message per `data` event. A LineFramer
-// buffers across frames so partial lines (very rare with WS, but possible if a
-// proxy splits messages) reassemble correctly.
+// buffers across frames so partial lines reassemble correctly if a proxy
+// splits messages.
 
 import type { Endpoint } from '../client.js';
 import { TransportError } from '../errors/types.js';
@@ -33,9 +33,8 @@ export class WsTransport implements Transport {
   private readonly listeners = new Set<TransportListener>();
   private readonly Ctor: WebSocketCtor;
   private readonly connectTimeoutMs: number;
-  private readonly encoder = new TextEncoder();
-  private readonly decoder = new TextDecoder();
   private readonly framer = new LineFramer();
+  private readonly decoder = new TextDecoder();
 
   constructor(opts: WsTransportOpts) {
     if (opts.endpoint.protocol !== 'ws' && opts.endpoint.protocol !== 'wss') {
@@ -61,9 +60,7 @@ export class WsTransport implements Transport {
     const url = `${scheme}://${this.endpoint.host}:${this.endpoint.port}${path}`;
 
     const ws = new this.Ctor(url);
-    if ('binaryType' in ws) {
-      (ws as unknown as { binaryType: BinaryType }).binaryType = 'arraybuffer';
-    }
+    ws.binaryType = 'arraybuffer';
 
     // Attach data handlers synchronously, BEFORE awaiting open, so we don't
     // drop frames the server may send immediately on its connection handler.
@@ -71,7 +68,7 @@ export class WsTransport implements Transport {
       const text = this.toText((ev as MessageEvent).data);
       if (text === undefined) return;
       for (const line of this.framer.push(text)) {
-        this.emit({ type: 'data', bytes: this.encoder.encode(line) });
+        this.emit({ type: 'data', text: line });
       }
     });
 
@@ -109,6 +106,8 @@ export class WsTransport implements Transport {
           clearTimeout(timer);
           reject(new TransportError('connect error', ev));
         } else {
+          // TODO(M4): wrap with readyState + any platform-specific detail
+          // before forwarding so the classifier has more to work with.
           this.emit({ type: 'error', cause: ev });
         }
       });
@@ -117,16 +116,18 @@ export class WsTransport implements Transport {
     this.ws = ws;
   }
 
-  async send(bytes: Uint8Array): Promise<void> {
+  async send(text: string): Promise<void> {
     if (!this.ws) throw new TransportError('not connected');
-    const text = this.decoder.decode(bytes) + '\n';
-    this.ws.send(text);
+    this.ws.send(text + '\n');
   }
 
   async close(): Promise<void> {
     const ws = this.ws;
     if (!ws) return;
-    if (ws.readyState === ws.CLOSED) return;
+    if (ws.readyState === ws.CLOSED) {
+      this.ws = null;
+      return;
+    }
     await new Promise<void>((resolve) => {
       const onClose = () => {
         ws.removeEventListener('close', onClose);
@@ -140,6 +141,7 @@ export class WsTransport implements Transport {
         resolve();
       }
     });
+    this.ws = null;
   }
 
   on(listener: TransportListener): () => void {

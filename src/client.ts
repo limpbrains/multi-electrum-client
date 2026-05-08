@@ -75,8 +75,6 @@ export class ElectrumClient {
   private readonly transport: Transport;
   private readonly requestTimeoutMs: number;
   private readonly inFlight = new Map<JsonRpcId, InFlight>();
-  private readonly encoder = new TextEncoder();
-  private readonly decoder = new TextDecoder();
   private nextId = 1;
   private state: ConnectionState = 'disconnected';
   private notifListener: ((n: JsonRpcNotification) => void) | undefined;
@@ -95,6 +93,9 @@ export class ElectrumClient {
 
   async connect(): Promise<void> {
     if (this.state === 'connected') return;
+    if (this.state === 'connecting') {
+      throw new TransportError('connect already in progress');
+    }
     this.state = 'connecting';
     this.detachTransport = this.transport.on((ev) => this.handle(ev));
     try {
@@ -135,7 +136,7 @@ export class ElectrumClient {
     this.inFlight.set(id, { def: def as Deferred<unknown>, method, timer });
 
     try {
-      await this.transport.send(this.encoder.encode(text));
+      await this.transport.send(text);
     } catch (err) {
       clearTimeout(timer);
       this.inFlight.delete(id);
@@ -167,11 +168,11 @@ export class ElectrumClient {
     }
     let msgs: JsonRpcMessage | JsonRpcMessage[];
     try {
-      msgs = decodeMessage(this.decoder.decode(ev.bytes));
+      msgs = decodeMessage(ev.text);
     } catch {
-      // Bad frame — drop. M4 will surface this through the classifier as a
-      // 'protocol' error against this client, but for M1 we silently drop so
-      // a misbehaving server doesn't take the whole client down.
+      // TODO(M4): forward to ErrorClassifier as a 'protocol' error against
+      // this client. For M1 we silently drop so a misbehaving server can't
+      // take the whole client down.
       return;
     }
     if (Array.isArray(msgs)) {

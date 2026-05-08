@@ -9,8 +9,6 @@ export class MockTransport implements Transport {
   readonly sent: string[] = [];
   connected = false;
   private readonly listeners = new Set<TransportListener>();
-  private readonly enc = new TextEncoder();
-  private readonly dec = new TextDecoder();
 
   constructor(endpoint: Endpoint = { host: 'mock', port: 0, protocol: 'ws' }) {
     this.endpoint = endpoint;
@@ -20,8 +18,8 @@ export class MockTransport implements Transport {
     this.connected = true;
   }
 
-  async send(bytes: Uint8Array): Promise<void> {
-    this.sent.push(this.dec.decode(bytes));
+  async send(text: string): Promise<void> {
+    this.sent.push(text);
   }
 
   async close(): Promise<void> {
@@ -38,7 +36,7 @@ export class MockTransport implements Transport {
   // --- Test helpers ---
 
   pushFromServer(text: string): void {
-    this.emit({ type: 'data', bytes: this.enc.encode(text) });
+    this.emit({ type: 'data', text });
   }
 
   pushClose(code = 1000, reason = ''): void {

@@ -142,4 +142,14 @@ describe('decodeMessage — protocol errors', () => {
     );
     expect(() => decodeMessage('{"id":1,"error":null}')).toThrow(ProtocolError);
   });
+
+  it('throws ProtocolError on non-scalar id', () => {
+    expect(() => decodeMessage('{"id":{},"result":1}')).toThrow(ProtocolError);
+    expect(() => decodeMessage('{"id":[1,2],"result":1}')).toThrow(ProtocolError);
+    expect(() => decodeMessage('{"id":true,"result":1}')).toThrow(ProtocolError);
+  });
+
+  it('throws ProtocolError on by-name (object) notification params', () => {
+    expect(() => decodeMessage('{"method":"server.ping","params":{"a":1}}')).toThrow(ProtocolError);
+  });
 });

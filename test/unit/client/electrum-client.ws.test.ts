@@ -1,15 +1,17 @@
 // Integration-style test that wires ElectrumClient on top of a real WsTransport
-// against a local `ws` server faking an Electrum endpoint. This exercises the
-// full M1 happy path (framing + transport + client) without Docker.
+// against a local `ws` server faking an Electrum endpoint. Exercises the full
+// M1 happy path (framing + transport + client) without Docker.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocket as WsWebSocket } from 'ws';
 
 import { ElectrumClient } from '../../../src/client.js';
 import { WsTransport } from '../../../src/transport/ws.js';
+import { deferred } from '../../../src/util/deferred.js';
 import { startTestWsServer, type TestWsServer } from '../../helpers/wsTestServer.js';
 
 const WebSocketCtor = WsWebSocket as unknown as new (url: string) => WebSocket;
+const HOST = '127.0.0.1';
 
 describe('ElectrumClient over WsTransport (M1 happy path)', () => {
   let srv: TestWsServer;
@@ -42,7 +44,7 @@ describe('ElectrumClient over WsTransport (M1 happy path)', () => {
     });
 
     const transport = new WsTransport({
-      endpoint: { host: 'localhost', port: srv.port, protocol: 'ws' },
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
       WebSocket: WebSocketCtor,
     });
     const client = new ElectrumClient({
@@ -68,9 +70,9 @@ describe('ElectrumClient over WsTransport (M1 happy path)', () => {
     srv.server.on('connection', (sock) => {
       sock.on('message', (raw) => {
         const req = JSON.parse(raw.toString('utf-8').trim());
-        // First reply with a real response, then push a notification.
+        // Reply, then push a notification on next microtask (no fixed wait).
         sock.send(JSON.stringify({ id: req.id, result: { height: 1 } }) + '\n');
-        setTimeout(() => {
+        queueMicrotask(() => {
           sock.send(
             JSON.stringify({
               jsonrpc: '2.0',
@@ -78,12 +80,12 @@ describe('ElectrumClient over WsTransport (M1 happy path)', () => {
               params: [{ height: 2, hex: 'aa' }],
             }) + '\n',
           );
-        }, 5);
+        });
       });
     });
 
     const transport = new WsTransport({
-      endpoint: { host: 'localhost', port: srv.port, protocol: 'ws' },
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
       WebSocket: WebSocketCtor,
     });
     const client = new ElectrumClient({
@@ -92,18 +94,18 @@ describe('ElectrumClient over WsTransport (M1 happy path)', () => {
       transport,
     });
 
-    const notifs: unknown[] = [];
-    client.onNotification((n) => notifs.push(n));
+    const gotNotif = deferred<{ method: string; params: readonly unknown[] }>();
+    client.onNotification((n) => gotNotif.resolve(n));
 
     await client.connect();
     const sub = await client.call<{ height: number }>('blockchain.headers.subscribe', []);
     expect(sub.height).toBe(1);
 
-    // Wait for the pushed notification.
-    await new Promise((r) => setTimeout(r, 30));
-
-    expect(notifs).toHaveLength(1);
-    expect(notifs[0]).toMatchObject({ method: 'blockchain.headers.subscribe' });
+    const notif = await gotNotif.promise;
+    expect(notif).toMatchObject({
+      method: 'blockchain.headers.subscribe',
+      params: [{ height: 2, hex: 'aa' }],
+    });
 
     await client.disconnect();
   });

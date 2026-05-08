@@ -9,9 +9,7 @@ import { WsTransport } from '../../../src/transport/ws.js';
 import { startTestWsServer, type TestWsServer } from '../../helpers/wsTestServer.js';
 
 const WebSocketCtor = WsWebSocket as unknown as new (url: string) => WebSocket;
-
-const enc = new TextEncoder();
-const dec = new TextDecoder();
+const HOST = '127.0.0.1';
 
 describe('WsTransport', () => {
   let srv: TestWsServer;
@@ -34,7 +32,7 @@ describe('WsTransport', () => {
     });
 
     const transport = new WsTransport({
-      endpoint: { host: 'localhost', port: srv.port, protocol: 'ws' },
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
       WebSocket: WebSocketCtor,
     });
 
@@ -42,13 +40,13 @@ describe('WsTransport', () => {
     transport.on((ev) => events.push(ev));
 
     await transport.connect();
-    await transport.send(enc.encode('{"id":1,"method":"server.ping","params":[]}'));
+    await transport.send('{"id":1,"method":"server.ping","params":[]}');
 
     await delay(40);
 
     const dataEvents = events.filter((e) => e.type === 'data');
     expect(dataEvents).toHaveLength(1);
-    expect(dec.decode(dataEvents[0]!.bytes)).toBe('{"id":1,"result":"ok"}');
+    expect(dataEvents[0]!.text).toBe('{"id":1,"result":"ok"}');
 
     expect(received[0]).toBe('{"id":1,"method":"server.ping","params":[]}\n');
 
@@ -62,13 +60,13 @@ describe('WsTransport', () => {
     });
 
     const transport = new WsTransport({
-      endpoint: { host: 'localhost', port: srv.port, protocol: 'ws' },
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
       WebSocket: WebSocketCtor,
     });
 
     const datas: string[] = [];
     transport.on((ev) => {
-      if (ev.type === 'data') datas.push(dec.decode(ev.bytes));
+      if (ev.type === 'data') datas.push(ev.text);
     });
 
     await transport.connect();
@@ -85,13 +83,13 @@ describe('WsTransport', () => {
     });
 
     const transport = new WsTransport({
-      endpoint: { host: 'localhost', port: srv.port, protocol: 'ws' },
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
       WebSocket: WebSocketCtor,
     });
 
     const datas: string[] = [];
     transport.on((ev) => {
-      if (ev.type === 'data') datas.push(dec.decode(ev.bytes));
+      if (ev.type === 'data') datas.push(ev.text);
     });
 
     await transport.connect();
@@ -103,29 +101,41 @@ describe('WsTransport', () => {
 
   it('rejects send before connect', async () => {
     const transport = new WsTransport({
-      endpoint: { host: 'localhost', port: srv.port, protocol: 'ws' },
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
       WebSocket: WebSocketCtor,
     });
-    await expect(transport.send(enc.encode('x'))).rejects.toBeInstanceOf(TransportError);
+    await expect(transport.send('x')).rejects.toBeInstanceOf(TransportError);
+  });
+
+  it('rejects send after close (ws is nulled)', async () => {
+    srv.server.on('connection', () => {
+      // accept silently
+    });
+    const transport = new WsTransport({
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
+      WebSocket: WebSocketCtor,
+    });
+    await transport.connect();
+    await transport.close();
+    await expect(transport.send('x')).rejects.toBeInstanceOf(TransportError);
   });
 
   it('rejects unsupported protocol', () => {
     expect(
       () =>
         new WsTransport({
-          endpoint: { host: 'localhost', port: 1, protocol: 'tcp' },
+          endpoint: { host: HOST, port: 1, protocol: 'tcp' },
           WebSocket: WebSocketCtor,
         }),
     ).toThrow(TransportError);
   });
 
   it('throws TransportError when connect fails (server not listening)', async () => {
-    // Use a port we know is closed: stop the server first.
     const port = srv.port;
     await srv.close();
 
     const transport = new WsTransport({
-      endpoint: { host: 'localhost', port, protocol: 'ws' },
+      endpoint: { host: HOST, port, protocol: 'ws' },
       WebSocket: WebSocketCtor,
       connectTimeoutMs: 500,
     });
@@ -139,7 +149,7 @@ describe('WsTransport', () => {
     });
 
     const transport = new WsTransport({
-      endpoint: { host: 'localhost', port: srv.port, protocol: 'ws', path: '/electrum' },
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws', path: '/electrum' },
       WebSocket: WebSocketCtor,
     });
     await transport.connect();
