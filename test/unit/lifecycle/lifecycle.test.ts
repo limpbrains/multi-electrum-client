@@ -294,6 +294,92 @@ describe('Manager lifecycle — suspend / resume', () => {
     await manager.stop();
   });
 
+  it('start() rejects when called from suspended (must use resume)', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.suspend({ graceMs: 0 });
+    await expect(manager.start()).rejects.toBeInstanceOf(SuspendedError);
+    await manager.resume();
+    await manager.stop();
+  });
+
+  it('start() rejects when called from running (idempotent guard)', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await expect(manager.start()).rejects.toBeInstanceOf(SuspendedError);
+    await manager.stop();
+  });
+
+  it('start() works again after stop (re-init)', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.stop();
+    await manager.start();
+    expect(manager.state).toBe('running');
+    await manager.stop();
+  });
+
+  it('stop() during suspend grace race: lifecycle ends stopped, not suspended', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    // Issue a non-replied call so suspend's grace-window has work to wait on.
+    void manager.call('server.ping', []).catch(() => undefined);
+    await delay(0);
+    // Trigger suspend with a generous grace, then race a stop() in.
+    const suspendPromise = manager.suspend({ graceMs: 100 });
+    const stopPromise = manager.stop();
+    await Promise.all([suspendPromise, stopPromise]);
+    expect(manager.state).toBe('stopped');
+  });
+
+  it('stop() during resume reconnect race: queued items reject SuspendedError, state stopped', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.suspend({ graceMs: 0 });
+    const queued = manager.call('server.ping', []);
+    // Kick off resume; immediately stop before resume finishes its awaits.
+    const resumePromise = manager.resume();
+    const stopPromise = manager.stop();
+    await Promise.all([resumePromise, stopPromise]);
+    await expect(queued).rejects.toBeInstanceOf(SuspendedError);
+    expect(manager.state).toBe('stopped');
+  });
+
   it('preserves subscriptions across suspend / resume with catch-up', async () => {
     const h = buildHarness();
     const manager = new ElectrumManager({
