@@ -124,13 +124,18 @@ export class ElectrumManager {
    */
   private lifecycle: LifecycleState = 'created';
   /**
-   * Tagged in-flight transition. Same-kind concurrent callers share the
-   * promise; opposite-kind callers chain after the current transition
-   * completes (so `m.resume()` issued during a `m.suspend()` actually
-   * runs the resume after the suspend lands, rather than returning the
-   * suspend's promise verbatim).
+   * FIFO tail of suspend/resume transitions. Each `suspend()` / `resume()`
+   * call appends its own task; the tail is the (catch-wrapped) promise
+   * that settles when the most-recently-queued transition finishes.
+   *
+   * Replaces a previous tagged-singleton scheme that broke under 3+
+   * overlapping calls: with that scheme, `suspend → resume → suspend`
+   * could collapse onto the head, leaving the manager in whatever state
+   * the second call landed on rather than the third caller's intent.
+   * The FIFO chain runs each call's task in submission order; each task
+   * re-evaluates lifecycle and is idempotent on its target state.
    */
-  private inFlightTransition: { kind: 'suspend' | 'resume'; promise: Promise<void> } | null = null;
+  private transitionTail: Promise<void> = Promise.resolve();
   /**
    * Calls submitted while `suspended` — replayed in order during `resume()`.
    * Each entry's deferred is resolved with the eventual wire result (or
@@ -224,25 +229,22 @@ export class ElectrumManager {
     }
   }
 
-  /** Disconnect every server and drop all subscriptions. Terminal. */
+  /**
+   * Disconnect every server and drop all subscriptions. Terminal.
+   *
+   * Awaits the FIFO transition tail before tearing down — any
+   * already-queued suspend / resume calls observe `lifecycle === 'stopped'`
+   * via their own re-evaluation and reject cleanly. Without this, a
+   * runSuspend's tail (e.g. `await tipUnsub()`) or a chained transition
+   * could fire after `await m.stop()` returned, surfacing as ghost
+   * `error` events to a caller who already considers the manager dead.
+   */
   async stop(): Promise<void> {
-    // If a suspend / resume transition is in flight, let it observe the
-    // stopped flag and unwind cleanly before we rip down the rest of the
-    // manager. Without this, runSuspend's tail (e.g. `await tipUnsub()`)
-    // could still fire after `await m.stop()` returns to the caller —
-    // observable to anyone listening on the `error` event.
     this.stopped = true;
     this.lifecycle = 'stopped';
-    const pending = this.inFlightTransition?.promise;
-    if (pending) {
-      try {
-        await pending;
-      } catch {
-        // Swallow — the transition's own race-checks short-circuit on
-        // stopped; any rejection is purely informational and already
-        // surfaced via the manager `error` event.
-      }
-    }
+    // Tail is catch-wrapped at append time — never rejects, so we can
+    // safely `await` without try/catch.
+    await this.transitionTail;
     // Reject anything queued during a prior suspend so callers don't dangle.
     while (this.suspendQueue.length > 0) {
       const item = this.suspendQueue.shift()!;
@@ -283,42 +285,39 @@ export class ElectrumManager {
    * `cancelInFlight: true` skips the wait entirely.
    */
   async suspend(opts: SuspendOptions = {}): Promise<void> {
-    // Same-kind re-entry: share the in-flight promise so `await` reflects
-    // the actual completion, not the intermediate state.
-    if (this.inFlightTransition?.kind === 'suspend') {
-      return this.inFlightTransition.promise;
-    }
-    // Opposite-kind re-entry: chain after the running resume completes,
-    // then run our own suspend. Without this, calling suspend() during
-    // resume() would observe the resume's promise and return as if the
-    // suspend had run — leaving the manager 'running' instead of
-    // 'suspended'.
-    if (this.inFlightTransition) {
-      const prev = this.inFlightTransition.promise;
-      return prev.then(
-        () => this.suspend(opts),
-        () => this.suspend(opts),
-      );
-    }
-    if (this.lifecycle === 'suspended') return;
+    // Submit-time guard: caller invoking suspend on an already-stopped
+    // manager gets a synchronous rejection (matches the documented
+    // contract). Race with a concurrent stop — see doSuspendIfNeeded.
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot suspend a stopped manager');
     }
-    // `created` is reachable when bindAppState fires before start() — app
-    // launches in the background and the AppState listener races ahead of
-    // the user's start() call. No sockets / no in-flight to drain; just
-    // record the state flip so resume() works as expected.
+    // Append to the FIFO chain: our task waits for any prior transition
+    // (success or failure — outcome of the prior call is independent of
+    // ours) and then re-evaluates lifecycle. The catch on the tail
+    // assignment keeps it never-rejecting so subsequent appenders and
+    // `stop()` can `await transitionTail` without seeing throws.
+    const task = this.transitionTail
+      .catch(() => undefined)
+      .then(() => this.doSuspendIfNeeded(opts));
+    this.transitionTail = task.catch(() => undefined);
+    return task;
+  }
+
+  /**
+   * Idempotent body of a queued suspend. Re-evaluates lifecycle at run
+   * time so chained transitions land on the right action regardless of
+   * what earlier transitions did. `created` flips to `suspended`
+   * synchronously (no sockets to drain). Already-suspended or stopped is
+   * a no-op — for the latter, the user must have called stop() while we
+   * were queued; honor stop's terminal intent rather than re-throwing.
+   */
+  private async doSuspendIfNeeded(opts: SuspendOptions): Promise<void> {
+    if (this.lifecycle === 'suspended' || this.lifecycle === 'stopped') return;
     if (this.lifecycle === 'created') {
       this.lifecycle = 'suspended';
       return;
     }
-    const task = this.runSuspend(opts);
-    this.inFlightTransition = { kind: 'suspend', promise: task };
-    try {
-      await task;
-    } finally {
-      this.inFlightTransition = null;
-    }
+    await this.runSuspend(opts);
   }
 
   private async runSuspend(opts: SuspendOptions): Promise<void> {
@@ -396,20 +395,22 @@ export class ElectrumManager {
    * see the `running` gate path once the state flips.
    */
   async resume(): Promise<void> {
-    if (this.inFlightTransition?.kind === 'resume') {
-      return this.inFlightTransition.promise;
-    }
-    if (this.inFlightTransition) {
-      const prev = this.inFlightTransition.promise;
-      return prev.then(
-        () => this.resume(),
-        () => this.resume(),
-      );
-    }
-    if (this.lifecycle === 'running') return;
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot resume a stopped manager');
     }
+    const task = this.transitionTail.catch(() => undefined).then(() => this.doResumeIfNeeded());
+    this.transitionTail = task.catch(() => undefined);
+    return task;
+  }
+
+  /**
+   * Idempotent body of a queued resume. Re-evaluates lifecycle at run
+   * time. Already-running or stopped is a no-op (stopped honors the
+   * user's terminal intent if a concurrent stop landed while queued).
+   * `created` throws with a `start()` hint; only `suspended` proceeds.
+   */
+  private async doResumeIfNeeded(): Promise<void> {
+    if (this.lifecycle === 'running' || this.lifecycle === 'stopped') return;
     if (this.lifecycle !== 'suspended') {
       throw new SuspendedError(
         this.lifecycle === 'created'
@@ -417,13 +418,7 @@ export class ElectrumManager {
           : `cannot resume from ${this.lifecycle}`,
       );
     }
-    const task = this.runResume();
-    this.inFlightTransition = { kind: 'resume', promise: task };
-    try {
-      await task;
-    } finally {
-      this.inFlightTransition = null;
-    }
+    await this.runResume();
   }
 
   private async runResume(): Promise<void> {
