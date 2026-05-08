@@ -1,0 +1,118 @@
+# Integration test stack. Wired up in M3+ as method coverage and integration tests land.
+# Layout intentionally flat; profiles let tests opt into slim or full matrix.
+#
+# Profiles:
+#   slim  — bitcoind + one each of electrumx/fulcrum/electrs + toxiproxy (CI default)
+#   full  — slim + strict + slow variants (nightly / on-demand)
+
+services:
+  bitcoind:
+    image: btcpayserver/bitcoin:26.0
+    profiles: [slim, full]
+    environment:
+      BITCOIN_NETWORK: regtest
+      CREATE_WALLET: 'true'
+    command:
+      - bitcoind
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -rpcuser=ci
+      - -rpcpassword=ci
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+      - -zmqpubhashblock=tcp://0.0.0.0:28334
+    ports:
+      - '18443:18443'
+      - '28332:28332'
+      - '28333:28333'
+      - '28334:28334'
+
+  electrumx-default:
+    image: lukechilds/electrumx:latest # TODO: pin a tag during M3
+    profiles: [slim, full]
+    depends_on: [bitcoind]
+    environment:
+      DAEMON_URL: http://ci:ci@bitcoind:18443
+      COIN: BitcoinSegwit
+      NET: regtest
+      SERVICES: tcp://:50001,wss://:50004
+    ports:
+      - '50001:50001'
+      - '50004:50004'
+
+  electrumx-strict:
+    image: lukechilds/electrumx:latest
+    profiles: [full]
+    depends_on: [bitcoind]
+    environment:
+      DAEMON_URL: http://ci:ci@bitcoind:18443
+      COIN: BitcoinSegwit
+      NET: regtest
+      SERVICES: tcp://:50001,wss://:50004
+      MAX_SEND: '50000'
+      MAX_SUBS: '10'
+      MAX_SESSION_SUBS: '5'
+    ports:
+      - '50011:50001'
+      - '50014:50004'
+
+  fulcrum-default:
+    image: cculianu/fulcrum:latest # TODO: pin during M3
+    profiles: [slim, full]
+    depends_on: [bitcoind]
+    volumes:
+      - ./fulcrum/configs/default.conf:/etc/fulcrum.conf:ro
+    ports:
+      - '50101:50001'
+      - '50104:50004'
+
+  fulcrum-strict:
+    image: cculianu/fulcrum:latest
+    profiles: [full]
+    depends_on: [bitcoind]
+    volumes:
+      - ./fulcrum/configs/strict.conf:/etc/fulcrum.conf:ro
+    ports:
+      - '50111:50001'
+      - '50114:50004'
+
+  electrs-default:
+    image: getumbrel/electrs:v0.10.2
+    profiles: [slim, full]
+    depends_on: [bitcoind]
+    environment:
+      ELECTRS_NETWORK: regtest
+      ELECTRS_DAEMON_RPC_ADDR: bitcoind:18443
+      ELECTRS_DAEMON_DIR: /data/bitcoin
+      ELECTRS_ELECTRUM_RPC_ADDR: 0.0.0.0:50001
+    ports:
+      - '50201:50001'
+
+  electrs-strict:
+    image: getumbrel/electrs:v0.10.2
+    profiles: [full]
+    depends_on: [bitcoind]
+    environment:
+      ELECTRS_NETWORK: regtest
+      ELECTRS_DAEMON_RPC_ADDR: bitcoind:18443
+      ELECTRS_DAEMON_DIR: /data/bitcoin
+      ELECTRS_ELECTRUM_RPC_ADDR: 0.0.0.0:50001
+      ELECTRS_RPC_BUFFER_SIZE: '4096'
+    ports:
+      - '50211:50001'
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    profiles: [slim, full]
+    command: ['-host=0.0.0.0', '-config=/etc/toxiproxy.json']
+    volumes:
+      - ./toxiproxy/config.json:/etc/toxiproxy.json:ro
+    ports:
+      - '8474:8474' # toxiproxy admin HTTP
+      - '60001:60001'
+      - '60004:60004'
+      - '60101:60101'
+      - '60201:60201'
