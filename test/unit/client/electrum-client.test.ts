@@ -153,6 +153,22 @@ describe('ElectrumClient', () => {
     expect(await b).toBe(2);
   });
 
+  it('refuses concurrent connect', async () => {
+    const transport = new MockTransport();
+    // Make connect() wait so the second call lands while the first is in flight.
+    let release!: () => void;
+    transport.connect = () =>
+      new Promise<void>((r) => {
+        release = r;
+      });
+    const client = new ElectrumClient({ id: 'a', endpoint: transport.endpoint, transport });
+
+    const first = client.connect();
+    await expect(client.connect()).rejects.toBeInstanceOf(TransportError);
+    release();
+    await first;
+  });
+
   it('disconnect closes transport and rejects pending', async () => {
     const transport = new MockTransport();
     const client = new ElectrumClient({ id: 'a', endpoint: transport.endpoint, transport });

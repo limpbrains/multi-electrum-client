@@ -82,14 +82,22 @@ function validate(raw: unknown): JsonRpcMessage {
 
   // Notification: has `method`, no `id` (server -> client push).
   if (typeof obj['method'] === 'string' && !('id' in obj)) {
-    return {
-      method: obj['method'],
-      params: Array.isArray(obj['params']) ? (obj['params'] as readonly unknown[]) : [],
-    };
+    let params: readonly unknown[];
+    if (!('params' in obj)) {
+      params = [];
+    } else if (Array.isArray(obj['params'])) {
+      params = obj['params'] as readonly unknown[];
+    } else {
+      // JSON-RPC 2.0 allows by-name (object) params, but Electrum is positional
+      // only. Reject other server's by-name use rather than silently coerce.
+      throw new ProtocolError('notification params must be an array (by-name not supported)');
+    }
+    return { method: obj['method'], params };
   }
 
   // Response: has `id`, plus `result` xor `error`.
   if ('id' in obj) {
+    const id = checkId(obj['id']);
     if ('error' in obj) {
       const e = obj['error'];
       if (e === null || typeof e !== 'object') {
@@ -100,22 +108,26 @@ function validate(raw: unknown): JsonRpcMessage {
         throw new ProtocolError('error response: malformed code or message');
       }
       const out: JsonRpcErrorResponse = {
-        id: obj['id'] as JsonRpcId,
+        id,
         error: { code: err['code'], message: err['message'] },
       };
       if (err['data'] !== undefined) out.error.data = err['data'];
       return out;
     }
     if ('result' in obj) {
-      return {
-        id: obj['id'] as JsonRpcId,
-        result: obj['result'],
-      };
+      return { id, result: obj['result'] };
     }
     throw new ProtocolError('response missing both result and error');
   }
 
   throw new ProtocolError('unrecognized JSON-RPC message shape');
+}
+
+function checkId(raw: unknown): JsonRpcId {
+  if (raw === null || typeof raw === 'number' || typeof raw === 'string') {
+    return raw;
+  }
+  throw new ProtocolError(`response id must be number, string, or null; got ${typeof raw}`);
 }
 
 function describe(v: unknown): string {
