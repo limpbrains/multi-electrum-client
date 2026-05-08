@@ -18,6 +18,11 @@ export const defaultClassifier: ErrorClassifier = {
     if (error instanceof ProtocolError) return 'protocol';
     if (error instanceof RpcError) {
       const msg = (error.message ?? '').toLowerCase();
+      // TODO(M4): per-server-software classifiers. The 'banned' substring
+      // match below will false-positive on legitimate RPC errors that
+      // mention bans (e.g. address-banned errors from some servers); the
+      // M4 strict-config Docker stack will let us swap this for tighter
+      // per-server heuristics keyed on `ctx.serverSoftware`.
       if (
         msg.includes('excessive resource') ||
         msg.includes('rate limit') ||

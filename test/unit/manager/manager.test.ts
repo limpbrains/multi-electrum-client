@@ -231,8 +231,7 @@ describe('ElectrumManager — auto-batch coalescing', () => {
     const p2 = manager.call('server.ping', []);
     await delay(0);
 
-    // a returns: first ok, second a transport-class error (we simulate via a
-    // rate-limit response so it triggers retry).
+    // a returns: first ok, second a rate-limit-class error (also retryable).
     const aT = h.transports.get('a')!;
     const wireA = JSON.parse(aT.sent[0]!);
     aT.pushFromServer(
@@ -287,7 +286,7 @@ describe('ElectrumManager — pool mutation', () => {
 });
 
 describe('ElectrumManager — telemetry feeds preferFastest', () => {
-  it('routes subsequent calls to the lowest-latency client', async () => {
+  it('routes subsequent calls to the lowest-latency tested client', async () => {
     const h = buildHarness();
     const manager = new ElectrumManager({
       network: 'regtest',
@@ -298,22 +297,34 @@ describe('ElectrumManager — telemetry feeds preferFastest', () => {
     });
     await manager.start();
 
-    // Warm both clients; b is slower than a (we just delay reply).
-    const wA = manager.call('server.ping', []);
-    const wB = manager.call('server.ping', []);
+    // Warm both in parallel so each gets a sample. With leastInFlight tiebreak
+    // and untested-clients-treated-as-eligible-but-not-monopolizing, the first
+    // call lands on a (both 0 inFlight; first wins) and the second on b (a now
+    // has 1 inFlight, b has 0).
+    const w1 = manager.call('server.ping', []);
+    const w2 = manager.call('server.ping', []);
     await delay(0);
+    // a replies fast.
     h.reply('a', (req: { id: number }) => ({ id: req.id, result: 'a' }));
+    // b replies slowly so its EMA inflates past a's.
+    await delay(30);
     h.reply('b', (req: { id: number }) => ({ id: req.id, result: 'b' }));
-    await Promise.all([wA, wB]);
+    await Promise.all([w1, w2]);
 
-    // Manually skew B's telemetry to be much slower so the next pick clearly
-    // prefers A. We do this by inspecting / using public API only — record an
-    // extra slow datapoint on B by issuing a call and replying after a delay.
-    const v0 = manager.getClientViews();
-    const a0 = v0.find((v) => v.id === 'a')!;
-    const b0 = v0.find((v) => v.id === 'b')!;
-    expect(a0.telemetry.success.count).toBeGreaterThanOrEqual(1);
-    expect(b0.telemetry.success.count).toBeGreaterThanOrEqual(1);
+    const warm = manager.getClientViews();
+    const aWarm = warm.find((v) => v.id === 'a')!;
+    const bWarm = warm.find((v) => v.id === 'b')!;
+    expect(aWarm.telemetry.latency.samples).toBeGreaterThanOrEqual(1);
+    expect(bWarm.telemetry.latency.samples).toBeGreaterThanOrEqual(1);
+    expect(bWarm.telemetry.latency.ema).toBeGreaterThan(aWarm.telemetry.latency.ema);
+
+    // Third call must go to a (lower EMA), not b.
+    const w3 = manager.call('server.ping', []);
+    await delay(0);
+    expect(h.transports.get('a')!.sent.length).toBeGreaterThan(0);
+    expect(h.transports.get('b')!.sent.length).toBe(0);
+    h.reply('a', (req: { id: number }) => ({ id: req.id, result: 'a-3' }));
+    expect(await w3).toBe('a-3');
 
     await manager.stop();
   });

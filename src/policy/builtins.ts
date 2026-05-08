@@ -55,9 +55,12 @@ export interface PreferFastestOpts {
 }
 
 /**
- * Pick the client with the lowest latency EMA. Clients with no samples yet are
- * treated as best (we want to give a fresh client at least one shot). Ties are
- * broken by `leastInFlight` (default) or `rr`.
+ * Pick the client with the lowest latency EMA among clients that have at least
+ * one sample. Untested clients (samples=0) are *also* admitted to the tied set
+ * so a fresh server gets a real chance to be picked, but they do not pull the
+ * threshold to zero — that would let an untested server monopolize the pool
+ * forever and hide a known-fast tested server. Ties are broken by
+ * `leastInFlight` (default) or `rr`.
  */
 export function preferFastest(opts: PreferFastestOpts = {}): RoutingPolicy {
   const withinPct = opts.withinPct ?? 0;
@@ -68,15 +71,19 @@ export function preferFastest(opts: PreferFastestOpts = {}): RoutingPolicy {
       const eligible = candidates.filter((c) => isUsable(c, excluded, now));
       if (eligible.length === 0) return null;
 
-      // Untested clients (samples=0) compete on ema=0 = "best".
-      const score = (c: ClientView) =>
-        c.telemetry.latency.samples > 0 ? c.telemetry.latency.ema : 0;
+      const tested = eligible.filter((c) => c.telemetry.latency.samples > 0);
+      const minTested =
+        tested.length > 0
+          ? Math.min(...tested.map((c) => c.telemetry.latency.ema))
+          : Number.POSITIVE_INFINITY;
+      const threshold =
+        minTested === Number.POSITIVE_INFINITY
+          ? Number.POSITIVE_INFINITY
+          : minTested * (1 + withinPct / 100);
 
-      const min = Math.min(...eligible.map(score));
-      const threshold = min === 0 ? 0 : min * (1 + withinPct / 100);
       const tied = eligible.filter((c) => {
-        const s = score(c);
-        return s === 0 || s <= threshold;
+        if (c.telemetry.latency.samples === 0) return true; // fresh: always eligible
+        return c.telemetry.latency.ema <= threshold;
       });
 
       if (tied.length === 1) return tied[0]!.id;
