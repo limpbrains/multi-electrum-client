@@ -399,6 +399,26 @@ describe('SubscriptionRegistry — concurrency', () => {
   });
 });
 
+describe('SubscriptionRegistry — exception safety', () => {
+  it('notify with non-JSON-serializable status does not throw, fires handler', async () => {
+    const env = fakeEnv();
+    env.setStatus('blockchain.scripthash.subscribe', ['H'], 'INIT');
+    const reg = new SubscriptionRegistry(env);
+    const handler = vi.fn();
+    await reg.subscribe('blockchain.scripthash.subscribe', ['H'], handler);
+
+    handler.mockClear();
+    // Circular object: JSON.stringify would throw without the try/catch in
+    // statusEquals.
+    const circular: Record<string, unknown> = {};
+    circular['self'] = circular;
+    expect(() =>
+      reg.notify('A', 'blockchain.scripthash.subscribe', ['H'], circular),
+    ).not.toThrow();
+    expect(handler).toHaveBeenCalledWith(circular);
+  });
+});
+
 describe('SubscriptionRegistry — last-handler unsub gating', () => {
   it('skips wire unsubscribe when bound client is gone', async () => {
     const env = fakeEnv();

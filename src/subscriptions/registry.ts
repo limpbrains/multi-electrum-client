@@ -409,6 +409,15 @@ function statusEquals(a: unknown, b: unknown): boolean {
   // Subscription statuses are JSON-serializable scalars or small objects
   // (BlockHeader, ScripthashStatus). Stringify is acceptable; if a server
   // ever returns key order non-deterministically we'll need a deeper compare.
+  // A misbehaving server returning a circular / non-serializable payload
+  // would otherwise throw out of `notify` / `rebind` and crash the caller's
+  // notification handler — fall back to "not equal" so the new status fires
+  // through (callers see it once and can act). Worse than a deep compare,
+  // strictly better than crashing the registry.
   if (a === b) return true;
-  return JSON.stringify(a) === JSON.stringify(b);
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
 }
