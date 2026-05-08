@@ -300,6 +300,10 @@ export class ElectrumClient {
    * `SuspendedError` rather than the `TransportError` that `disconnect`
    * would surface (their request didn't fail because the link died, it
    * failed because the manager went to sleep).
+   *
+   * Safe to call before `disconnect()`: the inFlight Map is cleared here,
+   * so `disconnect`'s own `failAllInFlight(TransportError)` walks an
+   * empty Map and produces no second rejection per request.
    */
   failInFlight(e: Error): void {
     this.failAllInFlight(e);
