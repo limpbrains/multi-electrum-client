@@ -72,6 +72,8 @@ export {
 // Single-client surface:
 export { ElectrumClient, type ElectrumClientOpts, type BatchCallItem } from './client.js';
 export { WsTransport, type WsTransportOpts } from './transport/ws.js';
+export { TcpTransport, type TcpTransportOpts, type TcpSocketLike } from './transport/tcp.js';
+export { TlsTransport, type TlsTransportOpts } from './transport/tls.js';
 export type { Transport, TransportEvent, TransportListener } from './transport/types.js';
 
 // Manager + RoutingPolicy built-ins (M2) + subscriptions (M4):

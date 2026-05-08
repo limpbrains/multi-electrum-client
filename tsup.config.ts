@@ -7,6 +7,8 @@ export default defineConfig({
     'src/cache/memory.ts',
     'src/errors/types.ts',
     'src/transport/ws.ts',
+    'src/transport/tcp.ts',
+    'src/transport/tls.ts',
   ],
   format: ['esm'],
   dts: true,

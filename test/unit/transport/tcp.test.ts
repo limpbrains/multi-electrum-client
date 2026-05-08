@@ -1,0 +1,186 @@
+import net, { type Server, type Socket } from 'node:net';
+
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { TransportError } from '../../../src/errors/types.js';
+import { TcpTransport } from '../../../src/transport/tcp.js';
+import type { TransportEvent } from '../../../src/transport/types.js';
+
+interface TestTcpServer {
+  server: Server;
+  port: number;
+  close(): Promise<void>;
+}
+
+async function startTestTcpServer(
+  onConn: (socket: Socket) => void = () => undefined,
+): Promise<TestTcpServer> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer((sock) => {
+      sock.setEncoding('utf-8');
+      onConn(sock);
+    });
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') {
+        reject(new Error('no address'));
+        return;
+      }
+      resolve({
+        server,
+        port: addr.port,
+        close: () =>
+          new Promise<void>((r) => {
+            server.close(() => r());
+          }),
+      });
+    });
+  });
+}
+
+describe('TcpTransport', () => {
+  let srv: TestTcpServer;
+
+  afterEach(async () => {
+    if (srv) await srv.close();
+  });
+
+  it('connects, sends newline-terminated, receives newline-split, closes', async () => {
+    const received: string[] = [];
+    srv = await startTestTcpServer((sock) => {
+      sock.on('data', (chunk) => {
+        received.push(typeof chunk === 'string' ? chunk : chunk.toString('utf-8'));
+        sock.write('{"id":1,"result":"ok"}\n');
+      });
+    });
+
+    const t = new TcpTransport({
+      endpoint: { host: '127.0.0.1', port: srv.port, protocol: 'tcp' },
+    });
+    const events: TransportEvent[] = [];
+    t.on((e) => events.push(e));
+
+    await t.connect();
+    await t.send('{"id":1}');
+    // Wait for the round-trip.
+    for (let i = 0; i < 50; i++) {
+      if (events.find((e) => e.type === 'data')) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(received).toContain('{"id":1}\n');
+    expect(events.find((e) => e.type === 'data')).toEqual({
+      type: 'data',
+      text: '{"id":1,"result":"ok"}',
+    });
+
+    await t.close();
+  });
+
+  it('reassembles split frames across multiple data chunks', async () => {
+    srv = await startTestTcpServer((sock) => {
+      sock.on('data', () => {
+        // Send a single message split into two writes.
+        sock.write('{"id":');
+        setTimeout(() => sock.write('1,"result":"ok"}\n'), 5);
+      });
+    });
+
+    const t = new TcpTransport({
+      endpoint: { host: '127.0.0.1', port: srv.port, protocol: 'tcp' },
+    });
+    const data: string[] = [];
+    t.on((e) => {
+      if (e.type === 'data') data.push(e.text);
+    });
+
+    await t.connect();
+    await t.send('{"id":1}');
+    for (let i = 0; i < 50; i++) {
+      if (data.length > 0) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(data).toEqual(['{"id":1,"result":"ok"}']);
+
+    await t.close();
+  });
+
+  it('emits one data event per line when chunks contain multiple frames', async () => {
+    srv = await startTestTcpServer((sock) => {
+      sock.on('data', () => {
+        sock.write('{"id":1}\n{"id":2}\n');
+      });
+    });
+
+    const t = new TcpTransport({
+      endpoint: { host: '127.0.0.1', port: srv.port, protocol: 'tcp' },
+    });
+    const data: string[] = [];
+    t.on((e) => {
+      if (e.type === 'data') data.push(e.text);
+    });
+
+    await t.connect();
+    await t.send('go');
+    for (let i = 0; i < 50; i++) {
+      if (data.length >= 2) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(data).toEqual(['{"id":1}', '{"id":2}']);
+
+    await t.close();
+  });
+
+  it('emits close event when the server drops the socket', async () => {
+    srv = await startTestTcpServer((sock) => {
+      sock.end();
+    });
+
+    const t = new TcpTransport({
+      endpoint: { host: '127.0.0.1', port: srv.port, protocol: 'tcp' },
+    });
+    const events: TransportEvent[] = [];
+    t.on((e) => events.push(e));
+
+    await t.connect();
+    for (let i = 0; i < 50; i++) {
+      if (events.find((e) => e.type === 'close')) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(events.find((e) => e.type === 'close')).toBeDefined();
+  });
+
+  it('rejects connect on a port nothing is listening on', async () => {
+    const t = new TcpTransport({
+      endpoint: { host: '127.0.0.1', port: 1, protocol: 'tcp' },
+      connectTimeoutMs: 500,
+    });
+    await expect(t.connect()).rejects.toBeInstanceOf(TransportError);
+  });
+
+  it('rejects send before connect', async () => {
+    const t = new TcpTransport({
+      endpoint: { host: '127.0.0.1', port: 1, protocol: 'tcp' },
+    });
+    await expect(t.send('x')).rejects.toBeInstanceOf(TransportError);
+  });
+
+  it('rejects send with an embedded newline', async () => {
+    srv = await startTestTcpServer();
+    const t = new TcpTransport({
+      endpoint: { host: '127.0.0.1', port: srv.port, protocol: 'tcp' },
+    });
+    await t.connect();
+    await expect(t.send('a\nb')).rejects.toBeInstanceOf(TransportError);
+    await t.close();
+  });
+
+  it('refuses non-tcp protocol', () => {
+    expect(
+      () =>
+        new TcpTransport({
+          endpoint: { host: 'h', port: 1, protocol: 'ws' },
+        }),
+    ).toThrow(TransportError);
+  });
+});

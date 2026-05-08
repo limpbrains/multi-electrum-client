@@ -70,17 +70,22 @@ manager.on('client-banned', ({ clientId, reason }) => {
 | M1 | Single-client WebSocket transport + JSON-RPC framing + ElectrumClient | ✅ |
 | M2 | ElectrumManager + RoutingPolicy built-ins + auto-batch coalescing + per-client telemetry + retry | ✅ |
 | M3 | Typed method registry + namespace API (`manager.scripthash.*`, `manager.transaction.*`, …) + domain types | ✅ |
-| M4 | Subscriptions registry (replay + catch-up diff) + per-server-software error classifier + cache + peer discovery (`server.peers.subscribe`) | next |
-| M5 | Lifecycle (`suspend` / `resume`) + RN parity tests via `react-native-harness` | |
-| M6 | TCP + TLS transports | |
-| M7 | Polish + 0.1 release | |
+| M4 | Subscriptions registry (replay + catch-up diff) + per-server-software error classifier + cache + peer discovery (`server.peers.subscribe`) | ✅ |
+| M5 | Lifecycle (`suspend` / `resume`) + `bindAppState` helper | ✅ |
+| M6 | TCP + TLS transports | ✅ |
+| M7 | Polish + 0.1 release | next |
 
 ## Platform notes
 
-- **Node** ≥ 20: works out of the box. Global `WebSocket` is stable in Node 22+; Node 20 needs the `--experimental-websocket` flag, or pass `WebSocket` from the `ws` package via `WsTransport`'s `WebSocket` option.
-- **Bun**: works out of the box.
-- **Browser**: only the `ws` transport is supported.
-- **React Native** (M5+): add a metro alias mapping `net` and `tls` to [`react-native-tcp-socket`](https://github.com/Rapsssito/react-native-tcp-socket). No platform branches inside the library.
+- **Node** ≥ 20: works out of the box. Global `WebSocket` is stable in Node 22+; Node 20 needs the `--experimental-websocket` flag, or pass `WebSocket` from the `ws` package via `WsTransport`'s `WebSocket` option. TCP / TLS use `node:net` / `node:tls`.
+- **Bun**: works out of the box (`ws`, `tcp`, `tls`).
+- **Browser**: only the `ws` / `wss` transport is supported. Don't construct servers with `protocol: 'tcp'` or `'tls'` — `node:net` / `node:tls` aren't available.
+- **React Native**: add a metro alias mapping `node:net` and `node:tls` to [`react-native-tcp-socket`](https://github.com/Rapsssito/react-native-tcp-socket). Its API is a 1:1 emulation of the Node modules; no platform branches inside the library. `WebSocket` is built into the RN runtime. For app lifecycle integration, pair `manager.suspend()`/`resume()` with the `bindAppState` helper:
+  ```ts
+  import { AppState } from 'react-native';
+  import { bindAppState } from 'multi-electrum-client';
+  const dispose = bindAppState(manager, AppState);
+  ```
 
 ## Development
 
