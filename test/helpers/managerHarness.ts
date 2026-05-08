@@ -9,8 +9,13 @@ import { MockTransport } from './mockTransport.js';
 export interface Harness {
   transports: Map<string, MockTransport>;
   factory: (endpoint: Endpoint) => Transport;
-  /** Resolve all queued sends for one server with a typed JSON-RPC response array or single. */
-  reply(host: string, build: (req: unknown) => unknown): void;
+  /**
+   * Resolve all queued sends for one server. The generic `T` lets callers ask
+   * for a more specific request shape (function parameters are contravariant
+   * in strict TS, so a non-generic `(req: unknown) => unknown` would refuse
+   * `(req: { id: number }) => ...`).
+   */
+  reply<T = unknown>(host: string, build: (req: T) => unknown): void;
 }
 
 export function buildHarness(): Harness {
@@ -20,17 +25,19 @@ export function buildHarness(): Harness {
     transports.set(endpoint.host, t);
     return t;
   };
-  const reply = (host: string, build: (req: unknown) => unknown): void => {
+  const reply = <T = unknown>(host: string, build: (req: T) => unknown): void => {
     const t = transports.get(host);
     if (!t) throw new Error(`no transport for host=${host}`);
     while (t.sent.length > 0) {
       const text = t.sent.shift()!;
       const parsed = JSON.parse(text);
       if (Array.isArray(parsed)) {
-        const responses = parsed.map((r) => build(r)).filter((r): r is unknown => r !== undefined);
+        const responses = parsed
+          .map((r) => build(r as T))
+          .filter((r): r is unknown => r !== undefined);
         if (responses.length > 0) t.pushFromServer(JSON.stringify(responses));
       } else {
-        const out = build(parsed);
+        const out = build(parsed as T);
         if (out !== undefined) t.pushFromServer(JSON.stringify(out));
       }
     }
