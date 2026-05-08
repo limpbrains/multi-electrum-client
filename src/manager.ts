@@ -15,9 +15,11 @@ import { defaultClassifier } from './errors/classifier.js';
 import {
   NoClientAvailableError,
   ProtocolError,
+  SuspendedError,
   type ErrorClassifier,
   type ErrorKind,
 } from './errors/types.js';
+import type { LifecycleState, SuspendOptions } from './lifecycle/types.js';
 import type { PickContext, RoutingPolicy } from './policy/types.js';
 import type { MethodName, ParamsOf, ResultOf } from './protocol/methods.js';
 import type {
@@ -116,6 +118,22 @@ export class ElectrumManager {
   private readonly discoverTimers = new Map<ClientId, ReturnType<typeof setTimeout>>();
   /** True while we're tearing down — guards async tasks against post-stop work. */
   private stopped = false;
+  /**
+   * Lifecycle state. `created → running → suspending → suspended →
+   * resuming → running → stopped`. See lifecycle/types.ts.
+   */
+  private lifecycle: LifecycleState = 'created';
+  /**
+   * Calls submitted while `suspended` — replayed in order during `resume()`.
+   * Each entry's deferred is resolved with the eventual wire result (or
+   * rejected with `SuspendedError` on `stop()` mid-suspend).
+   */
+  private readonly suspendQueue: Array<{
+    method: string;
+    params: readonly unknown[];
+    opts: CallOpts | undefined;
+    def: Deferred<unknown>;
+  }> = [];
   // Standard typed-event-emitter pattern: store opaquely, cast at the API edge.
   private readonly listeners = new Map<keyof ManagerEvents, Set<(p: unknown) => void>>();
 
@@ -147,9 +165,15 @@ export class ElectrumManager {
     }
   }
 
+  /** Current lifecycle state. */
+  get state(): LifecycleState {
+    return this.lifecycle;
+  }
+
   /** Connect every server in parallel. Errors do not throw; they fire `error` events. */
   async start(): Promise<void> {
     this.stopped = false;
+    this.lifecycle = 'running';
     const tasks = [...this.clients.values()].map(async (c) => {
       try {
         await c.connect();
@@ -181,9 +205,15 @@ export class ElectrumManager {
     }
   }
 
-  /** Disconnect every server and drop all subscriptions. */
+  /** Disconnect every server and drop all subscriptions. Terminal. */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.lifecycle = 'stopped';
+    // Reject anything queued during a prior suspend so callers don't dangle.
+    while (this.suspendQueue.length > 0) {
+      const item = this.suspendQueue.shift()!;
+      item.def.reject(new SuspendedError('manager stopped before resume'));
+    }
     for (const t of this.discoverTimers.values()) clearTimeout(t);
     this.discoverTimers.clear();
     if (this.tipUnsub) {
@@ -205,6 +235,122 @@ export class ElectrumManager {
         }
       }),
     );
+  }
+
+  /**
+   * Drain in-flight, close every socket, and enter `suspended`. The
+   * subscription registry is preserved across suspend so `resume()` can
+   * replay subscriptions with catch-up. Calls submitted while suspended
+   * queue (or reject if `failOnSuspend` is set on the call). Idempotent —
+   * calling `suspend` while already suspended / suspending is a no-op.
+   *
+   * `graceMs` (default 2000) bounds how long we wait for in-flight requests
+   * to settle before forcibly rejecting them with `SuspendedError`.
+   * `cancelInFlight: true` skips the wait entirely.
+   */
+  async suspend(opts: SuspendOptions = {}): Promise<void> {
+    if (this.lifecycle === 'suspended' || this.lifecycle === 'suspending') return;
+    if (this.lifecycle === 'stopped') {
+      throw new SuspendedError('cannot suspend a stopped manager');
+    }
+    this.lifecycle = 'suspending';
+    const graceMs = opts.graceMs ?? 2000;
+    const cancelInFlight = opts.cancelInFlight ?? false;
+
+    if (!cancelInFlight && graceMs > 0) {
+      // Best-effort drain. Poll inFlightCount across all clients; bail out
+      // when zero or grace elapses. Polling beats hooking each client's
+      // resolve callback because in-flight may finish during the await.
+      const deadline = Date.now() + graceMs;
+      while (Date.now() < deadline) {
+        if (this.totalInFlight() === 0) break;
+        await sleep(20);
+      }
+    }
+    // Anything left over: reject with `SuspendedError` so the caller sees
+    // the right cause (they didn't lose the link, the manager paused).
+    // We do this before `disconnect` because disconnect would otherwise
+    // surface them as `TransportError("disconnected by client")`.
+    for (const c of this.clients.values()) {
+      if (c.inFlightCount > 0) {
+        c.failInFlight(new SuspendedError('manager suspending'));
+      }
+    }
+    await Promise.all(
+      [...this.clients.values()].map(async (c) => {
+        try {
+          await c.disconnect();
+        } catch (e) {
+          this.emit('error', e);
+        }
+      }),
+    );
+    // Clear discover timers — they'd fire against dead sockets and route
+    // via policy.pick to a different server. The next `resume()` re-arms
+    // them on every `connected` transition.
+    for (const t of this.discoverTimers.values()) clearTimeout(t);
+    this.discoverTimers.clear();
+    // Tip becomes stale across suspend; cache writes are gated until
+    // `resume()` re-establishes the headers subscription.
+    this.tipHeight = undefined;
+    // Note: registry / suspendQueue / cache state preserved.
+    this.lifecycle = 'suspended';
+  }
+
+  /**
+   * Reconnect all clients, replay subscriptions with catch-up, and drain
+   * the suspend queue. Idempotent on `running`. Calls during `resuming`
+   * see the `running` gate path once the state flips.
+   */
+  async resume(): Promise<void> {
+    if (this.lifecycle === 'running' || this.lifecycle === 'resuming') return;
+    if (this.lifecycle === 'stopped') {
+      throw new SuspendedError('cannot resume a stopped manager');
+    }
+    if (this.lifecycle !== 'suspended') {
+      throw new SuspendedError(`cannot resume from ${this.lifecycle}`);
+    }
+    this.lifecycle = 'resuming';
+    // Reconnect: each client's `connected` transition fires
+    // `onStateChange` which in turn calls `restoreOrphans()`. We don't
+    // have to drive subscription replay manually.
+    await Promise.all(
+      [...this.clients.values()].map(async (c) => {
+        try {
+          await c.connect();
+        } catch (e) {
+          this.emit('error', e);
+        }
+      }),
+    );
+    // Re-install the tip subscription if a cache was configured. The user
+    // may have closed it via stop+start cycle; if `tipUnsub` is non-null
+    // we left a stale handle around — reset it.
+    if (this.cache && this.tipUnsub === null) {
+      try {
+        this.tipUnsub = await this.registry.subscribe<BlockHeader>(
+          'blockchain.headers.subscribe',
+          [],
+          (h) => {
+            if (h && typeof (h as BlockHeader).height === 'number') {
+              this.tipHeight = (h as BlockHeader).height;
+            }
+          },
+        );
+      } catch (e) {
+        this.emit('error', e);
+      }
+    }
+    this.lifecycle = 'running';
+    // Drain queued calls in arrival order. Re-issue via the public path so
+    // they flow through cache, batch, retry, and timeout from this moment.
+    const queued = this.suspendQueue.splice(0);
+    for (const item of queued) {
+      this.call(item.method, item.params, item.opts).then(
+        (v) => item.def.resolve(v),
+        (e) => item.def.reject(e),
+      );
+    }
   }
 
   addServer(spec: ServerSpec): void {
@@ -247,6 +393,22 @@ export class ElectrumManager {
     ...args: CallArgs<M>
   ): Promise<M extends MethodName ? ResultOf<M> : unknown>;
   async call(method: string, params: readonly unknown[] = [], opts?: CallOpts): Promise<unknown> {
+    // Lifecycle gate: while the manager is in (or transitioning into)
+    // `suspended`, calls either reject (when `failOnSuspend` is set) or
+    // queue and replay on `resume()`. The queue preserves ordering and
+    // resets the timeout clock to start ticking only after resume.
+    if (this.lifecycle === 'suspending' || this.lifecycle === 'suspended') {
+      if (opts?.failOnSuspend) {
+        throw new SuspendedError(`manager is ${this.lifecycle}`);
+      }
+      const def = deferred<unknown>();
+      this.suspendQueue.push({ method, params, opts, def });
+      return def.promise;
+    }
+    if (this.lifecycle === 'stopped') {
+      throw new SuspendedError('manager is stopped');
+    }
+
     // Cache lookup happens up-front: if the method is on the cacheable
     // allow-list and we already have a value, return it without ever
     // touching the wire. Cache writes happen after a successful wire call
@@ -605,6 +767,13 @@ export class ElectrumManager {
     const meta = this.meta.get(id);
     if (meta?.bannedUntil !== undefined && meta.bannedUntil > Date.now()) return false;
     return true;
+  }
+
+  /** Sum of in-flight requests across every connected client. */
+  private totalInFlight(): number {
+    let n = 0;
+    for (const c of this.clients.values()) n += c.inFlightCount;
+    return n;
   }
 
   // --- Cache helpers -----------------------------------------------------
@@ -1033,6 +1202,10 @@ function isRetryable(kind: ErrorKind): boolean {
   // Server-availability-class errors get a re-pick. Caller-owned errors
   // (rpc-error, protocol) are bubbled — the request itself is wrong.
   return kind === 'transport' || kind === 'timeout' || kind === 'rate-limit';
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function defaultTransportFactory(endpoint: Endpoint): Transport {

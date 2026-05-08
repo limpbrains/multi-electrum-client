@@ -294,6 +294,17 @@ export class ElectrumClient {
     }
   }
 
+  /**
+   * Reject every in-flight request with `e`, clear the timers, and drop
+   * the table. Used by the manager's `suspend()` path so callers see a
+   * `SuspendedError` rather than the `TransportError` that `disconnect`
+   * would surface (their request didn't fail because the link died, it
+   * failed because the manager went to sleep).
+   */
+  failInFlight(e: Error): void {
+    this.failAllInFlight(e);
+  }
+
   private failAllInFlight(e: Error): void {
     for (const inflight of this.inFlight.values()) {
       clearTimeout(inflight.timer);
