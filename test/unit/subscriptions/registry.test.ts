@@ -412,9 +412,7 @@ describe('SubscriptionRegistry — exception safety', () => {
     // statusEquals.
     const circular: Record<string, unknown> = {};
     circular['self'] = circular;
-    expect(() =>
-      reg.notify('A', 'blockchain.scripthash.subscribe', ['H'], circular),
-    ).not.toThrow();
+    expect(() => reg.notify('A', 'blockchain.scripthash.subscribe', ['H'], circular)).not.toThrow();
     expect(handler).toHaveBeenCalledWith(circular);
   });
 });

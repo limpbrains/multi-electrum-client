@@ -54,10 +54,7 @@ describe('defaultClassifier — ElectrumX rate-limit', () => {
 
   it('does not false-positive on routine errors', () => {
     expect(
-      defaultClassifier.classify(
-        new RpcError('history too long', 1),
-        baseCtx('ElectrumX 1.16.0'),
-      ),
+      defaultClassifier.classify(new RpcError('history too long', 1), baseCtx('ElectrumX 1.16.0')),
     ).toBe('rpc-error');
   });
 });
@@ -100,22 +97,19 @@ describe('defaultClassifier — electrs rate-limit', () => {
 
   it('does not match "excessive" alone (electrs uses different vocabulary)', () => {
     expect(
-      defaultClassifier.classify(
-        new RpcError('excessive history', 1),
-        baseCtx('electrs 0.10.2'),
-      ),
+      defaultClassifier.classify(new RpcError('excessive history', 1), baseCtx('electrs 0.10.2')),
     ).toBe('rpc-error');
   });
 });
 
 describe('defaultClassifier — unknown serverSoftware (generic table)', () => {
   it('matches the broad generic substrings when software is undefined', () => {
-    expect(
-      defaultClassifier.classify(new RpcError('You have been banned', 1), baseCtx()),
-    ).toBe('rate-limit');
-    expect(
-      defaultClassifier.classify(new RpcError('excessive load', 1), baseCtx()),
-    ).toBe('rate-limit');
+    expect(defaultClassifier.classify(new RpcError('You have been banned', 1), baseCtx())).toBe(
+      'rate-limit',
+    );
+    expect(defaultClassifier.classify(new RpcError('excessive load', 1), baseCtx())).toBe(
+      'rate-limit',
+    );
   });
 });
 
@@ -131,7 +125,10 @@ describe('defaultClassifier — untyped network errors', () => {
 
   it('classifies WS abnormal closure messages as transport', () => {
     expect(
-      defaultClassifier.classify(new Error('WebSocket was closed: 1006 abnormal closure'), baseCtx()),
+      defaultClassifier.classify(
+        new Error('WebSocket was closed: 1006 abnormal closure'),
+        baseCtx(),
+      ),
     ).toBe('transport');
   });
 
