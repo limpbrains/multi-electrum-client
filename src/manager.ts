@@ -118,6 +118,7 @@ export class ElectrumManager {
         this.callDirect(method, params, callOpts),
       emit: (event, payload) => this.emit(event, payload),
       pickConnectedClient: () => this.firstConnectedClient(),
+      isClientConnected: (id) => this.isClientUsable(id),
     });
     for (const spec of opts.servers) {
       this.installServer(spec);
@@ -282,7 +283,16 @@ export class ElectrumManager {
      */
     subscribe: (handler: SubscriptionHandler<BlockHeader>) =>
       this.registry.subscribe<BlockHeader>('blockchain.headers.subscribe', [], handler),
-    /** Shorthand for "fetch the current tip without subscribing." */
+    /**
+     * Fetch the current tip. Electrum has no separate "get tip" wire method
+     * — the only way to read it is to call `blockchain.headers.subscribe`,
+     * whose response includes the current header. The server treats this
+     * as a real subscription and will start pushing header notifications
+     * on the same connection; the registry has no record for them so they
+     * are dropped silently. If you also use `headers.subscribe(handler)`
+     * the server may produce two pushes per block (one for each
+     * registration). Use this only when you don't intend to subscribe.
+     */
     getTip: (opts?: CallOpts) => this.call('blockchain.headers.subscribe', [], opts),
     getHeader: (height: number, opts?: CallOpts) =>
       this.call('blockchain.block.header', [height], opts),
@@ -473,6 +483,20 @@ export class ElectrumManager {
       return id;
     }
     return null;
+  }
+
+  /**
+   * True iff the client is in the pool, in `connected` state, and not
+   * currently banned. Used by the subscription registry to gate a wire
+   * `unsubscribe` at the bound server (a fall-through to a different
+   * server would no-op or surface a misleading rpc-error).
+   */
+  private isClientUsable(id: ClientId): boolean {
+    const client = this.clients.get(id);
+    if (!client || client.getState() !== 'connected') return false;
+    const meta = this.meta.get(id);
+    if (meta?.bannedUntil !== undefined && meta.bannedUntil > Date.now()) return false;
+    return true;
   }
 
   /**
