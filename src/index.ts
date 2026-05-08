@@ -71,8 +71,9 @@ export { ElectrumClient, type ElectrumClientOpts, type BatchCallItem } from './c
 export { WsTransport, type WsTransportOpts } from './transport/ws.js';
 export type { Transport, TransportEvent, TransportListener } from './transport/types.js';
 
-// Manager + RoutingPolicy built-ins (M2):
+// Manager + RoutingPolicy built-ins (M2) + subscriptions (M4):
 export { ElectrumManager, type ManagerEvents } from './manager.js';
+export type { SubscriptionHandler, Unsubscribe } from './subscriptions/types.js';
 export {
   roundRobin,
   failover,
