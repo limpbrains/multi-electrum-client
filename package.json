@@ -46,7 +46,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run test/unit",
     "test:watch": "vitest test/unit",
-    "test:types": "vitest run test/types",
+    "test:types": "tsc --noEmit",
     "test:integration": "vitest run test/integration",
     "test:rn": "echo 'react-native-harness wired in M5'",
     "lint": "eslint .",

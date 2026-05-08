@@ -126,8 +126,12 @@ export interface HistoryEntry {
 
 export interface Unspent {
   txid: TxId;
-  /** Output index. */
-  txPos: number;
+  /**
+   * Output index. Wire field is `tx_pos` (snake_case) — kept verbatim for now
+   * because no runtime decoder ships in M3. The post-M4 decoder pass will
+   * normalize wire names to a parallel camelCase domain type.
+   */
+  tx_pos: number;
   /** Satoshis. */
   value: number;
   /** Block height; 0 if unconfirmed. */
@@ -148,7 +152,11 @@ export interface BlockHeader {
 }
 
 export interface MerkleProof {
-  blockHeight: number;
+  /**
+   * Wire field is `block_height` (snake_case). Kept verbatim until the
+   * post-M4 decoder pass remaps wire names to a domain type.
+   */
+  block_height: number;
   pos: number;
   merkle: readonly string[];
 }

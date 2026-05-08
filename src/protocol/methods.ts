@@ -110,3 +110,13 @@ export const methodNames = [
 ] as const satisfies readonly MethodName[];
 
 export type MethodNames = typeof methodNames;
+
+// Exhaustiveness probe: TS errors at compile time if a method is added to
+// the `Methods` interface without a matching entry in `methodNames` (or vice
+// versa). `satisfies` alone only catches typos, not omissions.
+type _ExhaustivenessCheck =
+  Exclude<MethodName, MethodNames[number]> extends never
+    ? true
+    : ['methodNames is missing entries for', Exclude<MethodName, MethodNames[number]>];
+const _exhaustivenessCheck: _ExhaustivenessCheck = true;
+void _exhaustivenessCheck;
