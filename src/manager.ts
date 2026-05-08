@@ -10,6 +10,7 @@ import { buildKey, cacheSpec } from './cache/keys.js';
 import type { CacheStore } from './cache/types.js';
 import type { ClientId, ClientView, ConnectionState, Endpoint, Telemetry } from './client.js';
 import { ElectrumClient } from './client.js';
+import { DEFAULT_DISCOVER_INTERVAL_MS, parsePeerList, type DiscoverOptions } from './discovery.js';
 import { defaultClassifier } from './errors/classifier.js';
 import {
   NoClientAvailableError,
@@ -110,6 +111,11 @@ export class ElectrumManager {
   private tipHeight: number | undefined;
   /** Disposer for the internal headers subscription. */
   private tipUnsub: (() => Promise<void>) | null = null;
+  private readonly discoverOptions: DiscoverOptions | undefined;
+  /** Per-client re-poll timers for peer discovery. */
+  private readonly discoverTimers = new Map<ClientId, ReturnType<typeof setTimeout>>();
+  /** True while we're tearing down — guards async tasks against post-stop work. */
+  private stopped = false;
   // Standard typed-event-emitter pattern: store opaquely, cast at the API edge.
   private readonly listeners = new Map<keyof ManagerEvents, Set<(p: unknown) => void>>();
 
@@ -123,6 +129,7 @@ export class ElectrumManager {
     this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
     this.cache = opts.cache;
     this.finalizedConfs = opts.finalizedConfs ?? 6;
+    this.discoverOptions = opts.discover;
     this.batcher = new MicrotaskBatcher<BatchItem>((items) => {
       this.flushBatch(items).catch((e) => this.emit('error', e));
     });
@@ -142,6 +149,7 @@ export class ElectrumManager {
 
   /** Connect every server in parallel. Errors do not throw; they fire `error` events. */
   async start(): Promise<void> {
+    this.stopped = false;
     const tasks = [...this.clients.values()].map(async (c) => {
       try {
         await c.connect();
@@ -175,6 +183,9 @@ export class ElectrumManager {
 
   /** Disconnect every server and drop all subscriptions. */
   async stop(): Promise<void> {
+    this.stopped = true;
+    for (const t of this.discoverTimers.values()) clearTimeout(t);
+    this.discoverTimers.clear();
     if (this.tipUnsub) {
       try {
         await this.tipUnsub();
@@ -463,12 +474,25 @@ export class ElectrumManager {
         // Fire-and-forget: rebind any orphaned subs onto the new connection.
         // Errors surface through the manager `error` event via runAttempts.
         this.registry.restoreOrphans().catch((e) => this.emit('error', e));
+        // Kick off a peer-discovery probe on this fresh connection. Idempotent:
+        // already-known peers are skipped without consulting onDiscover.
+        if (this.discoverOptions?.enabled) {
+          this.discoverFromClient(spec.id).catch((e) => this.emit('error', e));
+        }
       } else if (state === 'disconnected') {
         this.registry.clientDisconnected(spec.id);
         // Subs bound to this client are now orphaned — immediately try to
         // re-bind them onto any other already-connected client without
         // waiting for the next state transition.
         this.registry.restoreOrphans().catch((e) => this.emit('error', e));
+        // Cancel any scheduled re-poll: it would fire against a dead
+        // client and route via policy.pick to a different server, which
+        // is fine but wasteful. The next `connected` re-installs it.
+        const t = this.discoverTimers.get(spec.id);
+        if (t !== undefined) {
+          clearTimeout(t);
+          this.discoverTimers.delete(spec.id);
+        }
       }
     });
     this.clients.set(spec.id, client);
@@ -638,6 +662,82 @@ export class ElectrumManager {
       return;
     }
     await this.cache.set(key, serialized);
+  }
+
+  // --- Peer discovery ----------------------------------------------------
+
+  /**
+   * Probe a freshly-connected client for `server.peers.subscribe`. Parses
+   * the response, runs each candidate through `onDiscover`, and admits via
+   * `addServer`. Servers that don't support peer discovery typically emit
+   * an RPC error which we swallow — discovery is best-effort.
+   *
+   * Schedules the next re-poll on success (and only on success — a
+   * permanently-failing server doesn't waste timer slots forever).
+   */
+  private async discoverFromClient(clientId: ClientId): Promise<void> {
+    const opts = this.discoverOptions;
+    if (!opts?.enabled) return;
+    if (this.stopped) return;
+
+    let response: unknown;
+    try {
+      response = await this.callDirect('server.peers.subscribe', [], {
+        preferClient: clientId,
+        retry: 'none',
+      });
+    } catch {
+      // Server doesn't support peer discovery, or transient failure — drop
+      // silently. Manager `error` event already surfaced the underlying
+      // failure via runAttempts if it's something the caller cares about.
+      return;
+    }
+
+    const candidates = parsePeerList(response);
+    for (const cand of candidates) {
+      // Dedup against the existing pool (id is `host:port`).
+      if (this.clients.has(cand.id)) continue;
+      let admit: boolean;
+      if (opts.onDiscover) {
+        try {
+          admit = await opts.onDiscover(cand);
+        } catch (e) {
+          this.emit('error', e);
+          continue;
+        }
+      } else {
+        admit = true;
+      }
+      if (!admit) continue;
+      // Re-check after the await: the pool may have grown / shrunk while
+      // the user's callback ran (their callback might also have called
+      // addServer / removeServer).
+      if (this.stopped) return;
+      if (this.clients.has(cand.id)) continue;
+      try {
+        this.addServer(cand);
+      } catch (e) {
+        // Likely a duplicate id race; surface and move on.
+        this.emit('error', e);
+      }
+    }
+
+    const interval = opts.intervalMs ?? DEFAULT_DISCOVER_INTERVAL_MS;
+    if (interval <= 0) return;
+    if (this.stopped) return;
+    // Replace any prior timer (defensive; onStateChange already cleared on
+    // disconnect, but a manual addServer-during-poll race is possible).
+    const prev = this.discoverTimers.get(clientId);
+    if (prev !== undefined) clearTimeout(prev);
+    const t = setTimeout(() => {
+      this.discoverTimers.delete(clientId);
+      this.discoverFromClient(clientId).catch((e) => this.emit('error', e));
+    }, interval);
+    // Don't keep the Node event loop alive on this timer alone.
+    if (typeof t === 'object' && t !== null && 'unref' in t) {
+      (t as { unref: () => void }).unref();
+    }
+    this.discoverTimers.set(clientId, t);
   }
 
   /**
