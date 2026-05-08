@@ -144,8 +144,11 @@ describe('preferFastest', () => {
     expect(policy.pick(ctx(cs))).toBe('b');
   });
 
-  it('treats untested (samples=0) as best', () => {
+  it('admits untested (samples=0) clients to the tied set without monopolizing', () => {
     const policy = preferFastest();
+    // Untested b should not pull the threshold to 0 (which would have hidden a
+    // entirely under the old logic). Both clients land in the tied set; the
+    // leastInFlight tiebreak (both 0) returns the first.
     const cs = [
       view('a', {
         telemetry: { ...view('a').telemetry, latency: { ema: 50, p50: 50, p95: 50, samples: 5 } },
@@ -154,7 +157,49 @@ describe('preferFastest', () => {
         telemetry: { ...view('b').telemetry, latency: { ema: 0, p50: 0, p95: 0, samples: 0 } },
       }),
     ];
+    expect(policy.pick(ctx(cs))).toBe('a');
+  });
+
+  it('untested wins via leastInFlight when a tested client is busy', () => {
+    const policy = preferFastest();
+    const cs = [
+      view('a', {
+        telemetry: {
+          ...view('a').telemetry,
+          latency: { ema: 50, p50: 50, p95: 50, samples: 5 },
+          inFlight: 5,
+        },
+      }),
+      view('b', {
+        telemetry: {
+          ...view('b').telemetry,
+          latency: { ema: 0, p50: 0, p95: 0, samples: 0 },
+          inFlight: 0,
+        },
+      }),
+    ];
     expect(policy.pick(ctx(cs))).toBe('b');
+  });
+
+  it('all-untested falls back to leastInFlight / first-wins', () => {
+    const policy = preferFastest();
+    const cs = [
+      view('a', {
+        telemetry: {
+          ...view('a').telemetry,
+          latency: { ema: 0, p50: 0, p95: 0, samples: 0 },
+          inFlight: 0,
+        },
+      }),
+      view('b', {
+        telemetry: {
+          ...view('b').telemetry,
+          latency: { ema: 0, p50: 0, p95: 0, samples: 0 },
+          inFlight: 0,
+        },
+      }),
+    ];
+    expect(policy.pick(ctx(cs))).toBe('a');
   });
 
   it('withinPct widens the tied set', () => {

@@ -52,6 +52,11 @@ export interface ManagerEvents {
   error: unknown;
 }
 
+type AttemptOutcome =
+  | { kind: 'success'; clientId: ClientId; value: unknown }
+  | { kind: 'error'; clientId: ClientId; error: Error; errorKind: ErrorKind }
+  | { kind: 'no-client'; error: Error };
+
 export class ElectrumManager {
   readonly network: Network;
   private readonly clients = new Map<ClientId, ElectrumClient>();
@@ -63,8 +68,7 @@ export class ElectrumManager {
   private readonly requestTimeoutMs: number | undefined;
   private readonly transportFactory: (endpoint: Endpoint) => Transport;
   private readonly batcher: MicrotaskBatcher<BatchItem>;
-  // Variance on a discriminated mapped type doesn't carry through `[K]`
-  // lookups in strict TS, so we store opaquely and cast at the API edge.
+  // Standard typed-event-emitter pattern: store opaquely, cast at the API edge.
   private readonly listeners = new Map<keyof ManagerEvents, Set<(p: unknown) => void>>();
 
   constructor(opts: ManagerOptions & { transportFactory?: (e: Endpoint) => Transport }) {
@@ -76,7 +80,7 @@ export class ElectrumManager {
     this.requestTimeoutMs = opts.requestTimeoutMs;
     this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
     this.batcher = new MicrotaskBatcher<BatchItem>((items) => {
-      void this.flushBatch(items);
+      this.flushBatch(items).catch((e) => this.emit('error', e));
     });
     for (const spec of opts.servers) {
       this.installServer(spec);
@@ -118,13 +122,17 @@ export class ElectrumManager {
   async removeServer(id: ClientId): Promise<void> {
     const c = this.clients.get(id);
     if (!c) return;
-    this.clients.delete(id);
-    this.meta.delete(id);
+    // Disconnect first so any in-flight retry that races sees the client in
+    // its 'disconnected' state via the candidate snapshot rather than missing
+    // entirely (the latter would surface as a misleading "client disappeared"
+    // error). Only after the socket is closed do we drop the entry.
     try {
       await c.disconnect();
     } catch (e) {
       this.emit('error', e);
     }
+    this.clients.delete(id);
+    this.meta.delete(id);
   }
 
   /** Direct or auto-batched single call. */
@@ -146,7 +154,13 @@ export class ElectrumManager {
       });
       return def.promise as Promise<T>;
     }
-    return this.routeSingle(method, params, opts) as Promise<T>;
+    return this.runAttempts(
+      method,
+      params,
+      new Set<ClientId>(),
+      this.maxAttemptsFor(opts),
+      0,
+    ) as Promise<T>;
   }
 
   /**
@@ -214,58 +228,84 @@ export class ElectrumManager {
     });
   }
 
-  private async routeSingle(
+  /**
+   * Loop attemptOnce until success, non-retryable error, or budget exhausted.
+   * Single source of routing logic for both the direct call path and the
+   * partial-batch retry path. `seed` lets the retry path carry the original
+   * failure cause through to a final NoClientAvailableError.
+   */
+  private async runAttempts(
     method: string,
     params: readonly unknown[],
-    opts: CallOpts | undefined,
+    excluded: Set<ClientId>,
+    maxAttempts: number,
+    initialAttempt: number,
+    seed?: Error,
   ): Promise<unknown> {
-    const maxAttempts = this.maxAttemptsFor(opts);
-    const excluded = new Set<ClientId>();
-    let lastErr: Error | undefined;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const ctx: PickContext = {
-        request: { method, params },
-        attempt,
-        excluded,
-        candidates: this.buildCandidates(),
-        now: Date.now(),
-      };
-      const clientId = this.policy.pick(ctx);
-      if (clientId === null) {
-        throw lastErr ?? new NoClientAvailableError(`no eligible client for ${method}`);
-      }
-      const client = this.clients.get(clientId);
-      if (!client) {
-        excluded.add(clientId);
-        continue;
-      }
-      const start = Date.now();
-      try {
-        const value = await client.call(method, params);
-        this.recordSuccess(clientId, method, Date.now() - start);
-        return value;
-      } catch (e) {
-        const elapsed = Date.now() - start;
-        const kind = this.classifier.classify(e, {
-          ...(this.meta.get(clientId)?.capabilities.serverSoftware !== undefined
-            ? { serverSoftware: this.meta.get(clientId)!.capabilities.serverSoftware! }
-            : {}),
-          method,
-          durationMs: elapsed,
-        });
-        this.recordError(clientId, method, kind, elapsed);
-        excluded.add(clientId);
-        lastErr = e as Error;
-        if (!isRetryable(kind)) throw e;
-      }
+    let lastErr: Error | undefined = seed;
+    let attempt = initialAttempt;
+    while (attempt < maxAttempts) {
+      const outcome = await this.attemptOnce(method, params, excluded);
+      if (outcome.kind === 'success') return outcome.value;
+      if (outcome.kind === 'no-client') throw lastErr ?? outcome.error;
+      lastErr = outcome.error;
+      excluded.add(outcome.clientId);
+      attempt++;
+      if (!isRetryable(outcome.errorKind)) throw outcome.error;
     }
-
     throw lastErr ?? new NoClientAvailableError('exhausted retry budget');
   }
 
+  /**
+   * One pick-and-call cycle: ask the policy, send the request, classify the
+   * outcome, record telemetry, ban on rate-limit. Caller decides whether to
+   * loop based on the returned outcome kind.
+   */
+  private async attemptOnce(
+    method: string,
+    params: readonly unknown[],
+    excluded: ReadonlySet<ClientId>,
+  ): Promise<AttemptOutcome> {
+    const ctx: PickContext = {
+      request: { method, params },
+      attempt: excluded.size,
+      excluded,
+      candidates: this.buildCandidates(),
+      now: Date.now(),
+    };
+    const clientId = this.policy.pick(ctx);
+    if (clientId === null) {
+      return {
+        kind: 'no-client',
+        error: new NoClientAvailableError(`no eligible client for ${method}`),
+      };
+    }
+    const client = this.clients.get(clientId);
+    if (!client) {
+      return {
+        kind: 'no-client',
+        error: new NoClientAvailableError(`client ${clientId} no longer in pool`),
+      };
+    }
+    const start = Date.now();
+    try {
+      const value = await client.call(method, params);
+      this.recordSuccess(clientId, method, Date.now() - start);
+      return { kind: 'success', clientId, value };
+    } catch (e) {
+      const elapsed = Date.now() - start;
+      const errorKind = this.classifyFor(clientId, method, e, elapsed);
+      this.recordError(clientId, method, errorKind, elapsed);
+      return { kind: 'error', clientId, error: e as Error, errorKind };
+    }
+  }
+
   private async flushBatch(items: BatchItem[]): Promise<void> {
-    // Per-item picks at flush time; group same-client items into one batch.
+    // One candidate snapshot per flush; the policy sees a stable view across
+    // every item it picks for. N items × M clients allocations would otherwise
+    // blow up here.
+    const candidates = this.buildCandidates();
+    const now = Date.now();
     const groups = new Map<ClientId, BatchItem[]>();
     const unroutable: BatchItem[] = [];
 
@@ -274,8 +314,8 @@ export class ElectrumManager {
         request: { method: item.method, params: item.params },
         attempt: item.attempt,
         excluded: item.excluded,
-        candidates: this.buildCandidates(),
-        now: Date.now(),
+        candidates,
+        now,
       };
       const clientId = this.policy.pick(ctx);
       if (clientId === null) {
@@ -301,7 +341,7 @@ export class ElectrumManager {
     if (!client) {
       for (const item of grp) {
         item.excluded.add(clientId);
-        this.maybeRetry(item, new NoClientAvailableError(`client ${clientId} disappeared`));
+        this.maybeRetry(item, new NoClientAvailableError(`client ${clientId} no longer in pool`));
       }
       return;
     }
@@ -313,13 +353,7 @@ export class ElectrumManager {
     } catch (e) {
       // Whole-batch transport failure. Treat every item as failed and retry.
       const elapsed = Date.now() - start;
-      const kind = this.classifier.classify(e, {
-        ...(this.meta.get(clientId)?.capabilities.serverSoftware !== undefined
-          ? { serverSoftware: this.meta.get(clientId)!.capabilities.serverSoftware! }
-          : {}),
-        method: '<batch>',
-        durationMs: elapsed,
-      });
+      const kind = this.classifyFor(clientId, '<batch>', e, elapsed);
       this.recordError(clientId, '<batch>', kind, elapsed);
       for (const item of grp) {
         item.excluded.add(clientId);
@@ -340,13 +374,7 @@ export class ElectrumManager {
         this.recordSuccess(clientId, item.method, elapsed);
         item.def.resolve(r.value);
       } else {
-        const kind = this.classifier.classify(r.error, {
-          ...(this.meta.get(clientId)?.capabilities.serverSoftware !== undefined
-            ? { serverSoftware: this.meta.get(clientId)!.capabilities.serverSoftware! }
-            : {}),
-          method: item.method,
-          durationMs: elapsed,
-        });
+        const kind = this.classifyFor(clientId, item.method, r.error, elapsed);
         this.recordError(clientId, item.method, kind, elapsed);
         item.excluded.add(clientId);
         if (isRetryable(kind)) {
@@ -366,55 +394,19 @@ export class ElectrumManager {
     }
     // Retries take the direct (single-shot) path. Re-batching them across the
     // next microtask boundary buys little and complicates ordering guarantees.
-    this.routeFromItem(item).then(
+    // Seed `runAttempts` with the original error so a final
+    // NoClientAvailableError surfaces the actual cause.
+    this.runAttempts(
+      item.method,
+      item.params,
+      item.excluded,
+      this.maxAttemptsFor(item.opts),
+      item.attempt,
+      lastError,
+    ).then(
       (v) => item.def.resolve(v),
       (e) => item.def.reject(e),
     );
-  }
-
-  private async routeFromItem(item: BatchItem): Promise<unknown> {
-    const maxAttempts = this.maxAttemptsFor(item.opts);
-    let lastErr: Error | undefined;
-    while (item.attempt < maxAttempts) {
-      const ctx: PickContext = {
-        request: { method: item.method, params: item.params },
-        attempt: item.attempt,
-        excluded: item.excluded,
-        candidates: this.buildCandidates(),
-        now: Date.now(),
-      };
-      const clientId = this.policy.pick(ctx);
-      if (clientId === null) {
-        throw lastErr ?? new NoClientAvailableError(`no eligible client for ${item.method}`);
-      }
-      const client = this.clients.get(clientId);
-      if (!client) {
-        item.excluded.add(clientId);
-        item.attempt++;
-        continue;
-      }
-      const start = Date.now();
-      try {
-        const value = await client.call(item.method, item.params);
-        this.recordSuccess(clientId, item.method, Date.now() - start);
-        return value;
-      } catch (e) {
-        const elapsed = Date.now() - start;
-        const kind = this.classifier.classify(e, {
-          ...(this.meta.get(clientId)?.capabilities.serverSoftware !== undefined
-            ? { serverSoftware: this.meta.get(clientId)!.capabilities.serverSoftware! }
-            : {}),
-          method: item.method,
-          durationMs: elapsed,
-        });
-        this.recordError(clientId, item.method, kind, elapsed);
-        item.excluded.add(clientId);
-        item.attempt++;
-        lastErr = e as Error;
-        if (!isRetryable(kind)) throw e;
-      }
-    }
-    throw lastErr ?? new NoClientAvailableError('exhausted retry budget');
   }
 
   private buildCandidates(): ClientView[] {
@@ -447,11 +439,25 @@ export class ElectrumManager {
     return out;
   }
 
+  private classifyFor(
+    clientId: ClientId,
+    method: string,
+    e: unknown,
+    durationMs: number,
+  ): ErrorKind {
+    const sw = this.meta.get(clientId)?.capabilities.serverSoftware;
+    return this.classifier.classify(e, {
+      method,
+      durationMs,
+      ...(sw !== undefined ? { serverSoftware: sw } : {}),
+    });
+  }
+
   private recordSuccess(id: ClientId, method: string, latencyMs: number): void {
     const m = this.meta.get(id);
     if (!m) return;
     m.telemetry.recordSuccess(latencyMs, Date.now());
-    this.policy.onOutcome?.({ kind: 'success', clientId: id, method, latencyMs });
+    this.invokeOnOutcome({ kind: 'success', clientId: id, method, latencyMs });
   }
 
   private recordError(id: ClientId, method: string, kind: ErrorKind, latencyMs: number): void {
@@ -466,7 +472,18 @@ export class ElectrumManager {
         reason: kind,
       });
     }
-    this.policy.onOutcome?.({ kind: 'error', clientId: id, method, error: kind, latencyMs });
+    this.invokeOnOutcome({ kind: 'error', clientId: id, method, error: kind, latencyMs });
+  }
+
+  private invokeOnOutcome(o: Parameters<NonNullable<RoutingPolicy['onOutcome']>>[0]): void {
+    const fn = this.policy.onOutcome;
+    if (!fn) return;
+    try {
+      fn(o);
+    } catch (e) {
+      // Buggy user policy must not corrupt the hot path.
+      this.emit('error', e);
+    }
   }
 
   private emit<K extends keyof ManagerEvents>(event: K, payload: ManagerEvents[K]): void {
