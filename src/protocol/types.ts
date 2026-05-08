@@ -15,6 +15,8 @@ export interface ServerSpec {
   host: string;
   port: number;
   protocol: Protocol;
+  /** Optional URL path for WebSocket endpoints, e.g. `/ws`. */
+  path?: string;
 }
 
 export type Tx = ConfirmedTx | UnconfirmedTx;
