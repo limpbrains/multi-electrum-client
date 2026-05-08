@@ -4,11 +4,16 @@
 // request ids, dispatches responses back to caller promises, and routes
 // server-initiated notifications to a single subscribed listener (the
 // SubscriptionRegistry, in M4).
+//
+// Telemetry (latency / success / error / ban / classified-kind) lives on the
+// Manager — Client only exposes raw inFlight count and connectedSince so the
+// Manager can compose a ClientView snapshot for the RoutingPolicy.
 
 import type { ErrorKind } from './errors/types.js';
 import { RpcError, TimeoutError, TransportError } from './errors/types.js';
 import {
   decodeMessage,
+  encodeBatch,
   encodeRequest,
   type JsonRpcId,
   type JsonRpcMessage,
@@ -17,6 +22,7 @@ import {
 } from './protocol/framing.js';
 import type { Transport, TransportEvent } from './transport/types.js';
 import { deferred, type Deferred } from './util/deferred.js';
+import { err, ok, type Result } from './util/result.js';
 
 export type ClientId = string;
 
@@ -63,6 +69,11 @@ export interface ElectrumClientOpts {
   requestTimeoutMs?: number;
 }
 
+export interface BatchCallItem {
+  method: string;
+  params: readonly unknown[];
+}
+
 interface InFlight {
   def: Deferred<unknown>;
   method: string;
@@ -77,6 +88,7 @@ export class ElectrumClient {
   private readonly inFlight = new Map<JsonRpcId, InFlight>();
   private nextId = 1;
   private state: ConnectionState = 'disconnected';
+  private connectedAt: number | undefined;
   private notifListener: ((n: JsonRpcNotification) => void) | undefined;
   private detachTransport: (() => void) | undefined;
 
@@ -91,6 +103,16 @@ export class ElectrumClient {
     return this.state;
   }
 
+  /** Number of currently outstanding JSON-RPC requests. */
+  get inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
+  /** Monotonic ms timestamp of the most recent successful connect. */
+  get connectedSince(): number | undefined {
+    return this.connectedAt;
+  }
+
   async connect(): Promise<void> {
     if (this.state === 'connected') return;
     if (this.state === 'connecting') {
@@ -101,16 +123,18 @@ export class ElectrumClient {
     try {
       await this.transport.connect();
       this.state = 'connected';
-    } catch (err) {
+      this.connectedAt = Date.now();
+    } catch (e) {
       this.state = 'disconnected';
       this.detachTransport?.();
       this.detachTransport = undefined;
-      throw err;
+      throw e;
     }
   }
 
   async disconnect(): Promise<void> {
     this.state = 'disconnected';
+    this.connectedAt = undefined;
     this.detachTransport?.();
     this.detachTransport = undefined;
     this.failAllInFlight(new TransportError('disconnected by client'));
@@ -125,25 +149,53 @@ export class ElectrumClient {
     const req: JsonRpcRequest = { jsonrpc: '2.0', method, params, id };
     const text = encodeRequest(req);
     const def = deferred<T>();
-
-    const timer = setTimeout(() => {
-      const inflight = this.inFlight.get(id);
-      if (!inflight) return;
-      this.inFlight.delete(id);
-      inflight.def.reject(new TimeoutError(`${method} timed out after ${this.requestTimeoutMs}ms`));
-    }, this.requestTimeoutMs);
-
-    this.inFlight.set(id, { def: def as Deferred<unknown>, method, timer });
+    this.registerInFlight(id, def as Deferred<unknown>, method);
 
     try {
       await this.transport.send(text);
-    } catch (err) {
-      clearTimeout(timer);
-      this.inFlight.delete(id);
-      throw err;
+    } catch (e) {
+      this.cancelInFlight(id);
+      throw e;
     }
 
     return def.promise;
+  }
+
+  /**
+   * Send N requests as a single JSON-RPC batch and resolve with one Result per
+   * item, in the original order. Per-item failures (including timeouts) are
+   * surfaced as `{ ok: false, error }`. A whole-batch failure (transport send
+   * error, connection drop) rejects the outer promise.
+   */
+  async batchCall(reqs: readonly BatchCallItem[]): Promise<Array<Result<unknown>>> {
+    if (this.state !== 'connected') {
+      throw new TransportError(`cannot batchCall: state is ${this.state}`);
+    }
+    if (reqs.length === 0) return [];
+
+    const ids: JsonRpcId[] = [];
+    const promises: Promise<Result<unknown>>[] = [];
+    const jsonReqs: JsonRpcRequest[] = [];
+
+    for (const r of reqs) {
+      const id = this.nextId++;
+      ids.push(id);
+      jsonReqs.push({ jsonrpc: '2.0', method: r.method, params: r.params, id });
+
+      const def = deferred<unknown>();
+      this.registerInFlight(id, def, r.method);
+      promises.push(def.promise.then(ok, err));
+    }
+
+    const text = encodeBatch(jsonReqs);
+    try {
+      await this.transport.send(text);
+    } catch (e) {
+      for (const id of ids) this.cancelInFlight(id);
+      throw e;
+    }
+
+    return Promise.all(promises);
   }
 
   /** Set the listener for server-initiated notifications (one per client). */
@@ -151,9 +203,27 @@ export class ElectrumClient {
     this.notifListener = listener;
   }
 
+  private registerInFlight(id: JsonRpcId, def: Deferred<unknown>, method: string): void {
+    const timer = setTimeout(() => {
+      const inflight = this.inFlight.get(id);
+      if (!inflight) return;
+      this.inFlight.delete(id);
+      inflight.def.reject(new TimeoutError(`${method} timed out after ${this.requestTimeoutMs}ms`));
+    }, this.requestTimeoutMs);
+    this.inFlight.set(id, { def, method, timer });
+  }
+
+  private cancelInFlight(id: JsonRpcId): void {
+    const inflight = this.inFlight.get(id);
+    if (!inflight) return;
+    this.inFlight.delete(id);
+    clearTimeout(inflight.timer);
+  }
+
   private handle(ev: TransportEvent): void {
     if (ev.type === 'close') {
       this.state = 'disconnected';
+      this.connectedAt = undefined;
       const reason =
         ev.code !== undefined
           ? `socket closed (code=${ev.code}${ev.reason ? `, reason=${ev.reason}` : ''})`
@@ -192,21 +262,21 @@ export class ElectrumClient {
     this.inFlight.delete(msg.id);
     clearTimeout(inflight.timer);
     if ('error' in msg) {
-      const err = msg.error;
+      const e = msg.error;
       inflight.def.reject(
-        err.data !== undefined
-          ? new RpcError(err.message, err.code, err.data)
-          : new RpcError(err.message, err.code),
+        e.data !== undefined
+          ? new RpcError(e.message, e.code, e.data)
+          : new RpcError(e.message, e.code),
       );
     } else {
       inflight.def.resolve(msg.result);
     }
   }
 
-  private failAllInFlight(err: Error): void {
+  private failAllInFlight(e: Error): void {
     for (const inflight of this.inFlight.values()) {
       clearTimeout(inflight.timer);
-      inflight.def.reject(err);
+      inflight.def.reject(e);
     }
     this.inFlight.clear();
   }

@@ -41,10 +41,22 @@ export {
   ProtocolError,
 } from './errors/types.js';
 
-// Single-client surface (M1):
-export { ElectrumClient, type ElectrumClientOpts } from './client.js';
+// Single-client surface:
+export { ElectrumClient, type ElectrumClientOpts, type BatchCallItem } from './client.js';
 export { WsTransport, type WsTransportOpts } from './transport/ws.js';
 export type { Transport, TransportEvent, TransportListener } from './transport/types.js';
 
-// Manager + namespace API land in M2.
-// export { ElectrumManager } from './manager.js';
+// Manager + RoutingPolicy built-ins (M2):
+export { ElectrumManager, type ManagerEvents } from './manager.js';
+export {
+  roundRobin,
+  failover,
+  preferFastest,
+  withSticky,
+  type PreferFastestOpts,
+  type StickyKeyFn,
+} from './policy/builtins.js';
+export { defaultClassifier } from './errors/classifier.js';
+export { NoClientAvailableError } from './errors/types.js';
+export type { Result } from './util/result.js';
+export { ok, err } from './util/result.js';

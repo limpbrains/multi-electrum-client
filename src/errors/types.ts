@@ -49,3 +49,7 @@ export class RpcError extends Error {
 export class ProtocolError extends Error {
   override readonly name = 'ProtocolError';
 }
+
+export class NoClientAvailableError extends Error {
+  override readonly name = 'NoClientAvailableError';
+}
