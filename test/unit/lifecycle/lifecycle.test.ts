@@ -573,6 +573,46 @@ describe('Manager lifecycle — suspend / resume', () => {
     await manager.stop();
   });
 
+  it('addServer while suspended does not eagerly connect; resume() picks it up', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.suspend({ graceMs: 0 });
+
+    manager.addServer({ id: 'b', host: 'b', port: 50001, protocol: 'ws' });
+    // Transport was constructed (factory runs at install time) but not
+    // connected — eager connect would defeat suspend.
+    expect(h.transports.get('b')).toBeDefined();
+    expect(h.transports.get('b')!.connected).toBe(false);
+
+    await manager.resume();
+    // Now `b` is connected.
+    expect(h.transports.get('b')!.connected).toBe(true);
+    await manager.stop();
+  });
+
+  it('addServer on a stopped manager throws SuspendedError', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.stop();
+    expect(() => manager.addServer({ id: 'b', host: 'b', port: 50001, protocol: 'ws' })).toThrow(
+      SuspendedError,
+    );
+  });
+
   it('preserves subscriptions across suspend / resume with catch-up', async () => {
     const h = buildHarness();
     const manager = new ElectrumManager({
