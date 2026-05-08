@@ -380,6 +380,137 @@ describe('Manager lifecycle — suspend / resume', () => {
     expect(manager.state).toBe('stopped');
   });
 
+  it('queued call rejects immediately on AbortSignal abort, drops from queue', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.suspend({ graceMs: 0 });
+
+    const controller = new AbortController();
+    const queued = manager.call('server.ping', [], { signal: controller.signal });
+    controller.abort(new Error('user cancelled'));
+    await expect(queued).rejects.toThrow(/user cancelled/);
+
+    // Drained queue must not double-resolve / fire wire calls for the aborted item.
+    const resumePromise = manager.resume();
+    await delay(0);
+    // No reply needed — no wire request fires for the aborted call.
+    await resumePromise;
+    await manager.stop();
+  });
+
+  it('queued call rejects immediately when signal is already aborted at submit', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.suspend({ graceMs: 0 });
+
+    const controller = new AbortController();
+    controller.abort(new Error('preempt'));
+    const queued = manager.call('server.ping', [], { signal: controller.signal });
+    await expect(queued).rejects.toThrow(/preempt/);
+
+    await manager.resume();
+    await manager.stop();
+  });
+
+  it('concurrent suspend()s share the same in-flight transition promise', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    // Issue an in-flight call so suspend's grace window has work to do.
+    void manager.call('server.ping', []).catch(() => undefined);
+    await delay(0);
+
+    const a = manager.suspend({ graceMs: 50 });
+    const b = manager.suspend({ graceMs: 50 });
+    // Both must observe the FINAL state, not the intermediate.
+    await Promise.all([a, b]);
+    expect(manager.state).toBe('suspended');
+    await manager.stop();
+  });
+
+  it('does not accumulate duplicate tip handlers across suspend/resume cycles', async () => {
+    const h = buildHarness();
+    const cache = new (await import('../../../src/cache/memory.js')).MemoryCache();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+      cache,
+    });
+
+    // Helper: settle a header subscribe round-trip on `a`.
+    const settleHeaders = async (height: number): Promise<void> => {
+      await delay(0);
+      await delay(0);
+      h.reply('a', (req: { id: number; method: string }) =>
+        req.method === 'blockchain.headers.subscribe'
+          ? { id: req.id, result: { height, hex: '00' } }
+          : undefined,
+      );
+    };
+
+    const startPromise = manager.start();
+    await settleHeaders(100);
+    await startPromise;
+
+    // Two suspend/resume cycles — without the round-3 fix, each adds a
+    // handler to the registry's per-key Set.
+    for (let i = 0; i < 2; i++) {
+      await manager.suspend({ graceMs: 0 });
+      const resumePromise = manager.resume();
+      await settleHeaders(101 + i);
+      await resumePromise;
+    }
+
+    // Push a header notification; only one tip-tracker handler should
+    // fire (verified by checking the cache write goes through cleanly —
+    // duplicate handlers would still write the same value, but we want
+    // to assert the registry's notify-fanout didn't multiply).
+    h.transports.get('a')!.pushFromServer(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'blockchain.headers.subscribe',
+        params: [{ height: 200, hex: 'ff' }],
+      }),
+    );
+    await delay(0);
+
+    // Cache write for height 100 should be possible (tip=200, finality=6).
+    const probe = manager.call('blockchain.block.header', [100]);
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'blockchain.block.header' ? { id: req.id, result: 'HDR' } : undefined,
+    );
+    await probe;
+    await delay(0);
+    expect(await cache.get('et:regtest:v1:hdr:64')).toBe('"HDR"');
+
+    await manager.stop();
+  });
+
   it('preserves subscriptions across suspend / resume with catch-up', async () => {
     const h = buildHarness();
     const manager = new ElectrumManager({

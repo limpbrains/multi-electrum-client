@@ -124,6 +124,13 @@ export class ElectrumManager {
    */
   private lifecycle: LifecycleState = 'created';
   /**
+   * Cached promise for the current in-flight transition. Concurrent
+   * `suspend()` / `resume()` callers share the same promise so an
+   * `await` reflects the *actual* completion of the transition, not a
+   * fast-path return on observing the intermediate state.
+   */
+  private inFlightTransition: Promise<void> | null = null;
+  /**
    * Calls submitted while `suspended` — replayed in order during `resume()`.
    * Each entry's deferred is resolved with the eventual wire result (or
    * rejected with `SuspendedError` on `stop()` mid-suspend).
@@ -260,7 +267,13 @@ export class ElectrumManager {
    * `cancelInFlight: true` skips the wait entirely.
    */
   async suspend(opts: SuspendOptions = {}): Promise<void> {
-    if (this.lifecycle === 'suspended' || this.lifecycle === 'suspending') return;
+    // Idempotent re-entry: a second concurrent caller observes the
+    // in-flight transition and awaits its actual completion rather than
+    // resolving on the intermediate state. Without this, `await
+    // m.suspend()` while another suspend was already running would return
+    // immediately and `m.state` could still read 'suspending'.
+    if (this.inFlightTransition) return this.inFlightTransition;
+    if (this.lifecycle === 'suspended') return;
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot suspend a stopped manager');
     }
@@ -272,6 +285,16 @@ export class ElectrumManager {
       this.lifecycle = 'suspended';
       return;
     }
+    const task = this.runSuspend(opts);
+    this.inFlightTransition = task;
+    try {
+      await task;
+    } finally {
+      this.inFlightTransition = null;
+    }
+  }
+
+  private async runSuspend(opts: SuspendOptions): Promise<void> {
     this.lifecycle = 'suspending';
     const graceMs = opts.graceMs ?? 2000;
     const cancelInFlight = opts.cancelInFlight ?? false;
@@ -315,12 +338,21 @@ export class ElectrumManager {
     for (const t of this.discoverTimers.values()) clearTimeout(t);
     this.discoverTimers.clear();
     // Tip becomes stale across suspend; cache writes are gated until
-    // `resume()` re-establishes the headers subscription. The unsub handle
-    // is dropped (not invoked) — registry.clientDisconnected fired during
-    // disconnect already orphaned the underlying record, and resume() will
-    // create a fresh subscription rather than reusing this one.
+    // `resume()` re-establishes the headers subscription. We INVOKE the
+    // tipUnsub (not just null it) — otherwise the registry's per-key
+    // record retains the previous handler in its Set, and the next
+    // resume's subscribe call adds a *second* handler to the same record.
+    // After N suspend/resume cycles a long-lived RN session would have N
+    // copies of the tip-tracker handler all firing on every header push.
     this.tipHeight = undefined;
-    this.tipUnsub = null;
+    if (this.tipUnsub) {
+      try {
+        await this.tipUnsub();
+      } catch (e) {
+        this.emit('error', e);
+      }
+      this.tipUnsub = null;
+    }
     // Note: registry / suspendQueue / cache state preserved.
     // Race: a concurrent `stop()` may have flipped lifecycle to 'stopped'
     // while we were awaiting the disconnect. Don't clobber that — the
@@ -337,13 +369,30 @@ export class ElectrumManager {
    * see the `running` gate path once the state flips.
    */
   async resume(): Promise<void> {
-    if (this.lifecycle === 'running' || this.lifecycle === 'resuming') return;
+    // Same in-flight sharing as `suspend()` — a second caller awaits the
+    // actual completion rather than the intermediate state.
+    if (this.inFlightTransition) return this.inFlightTransition;
+    if (this.lifecycle === 'running') return;
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot resume a stopped manager');
     }
     if (this.lifecycle !== 'suspended') {
-      throw new SuspendedError(`cannot resume from ${this.lifecycle}`);
+      throw new SuspendedError(
+        this.lifecycle === 'created'
+          ? 'cannot resume from created — use start() on a fresh manager'
+          : `cannot resume from ${this.lifecycle}`,
+      );
     }
+    const task = this.runResume();
+    this.inFlightTransition = task;
+    try {
+      await task;
+    } finally {
+      this.inFlightTransition = null;
+    }
+  }
+
+  private async runResume(): Promise<void> {
     this.lifecycle = 'resuming';
     // Reconnect: each client's `connected` transition fires
     // `onStateChange` which in turn calls `restoreOrphans()`. We don't
@@ -465,9 +514,8 @@ export class ElectrumManager {
     //
     // `failOnSuspend` is consumed at queue-time only: a call that joins
     // the queue without it set will not be re-checked at drain time
-    // (lifecycle is `running` then anyway). If the caller wants to abort
-    // a queued call mid-suspend, use `opts.signal` (AbortSignal) — the
-    // same signal ref is forwarded into the re-issued call on drain.
+    // (lifecycle is `running` then anyway). For mid-suspend cancel, pass
+    // `opts.signal` — abort drops the queue entry and rejects locally.
     if (
       this.lifecycle === 'suspending' ||
       this.lifecycle === 'suspended' ||
@@ -477,7 +525,34 @@ export class ElectrumManager {
         throw new SuspendedError(`manager is ${this.lifecycle}`);
       }
       const def = deferred<unknown>();
-      this.suspendQueue.push({ method, params, opts, def });
+      const item = { method, params, opts, def };
+      this.suspendQueue.push(item);
+      // Honor a pre-supplied AbortSignal: a caller who aborts while their
+      // call is queued must not hang until resume(). On abort we drop the
+      // queue entry and reject locally; the eventual drain skips it. If
+      // the signal is already aborted, reject + skip enqueue immediately.
+      const signal = opts?.signal;
+      if (signal) {
+        if (signal.aborted) {
+          this.dropQueueItem(item);
+          def.reject(signalAbortReason(signal));
+        } else {
+          const onAbort = (): void => {
+            this.dropQueueItem(item);
+            def.reject(signalAbortReason(signal));
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+          // Best-effort cleanup of the listener once the deferred settles
+          // (success or failure) so we don't pin the signal across long
+          // suspends. AbortSignals are caller-owned; we err on the side of
+          // unbinding eagerly. Catch + ignore: this branch must not
+          // observe rejections (the caller's `await` is the owner).
+          def.promise.then(
+            () => signal.removeEventListener('abort', onAbort),
+            () => signal.removeEventListener('abort', onAbort),
+          );
+        }
+      }
       return def.promise;
     }
     if (this.lifecycle === 'stopped') {
@@ -849,6 +924,12 @@ export class ElectrumManager {
     let n = 0;
     for (const c of this.clients.values()) n += c.inFlightCount;
     return n;
+  }
+
+  /** Remove a queued suspend item by reference. No-op if already drained. */
+  private dropQueueItem(target: { def: Deferred<unknown> }): void {
+    const i = this.suspendQueue.findIndex((q) => q.def === target.def);
+    if (i >= 0) this.suspendQueue.splice(i, 1);
   }
 
   // --- Cache helpers -----------------------------------------------------
@@ -1281,6 +1362,16 @@ function isRetryable(kind: ErrorKind): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Best-effort extraction of an AbortSignal's `reason`. Falls back to a
+ * generic `Error` for older runtimes that don't populate `reason`.
+ */
+function signalAbortReason(signal: AbortSignal): unknown {
+  const reason: unknown = (signal as { reason?: unknown }).reason;
+  if (reason !== undefined) return reason;
+  return new Error('aborted');
 }
 
 function defaultTransportFactory(endpoint: Endpoint): Transport {
