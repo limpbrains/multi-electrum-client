@@ -82,7 +82,7 @@ export {
   type PreferFastestOpts,
   type StickyKeyFn,
 } from './policy/builtins.js';
-export { defaultClassifier } from './errors/classifier.js';
+export { defaultClassifier, composeClassifier } from './errors/classifier.js';
 export { NoClientAvailableError } from './errors/types.js';
 export type { Result } from './util/result.js';
 export { ok, err } from './util/result.js';
