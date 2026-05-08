@@ -238,6 +238,13 @@ export class ElectrumManager {
    * runSuspend's tail (e.g. `await tipUnsub()`) or a chained transition
    * could fire after `await m.stop()` returned, surfacing as ghost
    * `error` events to a caller who already considers the manager dead.
+   *
+   * Note on `state` observability: `manager.state` flips to `'stopped'`
+   * synchronously on entry — that flag is the *terminal intent*, not a
+   * "teardown finished" signal. Sockets and tip-subscription cleanup
+   * still run async; only after `await m.stop()` returns is teardown
+   * fully complete. Code reading `m.state === 'stopped'` to gate UI
+   * teardown should rely on the awaited resolve, not the field alone.
    */
   async stop(): Promise<void> {
     this.stopped = true;
@@ -271,6 +278,10 @@ export class ElectrumManager {
         }
       }),
     );
+    // Drop event listeners after the last possible emit (`error` paths
+    // above) so closures captured by user listeners don't keep the manager
+    // / its dependencies pinned across a discarded reference.
+    this.listeners.clear();
   }
 
   /**
@@ -683,6 +694,12 @@ export class ElectrumManager {
      *
      * Multiple callers asking for the same scripthash share one wire
      * subscription — handlers fan out from a single notification stream.
+     *
+     * Lifecycle: throws synchronously when called outside `running` (no
+     * connected client to bind to). Unlike `call()`, subscriptions are
+     * not queued across suspend — wait for `resume()` and re-subscribe.
+     * Existing subscriptions are preserved across suspend / resume and
+     * replayed with catch-up automatically.
      */
     subscribe: (hash: Scripthash, handler: SubscriptionHandler<ScripthashStatus>) =>
       this.registry.subscribe<ScripthashStatus>('blockchain.scripthash.subscribe', [hash], handler),
@@ -725,6 +742,10 @@ export class ElectrumManager {
      * (last handler removed → manager stops dispatching; the wire
      * `blockchain.headers.subscribe` has no paired unsubscribe so the
      * server keeps pushing for the session — documented quirk).
+     *
+     * Same lifecycle contract as `scripthash.subscribe`: throws when
+     * called outside `running`; existing subscriptions survive
+     * suspend / resume.
      */
     subscribe: (handler: SubscriptionHandler<BlockHeader>) =>
       this.registry.subscribe<BlockHeader>('blockchain.headers.subscribe', [], handler),
