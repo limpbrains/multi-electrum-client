@@ -1,0 +1,78 @@
+{
+  "name": "multi-electrum-client",
+  "version": "0.0.0",
+  "description": "Multi-server Electrum (Bitcoin) client for TypeScript with ban-aware routing, partial-batch redirect, subscription restore, and lifecycle support for Node, React Native, browser, and Bun.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "react-native": "./dist/index.js",
+      "browser": "./dist/index.js",
+      "bun": "./dist/index.js",
+      "node": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./policy": {
+      "types": "./dist/policy/builtins.d.ts",
+      "default": "./dist/policy/builtins.js"
+    },
+    "./cache/memory": {
+      "types": "./dist/cache/memory.d.ts",
+      "default": "./dist/cache/memory.js"
+    },
+    "./errors": {
+      "types": "./dist/errors/types.d.ts",
+      "default": "./dist/errors/types.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "clean": "rm -rf dist coverage",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run test/unit",
+    "test:watch": "vitest test/unit",
+    "test:types": "vitest run test/types",
+    "test:integration": "vitest run test/integration",
+    "test:rn": "echo 'react-native-harness wired in M5'",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^9.0.0",
+    "fast-check": "^3.0.0",
+    "prettier": "^3.0.0",
+    "tsd": "^0.31.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "keywords": [
+    "bitcoin",
+    "electrum",
+    "electrumx",
+    "fulcrum",
+    "electrs",
+    "websocket",
+    "react-native"
+  ]
+}
