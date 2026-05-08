@@ -252,12 +252,26 @@ export class ElectrumManager {
   ): Promise<unknown> {
     let lastErr: Error | undefined = seed;
     let attempt = initialAttempt;
+    // Bound on `client-missing` recoveries: every real client can plausibly
+    // be missing once (race with removeServer), plus a small slack. A buggy
+    // policy that ignores `excluded` and keeps returning the same stale id
+    // would otherwise spin forever — `attempt` doesn't move on missing.
+    let missCount = 0;
+    const missCap = this.clients.size + 4;
     while (attempt < maxAttempts) {
       const outcome = await this.attemptOnce(method, params, excluded, attempt);
       if (outcome.kind === 'success') return outcome.value;
       if (outcome.kind === 'no-pick') throw lastErr ?? outcome.error;
       if (outcome.kind === 'client-missing') {
         excluded.add(outcome.clientId);
+        if (++missCount > missCap) {
+          throw (
+            lastErr ??
+            new NoClientAvailableError(
+              `policy kept returning stale client ids (${missCount} consecutive); aborting`,
+            )
+          );
+        }
         // Don't bump `attempt`: missing-client doesn't count as a real try.
         continue;
       }
@@ -357,9 +371,21 @@ export class ElectrumManager {
   private async dispatchGroup(clientId: ClientId, grp: BatchItem[]): Promise<void> {
     const client = this.clients.get(clientId);
     if (!client) {
+      // Initial-flush race with removeServer. Treat as `client-missing`
+      // (consistent with runAttempts): exclude the id and re-route without
+      // burning a real attempt against the actual server.
       for (const item of grp) {
         item.excluded.add(clientId);
-        this.maybeRetry(item, new NoClientAvailableError(`client ${clientId} no longer in pool`));
+        this.runAttempts(
+          item.method,
+          item.params,
+          item.excluded,
+          this.maxAttemptsFor(item.opts),
+          item.attempt,
+        ).then(
+          (v) => item.def.resolve(v),
+          (e) => item.def.reject(e),
+        );
       }
       return;
     }
