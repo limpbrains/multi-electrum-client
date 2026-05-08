@@ -107,6 +107,19 @@ describe('WsTransport', () => {
     await expect(transport.send('x')).rejects.toBeInstanceOf(TransportError);
   });
 
+  it('rejects send when payload contains embedded newline', async () => {
+    srv.server.on('connection', () => {
+      // accept silently
+    });
+    const transport = new WsTransport({
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
+      WebSocket: WebSocketCtor,
+    });
+    await transport.connect();
+    await expect(transport.send('a\nb')).rejects.toBeInstanceOf(TransportError);
+    await transport.close();
+  });
+
   it('rejects send after close (ws is nulled)', async () => {
     srv.server.on('connection', () => {
       // accept silently

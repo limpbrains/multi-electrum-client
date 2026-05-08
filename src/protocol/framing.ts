@@ -89,8 +89,9 @@ function validate(raw: unknown): JsonRpcMessage {
       params = obj['params'] as readonly unknown[];
     } else {
       // JSON-RPC 2.0 allows by-name (object) params, but Electrum is positional
-      // only. Reject other server's by-name use rather than silently coerce.
-      throw new ProtocolError('notification params must be an array (by-name not supported)');
+      // only. We reject any non-array shape (object, string, number, boolean)
+      // rather than silently coerce — caller hangs on stale state otherwise.
+      throw new ProtocolError('notification params must be an array');
     }
     return { method: obj['method'], params };
   }
