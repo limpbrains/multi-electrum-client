@@ -78,14 +78,14 @@ describe('namespace API → call() → wire', () => {
 
     h.reply('a', (req: { id: number }) => ({
       id: req.id,
-      result: { block_height: 700_000, pos: 3, merkle: ['abc', 'def'] },
+      result: { blockHeight: 700_000, pos: 3, merkle: ['abc', 'def'] },
     }));
-    expect(await p).toEqual({ block_height: 700_000, pos: 3, merkle: ['abc', 'def'] });
+    expect(await p).toEqual({ blockHeight: 700_000, pos: 3, merkle: ['abc', 'def'] });
 
     await manager.stop();
   });
 
-  it('server.ping and headers.subscribe issue empty-param requests', async () => {
+  it('server.ping and headers.getTip issue empty-param requests', async () => {
     const h = buildHarness();
     const manager = new ElectrumManager({
       network: 'regtest',
@@ -104,7 +104,7 @@ describe('namespace API → call() → wire', () => {
     h.reply('a', (req: { id: number }) => ({ id: req.id, result: null }));
     expect(await ping).toBeNull();
 
-    const sub = manager.headers.subscribe();
+    const sub = manager.headers.getTip();
     await delay(0);
     sent = JSON.parse(h.transports.get('a')!.sent[0]!);
     expect(sent.method).toBe('blockchain.headers.subscribe');
@@ -113,6 +113,45 @@ describe('namespace API → call() → wire', () => {
       result: { height: 1, hex: '00' },
     }));
     expect(await sub).toEqual({ height: 1, hex: '00' });
+
+    await manager.stop();
+  });
+
+  it('transaction.getVerbose passes verbose=true and returns TxVerbose shape', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    const p = manager.transaction.getVerbose('TXID');
+    await delay(0);
+    const sent = JSON.parse(h.transports.get('a')!.sent[0]!);
+    expect(sent.method).toBe('blockchain.transaction.get');
+    expect(sent.params).toEqual(['TXID', true]);
+
+    h.reply('a', (req: { id: number }) => ({
+      id: req.id,
+      result: {
+        txid: 'TXID',
+        hash: 'TXID',
+        hex: 'deadbeef',
+        size: 100,
+        vsize: 80,
+        weight: 320,
+        version: 2,
+        locktime: 0,
+        vin: [],
+        vout: [],
+      },
+    }));
+    const result = await p;
+    expect(result.txid).toBe('TXID');
+    expect(result.hex).toBe('deadbeef');
 
     await manager.stop();
   });
