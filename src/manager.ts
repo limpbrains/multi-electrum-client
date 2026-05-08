@@ -370,8 +370,16 @@ export class ElectrumManager {
       ...(this.requestTimeoutMs !== undefined ? { requestTimeoutMs: this.requestTimeoutMs } : {}),
     });
     client.onNotification((notif) => {
-      const { subParams, status } = decodeNotification(notif.method, notif.params);
-      this.registry.notify(spec.id, notif.method, subParams, status);
+      // Notifications fire on the transport's read path. An uncaught throw
+      // here propagates into the transport handler — at best the client's
+      // dispatch loop tears down, at worst the WS layer drops the socket.
+      // Surface the failure as an `error` event and keep the stream alive.
+      try {
+        const { subParams, status } = decodeNotification(notif.method, notif.params);
+        this.registry.notify(spec.id, notif.method, subParams, status);
+      } catch (e) {
+        this.emit('error', e);
+      }
     });
     client.onStateChange((state) => {
       this.emit('client-state', { clientId: spec.id, state });
