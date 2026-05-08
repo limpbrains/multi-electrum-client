@@ -8,6 +8,10 @@
 // `\r?\n` and emitted one logical message per `data` event. A LineFramer
 // buffers across frames so partial lines reassemble correctly if a proxy
 // splits messages.
+//
+// TODO(M2): close() during in-flight connect() leaves the ws to finish
+// opening into this.ws — needs a coordinated abort path before reconnect
+// logic in M2 starts retrying connects.
 
 import type { Endpoint } from '../client.js';
 import { TransportError } from '../errors/types.js';
@@ -118,6 +122,13 @@ export class WsTransport implements Transport {
 
   async send(text: string): Promise<void> {
     if (!this.ws) throw new TransportError('not connected');
+    // We append '\n' to delimit messages on the wire. An embedded newline in
+    // the payload would corrupt framing on the server side. JSON.stringify
+    // (the only intended caller via ElectrumClient) escapes newlines, so this
+    // guard only fires for misuse.
+    if (text.includes('\n')) {
+      throw new TransportError('payload must not contain embedded newline');
+    }
     this.ws.send(text + '\n');
   }
 
