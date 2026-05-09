@@ -2,9 +2,9 @@
 
 All notable changes to `multi-electrum-client` are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — 2026-05-09
+## [Unreleased]
 
-Initial public release.
+Pre-release. The unit-test surface is complete, but the integration suite against the Docker compose stack (cross-impl parity, failover under toxiproxy, partial-batch retry, subscription catch-up, ban detection on strict configs) is not yet wired up. No version is cut until that lands.
 
 ### Added
 
@@ -20,6 +20,12 @@ Initial public release.
 - **Conditional package exports** — root `.` resolves to `index.browser.js` for browser bundlers (no `node:net` / `node:tls`), `index.js` for Node / RN / Bun.
 - **Examples** — `examples/{node,bun,browser,rn}-basic.*`.
 
-### Test stats
+### Pending before 0.1.0
 
-230+ unit tests covering policies, framing, registry, classifier, cache, discovery, lifecycle, transports.
+- Docker compose integration suite: cross-impl parity, failover under toxiproxy fault injection, partial-batch retry, subscription catch-up, ban detection on strict configs.
+- RN parity tests via `react-native-harness`.
+- CI workflows for `integration` and `rn`.
+
+### Test stats (unit only)
+
+233 unit tests covering policies, framing, registry, classifier, cache, discovery, lifecycle, transports.
