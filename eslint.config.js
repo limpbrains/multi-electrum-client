@@ -32,9 +32,28 @@ export default [
     },
   },
   {
-    // Examples are illustrative and don't participate in the typechecked
-    // project — skip them in lint too.
-    ignores: ['dist/**', 'coverage/**', 'node_modules/**', '*.config.js', 'examples/**'],
+    ignores: ['dist/**', 'coverage/**', 'node_modules/**', '*.config.js'],
+  },
+  {
+    // Examples now participate in `pnpm typecheck` via tsconfig.examples.json,
+    // but the main eslint flat config pins `parserOptions.project` to
+    // ./tsconfig.json (which doesn't include examples/). Loosen parser
+    // options for the examples folder so lint passes without the type-aware
+    // rules that need a project. RN example depends on react / react-native
+    // types we don't ship as devDeps — skip it in lint too.
+    files: ['examples/**/*.ts', 'examples/**/*.tsx'],
+    languageOptions: {
+      parserOptions: {
+        project: null,
+      },
+    },
+    rules: {
+      // Examples log to the console for clarity. That's the point.
+      'no-console': 'off',
+    },
+  },
+  {
+    ignores: ['examples/rn-basic.tsx'],
   },
   prettier,
 ];

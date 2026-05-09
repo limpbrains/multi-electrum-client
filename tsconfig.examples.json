@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "skipLibCheck": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "paths": {
+      "multi-electrum-client": ["./src/index.ts"]
+    }
+  },
+  "include": ["examples/**/*.ts"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "coverage",
+    // RN example needs `@types/react` + `@types/react-native` which we
+    // don't ship as devDependencies — it's illustrative only and not
+    // part of the typechecked surface. The other three examples gate
+    // public-API drift.
+    "examples/rn-basic.tsx"
+  ]
+}

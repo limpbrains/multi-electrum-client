@@ -63,10 +63,11 @@
   "scripts": {
     "build": "tsup",
     "clean": "rm -rf dist coverage",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json",
+    "typecheck:examples": "tsc --noEmit -p tsconfig.examples.json",
     "test": "vitest run test/unit",
     "test:watch": "vitest test/unit",
-    "test:types": "tsc --noEmit",
+    "test:types": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json",
     "test:integration": "vitest run test/integration",
     "test:rn": "echo 'react-native-harness wired in M5'",
     "lint": "eslint .",
