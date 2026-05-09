@@ -6,11 +6,17 @@
 // finality), lifecycle suspend/resume (M5), and TCP/TLS transports (M6) plug
 // in here in subsequent milestones.
 
-import { buildKey, cacheSpec } from './cache/keys.js';
+import {
+  findCacheSpec,
+  isFinalized,
+  readFromCache,
+  writeToCache,
+  type CacheSpec,
+} from './cache/finality.js';
 import type { CacheStore } from './cache/types.js';
 import type { ClientId, ClientView, ConnectionState, Endpoint, Telemetry } from './client.js';
 import { ElectrumClient } from './client.js';
-import { DEFAULT_DISCOVER_INTERVAL_MS, parsePeerList, type DiscoverOptions } from './discovery.js';
+import { PeerDiscoveryRunner } from './discovery.js';
 import { defaultClassifier } from './errors/classifier.js';
 import {
   NoClientAvailableError,
@@ -114,7 +120,7 @@ export class ElectrumManager {
   private tipHeight: number | undefined;
   /** Disposer for the internal headers subscription. */
   private tipUnsub: (() => Promise<void>) | null = null;
-  private readonly discoverOptions: DiscoverOptions | undefined;
+  private readonly discovery: PeerDiscoveryRunner | undefined;
   /**
    * Auto-handshake `server.version` on every connect. Default `true`;
    * disabled when the caller wants to drive `server.version` directly
@@ -122,8 +128,6 @@ export class ElectrumManager {
    * `"server.version already sent"`).
    */
   private readonly handshakeOnConnect: boolean;
-  /** Per-client re-poll timers for peer discovery. */
-  private readonly discoverTimers = new Map<ClientId, ReturnType<typeof setTimeout>>();
   /**
    * Reconnect backoff. Per-client transport faults trigger an exponential-
    * backoff retry that multiplies by `factor` per failed attempt, clamped
@@ -188,7 +192,16 @@ export class ElectrumManager {
     this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
     this.cache = opts.cache;
     this.finalizedConfs = opts.finalizedConfs ?? 6;
-    this.discoverOptions = opts.discover;
+    this.discovery = opts.discover
+      ? new PeerDiscoveryRunner(opts.discover, {
+          call: (clientId, method, params) =>
+            this.callDirect(method, params, { preferClient: clientId, retry: 'none' }),
+          hasClient: (id) => this.clients.has(id),
+          addServer: (spec) => this.addServer(spec),
+          isStopped: () => this.stopped,
+          onError: (e) => this.emit('error', e),
+        })
+      : undefined;
     this.handshakeOnConnect = opts.handshakeOnConnect ?? true;
     this.reconnectBackoff = opts.reconnectBackoff ?? {
       minMs: 500,
@@ -292,8 +305,7 @@ export class ElectrumManager {
       const item = this.suspendQueue.shift()!;
       item.def.reject(new SuspendedError('manager stopped before resume'));
     }
-    for (const t of this.discoverTimers.values()) clearTimeout(t);
-    this.discoverTimers.clear();
+    this.discovery?.cancelAll();
     // Auto-reconnect off — clear timers + intent flags so a `disconnected`
     // event triggered by our own `c.disconnect()` below doesn't reschedule.
     this.wantsReconnect.clear();
@@ -412,8 +424,7 @@ export class ElectrumManager {
     // dies until the user manually `removeServer` + `addServer`s, or the
     // client eventually reconnects via the underlying transport's
     // backoff.
-    for (const t of this.discoverTimers.values()) clearTimeout(t);
-    this.discoverTimers.clear();
+    this.discovery?.cancelAll();
     // Cancel any pending reconnects — sockets we just closed would
     // otherwise auto-reconnect during suspend. resume() drives the
     // explicit reconnect path. wantsReconnect stays set so a
@@ -673,17 +684,26 @@ export class ElectrumManager {
     // touching the wire. Cache writes happen after a successful wire call
     // (see `runAttempts` resolution + `dispatchGroup`). `bypassCache` opts
     // out of both the read and the write.
-    const spec = opts?.bypassCache ? null : this.cacheSpecFor(method, params);
+    const spec: CacheSpec | null = opts?.bypassCache
+      ? null
+      : findCacheSpec(this.cache, method, params);
     if (spec && this.cache) {
-      const hit = await this.readCache(spec);
+      const hit = await readFromCache(this.cache, this.network, spec, (e) => this.emit('error', e));
       if (hit !== undefined) return hit;
     }
 
     const value = await this.callInner(method, params, opts);
-    if (spec && this.cache && this.isFinalized(spec.finalityHeight) && !opts?.bypassCache) {
+    if (
+      spec &&
+      this.cache &&
+      isFinalized(spec.finalityHeight, this.tipHeight, this.finalizedConfs) &&
+      !opts?.bypassCache
+    ) {
       // Fire-and-forget: a slow cache adapter must not block the caller.
       // A failed cache write just means the next call refetches.
-      void this.writeCache(spec, value).catch((e) => this.emit('error', e));
+      void writeToCache(this.cache, this.network, spec, value, (e) => this.emit('error', e)).catch(
+        (e) => this.emit('error', e),
+      );
     }
     return value;
   }
@@ -916,8 +936,8 @@ export class ElectrumManager {
         this.registry.restoreOrphans().catch((e) => this.emit('error', e));
         // Kick off a peer-discovery probe on this fresh connection. Idempotent:
         // already-known peers are skipped without consulting onDiscover.
-        if (this.discoverOptions?.enabled) {
-          this.discoverFromClient(spec.id).catch((e) => this.emit('error', e));
+        if (this.discovery?.enabled) {
+          this.discovery.runFor(spec.id).catch((e) => this.emit('error', e));
         }
       } else if (state === 'disconnected') {
         this.registry.clientDisconnected(spec.id);
@@ -928,11 +948,7 @@ export class ElectrumManager {
         // Cancel any scheduled re-poll: it would fire against a dead
         // client and route via policy.pick to a different server, which
         // is fine but wasteful. The next `connected` re-installs it.
-        const t = this.discoverTimers.get(spec.id);
-        if (t !== undefined) {
-          clearTimeout(t);
-          this.discoverTimers.delete(spec.id);
-        }
+        this.discovery?.cancelFor(spec.id);
         // Schedule a backoff reconnect. Skipped while suspending /
         // suspended (those states close sockets deliberately and resume()
         // drives the reconnect) and when the user has explicitly removed
@@ -1162,138 +1178,10 @@ export class ElectrumManager {
     if (i >= 0) this.suspendQueue.splice(i, 1);
   }
 
-  // --- Cache helpers -----------------------------------------------------
-
-  /** Public wrapper kept stable so the cache module remains side-effect-free. */
-  private cacheSpecFor(method: string, params: readonly unknown[]): ReturnType<typeof cacheSpec> {
-    if (!this.cache) return null;
-    return cacheSpec(method, params);
-  }
-
-  /** True iff the cache has been populated past `finalizedConfs` for this height. */
-  private isFinalized(height: number): boolean {
-    if (this.tipHeight === undefined) return false;
-    return this.tipHeight - height >= this.finalizedConfs;
-  }
-
-  private async readCache(
-    spec: NonNullable<ReturnType<typeof cacheSpec>>,
-  ): Promise<unknown | undefined> {
-    if (!this.cache) return undefined;
-    const key = buildKey(this.network, spec.bucket, spec.id);
-    let raw: string | null;
-    try {
-      raw = await this.cache.get(key);
-    } catch (e) {
-      // Cache failure must not break the request — caller injected the
-      // store, manager just falls back to a wire call. Surface for visibility.
-      this.emit('error', e);
-      return undefined;
-    }
-    if (raw === null) return undefined;
-    try {
-      return JSON.parse(raw);
-    } catch (e) {
-      // Corrupted entry. Remove it best-effort and miss the read.
-      this.emit('error', e);
-      void this.cache.del(key).catch(() => undefined);
-      return undefined;
-    }
-  }
-
-  private async writeCache(
-    spec: NonNullable<ReturnType<typeof cacheSpec>>,
-    value: unknown,
-  ): Promise<void> {
-    if (!this.cache) return;
-    const key = buildKey(this.network, spec.bucket, spec.id);
-    let serialized: string;
-    try {
-      serialized = JSON.stringify(value);
-    } catch (e) {
-      // Non-serializable response (circular ref, BigInt) — skip the
-      // write rather than throwing out of the post-success path.
-      this.emit('error', e);
-      return;
-    }
-    await this.cache.set(key, serialized);
-  }
-
-  // --- Peer discovery ----------------------------------------------------
-
-  /**
-   * Probe a freshly-connected client for `server.peers.subscribe`. Parses
-   * the response, runs each candidate through `onDiscover`, and admits via
-   * `addServer`. Servers that don't support peer discovery typically emit
-   * an RPC error which we swallow — discovery is best-effort.
-   *
-   * Schedules the next re-poll on success (and only on success — a
-   * permanently-failing server doesn't waste timer slots forever).
-   */
-  private async discoverFromClient(clientId: ClientId): Promise<void> {
-    const opts = this.discoverOptions;
-    if (!opts?.enabled) return;
-    if (this.stopped) return;
-
-    let response: unknown;
-    try {
-      response = await this.callDirect('server.peers.subscribe', [], {
-        preferClient: clientId,
-        retry: 'none',
-      });
-    } catch {
-      // Server doesn't support peer discovery, or transient failure — drop
-      // silently. Manager `error` event already surfaced the underlying
-      // failure via runAttempts if it's something the caller cares about.
-      return;
-    }
-
-    const candidates = parsePeerList(response);
-    for (const cand of candidates) {
-      // Dedup against the existing pool (id is `host:port`).
-      if (this.clients.has(cand.id)) continue;
-      let admit: boolean;
-      if (opts.onDiscover) {
-        try {
-          admit = await opts.onDiscover(cand);
-        } catch (e) {
-          this.emit('error', e);
-          continue;
-        }
-      } else {
-        admit = true;
-      }
-      if (!admit) continue;
-      // Re-check after the await: the pool may have grown / shrunk while
-      // the user's callback ran (their callback might also have called
-      // addServer / removeServer).
-      if (this.stopped) return;
-      if (this.clients.has(cand.id)) continue;
-      try {
-        this.addServer(cand);
-      } catch (e) {
-        // Likely a duplicate id race; surface and move on.
-        this.emit('error', e);
-      }
-    }
-
-    const interval = opts.intervalMs ?? DEFAULT_DISCOVER_INTERVAL_MS;
-    if (interval <= 0) return;
-    if (this.stopped) return;
-    // Replace any prior timer (defensive; onStateChange already cleared on
-    // disconnect, but a manual addServer-during-poll race is possible).
-    const prev = this.discoverTimers.get(clientId);
-    if (prev !== undefined) clearTimeout(prev);
-    const t = setTimeout(() => {
-      this.discoverTimers.delete(clientId);
-      this.discoverFromClient(clientId).catch((e) => this.emit('error', e));
-    }, interval);
-    // Don't keep the Node event loop alive on this timer alone.
-    if (typeof t === 'object' && t !== null && 'unref' in t) {
-      (t as { unref: () => void }).unref();
-    }
-    this.discoverTimers.set(clientId, t);
-  }
+  // Cache layer is implemented as pure functions in `./cache/finality.ts`;
+  // peer discovery is implemented as `PeerDiscoveryRunner` in
+  // `./discovery.ts`. Manager delegates to both so this file stays
+  // focused on routing, lifecycle, and telemetry.
 
   /**
    * One pick-and-call cycle: ask the policy, send the request, classify the
