@@ -88,3 +88,127 @@ export interface DiscoverOptions {
 }
 
 export const DEFAULT_DISCOVER_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
+
+/**
+ * Dependencies the runner needs from the manager. Kept narrow so this
+ * module can't reach into manager internals — every interaction goes
+ * through one of these callbacks.
+ */
+export interface PeerDiscoveryDeps {
+  /** Make a non-retried wire call pinned to `clientId`. */
+  call(clientId: ClientId, method: string, params: readonly unknown[]): Promise<unknown>;
+  /** Already in pool? Used to dedup admitted peers. */
+  hasClient(id: ClientId): boolean;
+  /** Admit a peer; runner catch-wraps any throw and forwards via `onError`. */
+  addServer(spec: ServerSpec): void;
+  /**
+   * True once the manager is tearing down — runner short-circuits between
+   * awaits so a late timer fire doesn't poke a dead manager.
+   */
+  isStopped(): boolean;
+  /** Surface a recoverable error to the manager's `error` event. */
+  onError(e: unknown): void;
+}
+
+/**
+ * Periodic `server.peers.subscribe` poller. One instance per manager;
+ * the manager calls `runFor(clientId)` on every fresh connect (the
+ * runner internally schedules the re-poll) and `cancelFor(clientId)`
+ * on every disconnect / removeServer / suspend / stop.
+ *
+ * Errors mid-poll are swallowed — most servers don't support peer
+ * discovery and emit an RPC error, which we treat as "this server
+ * can't be polled" rather than a manager-level failure. User
+ * callbacks (`onDiscover`) that throw are surfaced via `onError` so
+ * a buggy callback is observable.
+ */
+export class PeerDiscoveryRunner {
+  private readonly options: DiscoverOptions;
+  private readonly deps: PeerDiscoveryDeps;
+  private readonly timers = new Map<ClientId, ReturnType<typeof setTimeout>>();
+
+  constructor(options: DiscoverOptions, deps: PeerDiscoveryDeps) {
+    this.options = options;
+    this.deps = deps;
+  }
+
+  /** True iff the runner is enabled by the user's options. */
+  get enabled(): boolean {
+    return this.options.enabled;
+  }
+
+  /**
+   * Probe `clientId` for peers and admit any that pass the user's
+   * filter. Schedules the next re-poll on success. No-op when
+   * disabled or after the manager is stopped.
+   */
+  async runFor(clientId: ClientId): Promise<void> {
+    if (!this.options.enabled) return;
+    if (this.deps.isStopped()) return;
+
+    let response: unknown;
+    try {
+      response = await this.deps.call(clientId, 'server.peers.subscribe', []);
+    } catch {
+      // Server doesn't support discovery or transient failure — runAttempts
+      // already surfaced anything callers care about. Drop silently.
+      return;
+    }
+
+    const candidates = parsePeerList(response);
+    for (const cand of candidates) {
+      if (this.deps.hasClient(cand.id)) continue;
+      let admit: boolean;
+      if (this.options.onDiscover) {
+        try {
+          admit = await this.options.onDiscover(cand);
+        } catch (e) {
+          this.deps.onError(e);
+          continue;
+        }
+      } else {
+        admit = true;
+      }
+      if (!admit) continue;
+      // Re-check after each await: pool / lifecycle may have changed
+      // during the user's callback.
+      if (this.deps.isStopped()) return;
+      if (this.deps.hasClient(cand.id)) continue;
+      try {
+        this.deps.addServer(cand);
+      } catch (e) {
+        // Likely a duplicate-id race; surface and move on.
+        this.deps.onError(e);
+      }
+    }
+
+    const interval = this.options.intervalMs ?? DEFAULT_DISCOVER_INTERVAL_MS;
+    if (interval <= 0) return;
+    if (this.deps.isStopped()) return;
+    const prev = this.timers.get(clientId);
+    if (prev !== undefined) clearTimeout(prev);
+    const t = setTimeout(() => {
+      this.timers.delete(clientId);
+      this.runFor(clientId).catch((e) => this.deps.onError(e));
+    }, interval);
+    if (typeof t === 'object' && t !== null && 'unref' in t) {
+      (t as { unref: () => void }).unref();
+    }
+    this.timers.set(clientId, t);
+  }
+
+  /** Cancel any pending re-poll timer for `clientId`. */
+  cancelFor(clientId: ClientId): void {
+    const t = this.timers.get(clientId);
+    if (t !== undefined) {
+      clearTimeout(t);
+      this.timers.delete(clientId);
+    }
+  }
+
+  /** Cancel every pending timer. Used by manager on `stop` / `suspend`. */
+  cancelAll(): void {
+    for (const t of this.timers.values()) clearTimeout(t);
+    this.timers.clear();
+  }
+}
