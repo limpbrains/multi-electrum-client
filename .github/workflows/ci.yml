@@ -58,3 +58,26 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+
+  integration:
+    runs-on: ubuntu-latest
+    # Real Docker stack — slower than unit; run in parallel with the rest
+    # so PR feedback isn't blocked on it.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: boot integration stack
+        run: docker compose -f docker/compose.yml --profile slim up -d --wait
+      - name: integration tests
+        run: pnpm test:integration
+      - name: dump logs on failure
+        if: failure()
+        run: docker compose -f docker/compose.yml --profile slim logs --no-color
+      - name: tear down
+        if: always()
+        run: docker compose -f docker/compose.yml --profile slim down -v

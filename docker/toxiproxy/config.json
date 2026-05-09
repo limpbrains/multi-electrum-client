@@ -4,23 +4,5 @@
     "listen": "0.0.0.0:60001",
     "upstream": "electrumx-default:50001",
     "enabled": true
-  },
-  {
-    "name": "electrumx-ws",
-    "listen": "0.0.0.0:60004",
-    "upstream": "electrumx-default:50004",
-    "enabled": true
-  },
-  {
-    "name": "fulcrum-tcp",
-    "listen": "0.0.0.0:60101",
-    "upstream": "fulcrum-default:50001",
-    "enabled": true
-  },
-  {
-    "name": "electrs-tcp",
-    "listen": "0.0.0.0:60201",
-    "upstream": "electrs-default:50001",
-    "enabled": true
   }
 ]
