@@ -112,6 +112,30 @@ services:
       retries: 30
       start_period: 15s
 
+  electrs-default:
+    image: getumbrel/electrs:v0.11.0
+    profiles: [slim, full]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+      bitcoind-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./electrs/configs/default.toml:/data/electrs.toml:ro
+    command: ['--conf=/data/electrs.toml']
+    ports:
+      - '50201:50001' # direct lane
+    healthcheck:
+      # electrs image is distroless-ish; rely on the python3 baked in to
+      # the underlying base if present, else a python-less probe.
+      # Actually electrs image is FROM debian:slim — /bin/sh + nc-via-bash
+      # is enough.
+      test: ['CMD', 'bash', '-c', 'echo > /dev/tcp/127.0.0.1/50001']
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.9.0
     profiles: [slim, full]
@@ -125,6 +149,7 @@ services:
       - '8474:8474' # admin HTTP
       - '60001:60001' # electrumx-tcp lane
       - '60101:60101' # fulcrum-tcp lane
+      - '60201:60201' # electrs-tcp lane
     # No healthcheck: the toxiproxy image is scratch-based and ships only
     # the `toxiproxy-server` binary — nothing to drive a `bash` / `python`
     # / `curl` probe with. No other service gates on toxiproxy; CI's `up
