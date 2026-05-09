@@ -16,14 +16,23 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
       "browser": {
         "types": "./dist/index.browser.d.ts",
         "default": "./dist/index.browser.js"
       },
-      "react-native": "./dist/index.js",
-      "bun": "./dist/index.js",
-      "node": "./dist/index.js",
+      "react-native": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "bun": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "node": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
     "./policy": {

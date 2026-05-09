@@ -25,20 +25,47 @@ describe('transport factory', () => {
   });
 
   it('overwrites prior registration', () => {
+    // Use a synthetic protocol so we don't have to restore a real
+    // transport's registration (the underlying module is already cached;
+    // re-importing it does not re-fire the side-effect).
     const fakes: { calls: number } = { calls: 0 };
-    registerTransport('ws', () => {
+    const FAKE = 'fake-test-only' as const;
+    const ctor = (): ReturnType<Parameters<typeof registerTransport>[1]> => {
       fakes.calls++;
       return {
-        endpoint: { host: 'h', port: 1, protocol: 'ws' },
+        endpoint: { host: 'h', port: 1, protocol: FAKE as unknown as 'ws' },
+        connect: async () => undefined,
+        send: async () => undefined,
+        close: async () => undefined,
+        on: () => () => undefined,
+      };
+    };
+    registerTransport(FAKE, ctor);
+    defaultTransportFactory({
+      host: 'h',
+      port: 1,
+      protocol: FAKE as unknown as 'ws',
+    });
+    expect(fakes.calls).toBe(1);
+
+    // Replace and verify the second ctor wins.
+    let secondCalls = 0;
+    registerTransport(FAKE, () => {
+      secondCalls++;
+      return {
+        endpoint: { host: 'h', port: 1, protocol: FAKE as unknown as 'ws' },
         connect: async () => undefined,
         send: async () => undefined,
         close: async () => undefined,
         on: () => () => undefined,
       };
     });
-    defaultTransportFactory({ host: 'h', port: 1, protocol: 'ws' });
-    expect(fakes.calls).toBe(1);
-    // Restore real ws registration so other tests aren't affected.
-    void import('../../../src/transport/ws.js');
+    defaultTransportFactory({
+      host: 'h',
+      port: 1,
+      protocol: FAKE as unknown as 'ws',
+    });
+    expect(secondCalls).toBe(1);
+    expect(fakes.calls).toBe(1); // first ctor not called again
   });
 });
