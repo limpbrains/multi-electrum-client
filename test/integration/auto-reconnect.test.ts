@@ -15,12 +15,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import {
-  ElectrumManager,
-  failover,
-  type BlockHeader,
-  type ServerSpec,
-} from '../../src/index.js';
+import { ElectrumManager, failover, type BlockHeader, type ServerSpec } from '../../src/index.js';
 
 import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
 import { getBlockCount, mineBlocks } from './helpers/regtestRpc.js';
