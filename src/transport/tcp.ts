@@ -32,6 +32,7 @@ import { connect as netConnect } from 'node:net';
 
 import type { Endpoint } from '../client.js';
 import { TransportError } from '../errors/types.js';
+import { registerTransport } from './factory.js';
 import { LineFramer } from './lineFramer.js';
 import type { Transport, TransportEvent, TransportListener } from './types.js';
 
@@ -238,3 +239,7 @@ export type { NodeSocket };
 // Internal options type — exported for `TlsTransport` only. Not part of the
 // public surface; do not document in README.
 export type { InternalOpts as InternalTcpTransportOpts };
+
+// Self-register so `defaultTransportFactory` finds us by protocol. Importing
+// this module pulls in `node:net` — the browser entry intentionally skips it.
+registerTransport('tcp', (endpoint) => new TcpTransport({ endpoint }));

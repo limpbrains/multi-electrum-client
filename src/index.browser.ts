@@ -1,11 +1,17 @@
-// multi-electrum-client — Node / RN / Bun entry. Imports every transport
-// for side-effect registration in the factory; the browser entry
-// (`src/index.browser.ts`) imports only `ws` to keep `node:net` /
-// `node:tls` out of bundler resolution graphs.
+// Browser entry. Re-exports everything except `TcpTransport` and
+// `TlsTransport`, and registers only `ws` / `wss` in the transport factory.
+// This keeps `node:net` / `node:tls` out of a browser bundler's resolution
+// graph entirely. Browser users can still set `protocol: 'tcp'` / `'tls'`
+// in `ServerSpec`, but the default factory will throw a clear
+// `ProtocolError('no transport registered for protocol \'tcp\'')` rather
+// than failing at module-resolve time.
+//
+// To use a custom transport in the browser (e.g. tunneling TCP via a
+// WebSocket bridge) override `ManagerOptions.transportFactory`.
 
+// Side-effect: registers ws + wss in the transport factory. Must come before
+// the manager is constructed.
 import './transport/ws.js';
-import './transport/tcp.js';
-import './transport/tls.js';
 
 export type {
   ClientId,
@@ -53,10 +59,6 @@ export type {
   ReconnectBackoff,
 } from './protocol/types.js';
 
-// Method registry (M3): one-source-of-truth for typed `manager.call(...)`
-// and the namespace API. Type-only — there is no runtime registry to
-// dereference. `methodNames` is the runtime list (allow-listing in custom
-// policies, metrics, discovery UIs).
 export type {
   Methods,
   MethodName,
@@ -75,11 +77,9 @@ export {
   ProtocolError,
 } from './errors/types.js';
 
-// Single-client surface:
+// Single-client surface (no TcpTransport / TlsTransport — browser only).
 export { ElectrumClient, type ElectrumClientOpts, type BatchCallItem } from './client.js';
 export { WsTransport, type WsTransportOpts } from './transport/ws.js';
-export { TcpTransport, type TcpTransportOpts, type TcpSocketLike } from './transport/tcp.js';
-export { TlsTransport, type TlsTransportOpts } from './transport/tls.js';
 export type { Transport, TransportEvent, TransportListener } from './transport/types.js';
 export {
   registerTransport,
@@ -87,11 +87,9 @@ export {
   registeredProtocols,
 } from './transport/factory.js';
 
-// Manager + RoutingPolicy built-ins (M2) + subscriptions (M4):
 export { ElectrumManager, type ManagerEvents } from './manager.js';
 export type { SubscriptionHandler, Unsubscribe } from './subscriptions/types.js';
 
-// Lifecycle (M5):
 export type { LifecycleState, SuspendOptions } from './lifecycle/types.js';
 export {
   bindAppState,

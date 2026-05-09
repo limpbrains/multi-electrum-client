@@ -15,6 +15,7 @@
 
 import type { Endpoint } from '../client.js';
 import { TransportError } from '../errors/types.js';
+import { registerTransport } from './factory.js';
 import { LineFramer } from './lineFramer.js';
 import type { Transport, TransportEvent, TransportListener } from './types.js';
 
@@ -179,3 +180,7 @@ export class WsTransport implements Transport {
     return undefined;
   }
 }
+
+// Self-register so `defaultTransportFactory` finds us by protocol.
+registerTransport('ws', (endpoint) => new WsTransport({ endpoint }));
+registerTransport('wss', (endpoint) => new WsTransport({ endpoint }));

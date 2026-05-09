@@ -4,11 +4,14 @@ Multi-server Electrum (Bitcoin) client for TypeScript with ban-aware routing,
 partial-batch redirect, subscription restore, and lifecycle support for
 Node, React Native, browser, and Bun.
 
-> **Status:** pre-release. Manager + routing + typed method registry are in
-> place (M0–M3); subscriptions, cache, peer discovery, lifecycle, and TCP/TLS
-> still landing. See
+> **Status:** `0.1.0`. All MVP features land: WS / TCP / TLS transports, manager
+> + routing + auto-batch + retry, typed method registry + namespace API,
+> subscriptions with replay + catch-up diff, finality-gated cache, peer
+> discovery, per-server-software error classifier, lifecycle (suspend / resume +
+> bindAppState). Integration suite against the Docker compose stack ships next.
+> See
 > [`docs/specs/2026-05-08-multi-electrum-client-design.md`](docs/specs/2026-05-08-multi-electrum-client-design.md)
-> for the full design and roadmap.
+> for the full design.
 
 ## Why
 
@@ -73,20 +76,13 @@ manager.on('client-banned', ({ clientId, reason }) => {
 | M4 | Subscriptions registry (replay + catch-up diff) + per-server-software error classifier + cache + peer discovery (`server.peers.subscribe`) | ✅ |
 | M5 | Lifecycle (`suspend` / `resume`) + `bindAppState` helper | ✅ |
 | M6 | TCP + TLS transports | ✅ |
-| M7 | Polish + 0.1 release | next |
+| M7 | Polish + 0.1 release | ✅ |
 
 ## Platform notes
 
 - **Node** ≥ 20: works out of the box. Global `WebSocket` is stable in Node 22+; Node 20 needs the `--experimental-websocket` flag, or pass `WebSocket` from the `ws` package via `WsTransport`'s `WebSocket` option. TCP / TLS use `node:net` / `node:tls`.
 - **Bun**: works out of the box (`ws`, `tcp`, `tls`).
-- **Browser**: only the `ws` / `wss` transport is supported. Don't construct servers with `protocol: 'tcp'` or `'tls'` — `node:net` / `node:tls` aren't available. Until the package ships a separate browser entry (planned for M7), the root `multi-electrum-client` import re-exports the TCP/TLS classes, so browser bundlers will try to resolve `node:net` / `node:tls` at build time even if you never instantiate them. Add a fallback / alias:
-  ```js
-  // webpack
-  resolve.fallback = { 'node:net': false, 'node:tls': false };
-  // vite (vite.config.ts)
-  resolve.alias = { 'node:net': false, 'node:tls': false };
-  ```
-  …or import only the WS surface directly: `import { WsTransport } from 'multi-electrum-client/transport/ws'`.
+- **Browser**: only `ws` / `wss` are supported. The package's `browser` conditional export points to a separate entry that registers only the WebSocket transport — `node:net` / `node:tls` are never reached by your bundler's resolution graph. Constructing a server with `protocol: 'tcp'` / `'tls'` still throws `ProtocolError` clearly at runtime (rather than at bundle time).
 - **React Native**: add a metro alias mapping `node:net` and `node:tls` to [`react-native-tcp-socket`](https://github.com/Rapsssito/react-native-tcp-socket). Its API is a 1:1 emulation of the Node modules; no platform branches inside the library. `WebSocket` is built into the RN runtime. For app lifecycle integration, pair `manager.suspend()`/`resume()` with the `bindAppState` helper:
   ```ts
   import { AppState } from 'react-native';
@@ -94,11 +90,19 @@ manager.on('client-banned', ({ clientId, reason }) => {
   const dispose = bindAppState(manager, AppState);
   ```
 
+## Examples
+
+Runnable snippets in [`examples/`](examples/):
+- [`node-basic.ts`](examples/node-basic.ts) — Node 22+, mixed TLS / TCP transports.
+- [`bun-basic.ts`](examples/bun-basic.ts) — Bun, top-level await, single-server failover.
+- [`browser-basic.html`](examples/browser-basic.html) — `wss` only, `visibilitychange` → `suspend` / `resume`.
+- [`rn-basic.tsx`](examples/rn-basic.tsx) — React Native, `bindAppState`, headers subscription.
+
 ## Development
 
 ```bash
 pnpm install
-pnpm test            # 104+ unit tests
+pnpm test            # 230+ unit tests
 pnpm typecheck
 pnpm lint
 pnpm build           # tsup -> dist/ (ESM + .d.ts)

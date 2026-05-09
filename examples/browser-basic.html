@@ -1,0 +1,48 @@
+<!doctype html>
+<!--
+  Browser example — uses the package's `browser` conditional export, which
+  registers ws/wss only (no `node:net` / `node:tls`). Bundle this with vite,
+  webpack, or your bundler of choice.
+
+  HTML harness for a build step like:
+    npx vite build examples/browser-basic.html
+  or just include the bundled output below as `<script type="module" src="...">`.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>multi-electrum-client — browser example</title>
+  </head>
+  <body>
+    <pre id="out"></pre>
+    <script type="module">
+      import { ElectrumManager, failover } from 'multi-electrum-client';
+
+      const out = document.getElementById('out');
+      const log = (...args) => {
+        out.textContent += args.join(' ') + '\n';
+      };
+
+      const manager = new ElectrumManager({
+        network: 'mainnet',
+        servers: [
+          // Browsers can only reach servers exposing a wss endpoint.
+          { id: 'a', host: 'electrum.example.org', port: 50004, protocol: 'wss' },
+        ],
+        policy: failover(['a']),
+      });
+      manager.on('client-state', (e) => log('[state]', e.clientId, '→', e.state));
+      manager.on('error', (e) => log('[error]', e));
+
+      await manager.start();
+      const tip = await manager.headers.getTip();
+      log('tip:', JSON.stringify(tip));
+
+      // Suspend on tab hide, resume on visible — common browser pattern.
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) manager.suspend();
+        else manager.resume();
+      });
+    </script>
+  </body>
+</html>
