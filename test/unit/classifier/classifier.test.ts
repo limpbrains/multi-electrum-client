@@ -117,6 +117,32 @@ describe('defaultClassifier — unknown serverSoftware (generic table)', () => {
     );
   });
 
+  it('matches anchored "banned" phrasings when software is undefined', () => {
+    // Unknown servers may emit a banner-style ban message; we want
+    // these to land as `rate-limit` so the manager backs off.
+    expect(
+      defaultClassifier.classify(new RpcError('You have been banned for 5 minutes', 1), baseCtx()),
+    ).toBe('rate-limit');
+    expect(
+      defaultClassifier.classify(new RpcError('client is banned (cooldown)', 1), baseCtx()),
+    ).toBe('rate-limit');
+    expect(defaultClassifier.classify(new RpcError('client banned for 60s', 1), baseCtx())).toBe(
+      'rate-limit',
+    );
+  });
+
+  it('does NOT match unrelated "banned" payload data', () => {
+    // "banned by miners" appears in some tx-broadcast policy rejects;
+    // anchored substrings ("is banned", "have been banned", "client
+    // banned") don't match this and the classifier returns rpc-error.
+    expect(
+      defaultClassifier.classify(
+        new RpcError('transaction rejected: banned by miners', 1),
+        baseCtx(),
+      ),
+    ).toBe('rpc-error');
+  });
+
   it('does NOT false-fire on tx-broadcast policy rejects with "excessive ..." substrings', () => {
     // Bitcoin Core's mempool policy emits "tx-size" / "bad-txns-..." style
     // strings; a server returning the policy reject verbatim must NOT be

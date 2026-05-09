@@ -242,6 +242,18 @@ export interface ManagerOptions {
    * table; without the handshake every classification falls through
    * to the generic table.
    *
+   * **Eventual-consistency window**: the handshake fires
+   * fire-and-forget AFTER the client transitions to `'connected'`,
+   * so a request issued in the same microtask as the state event
+   * (e.g. on a freshly added server during a burst) can race ahead
+   * of the version response and be classified against the generic
+   * table. The generic table is a deliberately narrower superset of
+   * the vendor lists' "well-known" phrases — for the rate-limit
+   * codepath specifically the practical difference is small (vendor
+   * tables and the generic table both catch the canonical strings),
+   * but if you need vendor-exact classification on the very first
+   * call, await `server.version` yourself before issuing it.
+   *
    * Default: `true`. Set `false` for tests / workflows that drive
    * `server.version` themselves — ElectrumX 1.16+ rejects a second
    * version call on the same session with `"server.version already
