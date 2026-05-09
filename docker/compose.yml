@@ -64,6 +64,54 @@ services:
       retries: 30
       start_period: 10s
 
+  bitcoind-init:
+    # One-shot: mines a single regtest block and creates the `ci` wallet.
+    # Fulcrum's controller refuses to start while bitcoind reports
+    # `getblockchaininfo.headers === 0`, so we prime the chain. Idempotent —
+    # createwallet errors are tolerated and generatetoaddress only runs at
+    # height 0.
+    image: btcpayserver/bitcoin:26.0
+    profiles: [slim, full]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        set -e
+        ARGS="-regtest -rpcconnect=bitcoind -rpcport=18443 -rpcuser=ci -rpcpassword=ci"
+        bitcoin-cli $$ARGS -named createwallet wallet_name=ci 2>/dev/null || true
+        bitcoin-cli $$ARGS loadwallet ci 2>/dev/null || true
+        H=$$(bitcoin-cli $$ARGS getblockcount)
+        if [ "$$H" = "0" ]; then
+          ADDR=$$(bitcoin-cli $$ARGS getnewaddress)
+          bitcoin-cli $$ARGS generatetoaddress 1 "$$ADDR" > /dev/null
+        fi
+        echo "init: chain at $$(bitcoin-cli $$ARGS getblockcount)"
+    restart: 'no'
+
+  fulcrum-default:
+    image: cculianu/fulcrum:v1.11.1
+    profiles: [slim, full]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+      bitcoind-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./fulcrum/configs/default.conf:/etc/fulcrum.conf:ro
+    command: ['Fulcrum', '/etc/fulcrum.conf']
+    ports:
+      - '50101:50001' # direct lane (host) → 50001 (container)
+    healthcheck:
+      # /dev/tcp is bash-only and the image's `sh` is dash. Invoke bash
+      # explicitly.
+      test: ['CMD', 'bash', '-c', 'echo > /dev/tcp/127.0.0.1/50001']
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.9.0
     profiles: [slim, full]
@@ -76,6 +124,7 @@ services:
     ports:
       - '8474:8474' # admin HTTP
       - '60001:60001' # electrumx-tcp lane
+      - '60101:60101' # fulcrum-tcp lane
     # No healthcheck: the toxiproxy image is scratch-based and ships only
     # the `toxiproxy-server` binary — nothing to drive a `bash` / `python`
     # / `curl` probe with. No other service gates on toxiproxy; CI's `up

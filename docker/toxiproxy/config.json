@@ -4,5 +4,11 @@
     "listen": "0.0.0.0:60001",
     "upstream": "electrumx-default:50001",
     "enabled": true
+  },
+  {
+    "name": "fulcrum-tcp",
+    "listen": "0.0.0.0:60101",
+    "upstream": "fulcrum-default:50001",
+    "enabled": true
   }
 ]
