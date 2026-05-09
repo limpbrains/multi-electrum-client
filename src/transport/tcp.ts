@@ -2,9 +2,22 @@
 //
 // Imports node:net statically. RN consumers point metro at
 // `react-native-tcp-socket` via the standard alias — its API is a 1:1
-// emulation of node:net's `Socket`. Browser / Bun callers should use
-// WsTransport (this file is not bundled into browser builds — see
-// package.json conditional exports).
+// emulation of node:net's `Socket`.
+//
+// Browser builds: this module is currently re-exported from the package
+// root (so its top-level `import 'node:net'` is reachable from a
+// browser bundler's resolution graph even when the consumer never
+// instantiates `TcpTransport`). Until the package ships a separate
+// browser entry (M7), browser users must add a bundler alias /
+// fallback:
+//
+//     // webpack
+//     resolve.fallback = { 'node:net': false, 'node:tls': false };
+//     // vite
+//     resolve.alias = { 'node:net': false, 'node:tls': false };
+//
+// or restrict their package import to `multi-electrum-client/transport/ws`.
+// Bun and Node use the modules directly.
 //
 // Framing: newline-delimited messages via the shared `LineFramer`. Outgoing
 // payloads are appended `\n`; incoming chunks are split on `\r?\n` with
@@ -103,12 +116,29 @@ export class TcpTransport implements Transport {
 
     // Wire data / close / error handlers BEFORE awaiting connect so we
     // don't drop bytes the server may push as soon as the socket opens.
-    // setEncoding('utf-8') above means `chunk` is always a string in
-    // practice, but `Buffer.toString` is kept as a defensive fallback for
-    // socket implementations (e.g. RN's react-native-tcp-socket on some
-    // platforms) that ignore the encoding hint.
+    // `setEncoding('utf-8')` above means `chunk` arrives as a string from
+    // both `node:net` and `react-native-tcp-socket`. If a future shim
+    // ignores the encoding hint and emits a Buffer, `Buffer.toString`
+    // decodes correctly; a raw `Uint8Array` would not (its `toString`
+    // returns comma-decimals), so we route those through `TextDecoder`.
+    const decoder = new TextDecoder();
     socket.on('data', (chunk) => {
-      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+      let text: string;
+      if (typeof chunk === 'string') {
+        text = chunk;
+      } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(chunk)) {
+        text = chunk.toString('utf-8');
+      } else if (chunk instanceof Uint8Array) {
+        text = decoder.decode(chunk);
+      } else {
+        // Unknown shape — surface as an error rather than silently
+        // corrupting the framer's input.
+        this.emit({
+          type: 'error',
+          cause: new TransportError('unexpected data chunk type from socket'),
+        });
+        return;
+      }
       for (const line of this.framer.push(text)) {
         this.emit({ type: 'data', text: line });
       }
