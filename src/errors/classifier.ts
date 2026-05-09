@@ -70,11 +70,13 @@ const ELECTRS_RATE_LIMIT_SUBSTRINGS = ['too many requests', 'rate limit', 'conne
  * error before `server.version` populates `capabilities.serverSoftware`,
  * or a server we don't have a vendor table for.
  *
- * Each substring is anchored: bare `'excessive'` would false-fire on
+ * Each substring is anchored to phrasings that only the rate-limit
+ * paths use. Bare `'excessive'` would false-fire on
  * `blockchain.transaction.broadcast` policy rejects ("excessive size",
- * "excessive sigops") and ban an otherwise-healthy server. We match
- * `'excessive resource'` / `'excessive request'` instead, which only
- * the resource-throttling paths use.
+ * "excessive sigops"); bare `'banned'` is fine for ban-banner
+ * messages but we anchor it to `'is banned'` / `'have been banned'`
+ * to avoid matching "banned by miners" / "banned address" in payload
+ * data.
  */
 const GENERIC_RATE_LIMIT_SUBSTRINGS = [
   'rate limit',
@@ -86,6 +88,9 @@ const GENERIC_RATE_LIMIT_SUBSTRINGS = [
   'excessive resource', // ElectrumX / aiorpcx
   'excessive request',
   'subscription limit reached', // Fulcrum
+  'is banned', // generic "client is banned" / "your IP is banned"
+  'have been banned', // "you have been banned"
+  'client banned', // Fulcrum-style "client banned for Xs"
 ];
 
 // --- Helpers ---------------------------------------------------------------

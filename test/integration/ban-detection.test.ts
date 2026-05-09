@@ -64,10 +64,12 @@ describe('integration: ban detection on Fulcrum with tight max_subs_per_ip', () 
       cooldownMs: 60_000,
       // Disable rapid reconnect for the duration so a transport blip
       // doesn't reset Fulcrum's per-IP subscribe counter mid-burst.
-      // 60s minMs effectively means "no reconnect for the test
-      // window"; `manager.stop()` clears the pending timer in the
-      // finally block so this doesn't leak a real timer.
-      reconnectBackoff: { minMs: 60_000, maxMs: 60_000, factor: 2, jitter: 0 },
+      // Use 120s — decoupled from the 60s test timeout so the timer
+      // CAN'T fire near the deadline (Fulcrum closes the socket on
+      // some over-cap responses; a reconnect timer firing right at
+      // 60s would race the test's cleanup). `manager.stop()` clears
+      // the pending timer in the finally block so this doesn't leak.
+      reconnectBackoff: { minMs: 120_000, maxMs: 120_000, factor: 2, jitter: 0 },
     });
     manager.on('client-banned', (e) =>
       banned.push({ clientId: e.clientId, reason: e.reason, until: e.until }),
