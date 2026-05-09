@@ -76,9 +76,8 @@ services:
     ports:
       - '8474:8474' # admin HTTP
       - '60001:60001' # electrumx-tcp lane
-    healthcheck:
-      test: ['CMD-SHELL', "echo > /dev/tcp/127.0.0.1/8474"]
-      interval: 2s
-      timeout: 5s
-      retries: 15
-      start_period: 5s
+    # No healthcheck: the toxiproxy image is scratch-based and ships only
+    # the `toxiproxy-server` binary — nothing to drive a `bash` / `python`
+    # / `curl` probe with. No other service gates on toxiproxy; CI's `up
+    # --wait` succeeds once electrumx is healthy. Tests that need the
+    # admin HTTP API poll it themselves at :8474.
