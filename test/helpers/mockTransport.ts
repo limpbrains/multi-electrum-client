@@ -8,6 +8,10 @@ export class MockTransport implements Transport {
   readonly endpoint: Endpoint;
   readonly sent: string[] = [];
   connected = false;
+  /** Total `connect()` calls across transport lifetime (incl. reconnects). */
+  connectCalls = 0;
+  /** Override next `connect()` to throw — simulate failed reconnect. */
+  nextConnectError: Error | null = null;
   private readonly listeners = new Set<TransportListener>();
 
   constructor(endpoint: Endpoint = { host: 'mock', port: 0, protocol: 'ws' }) {
@@ -15,6 +19,12 @@ export class MockTransport implements Transport {
   }
 
   async connect(): Promise<void> {
+    this.connectCalls++;
+    if (this.nextConnectError) {
+      const e = this.nextConnectError;
+      this.nextConnectError = null;
+      throw e;
+    }
     this.connected = true;
   }
 

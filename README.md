@@ -25,6 +25,7 @@ whose value proposition is **resilience**:
 - Ban / rate-limit detection per server software (ElectrumX, Fulcrum, electrs).
 - Partial batch failures auto-redirect to another server, per item.
 - Subscriptions replay + catch-up diff on reconnect — handlers don't miss events.
+- Auto-reconnect on transport faults with exponential backoff + jitter.
 - `suspend()` / `resume()` for React Native background lifecycle.
 
 ## What works today

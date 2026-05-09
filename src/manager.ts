@@ -29,6 +29,7 @@ import type {
   ManagerOptions,
   Network,
   RawTxHex,
+  ReconnectBackoff,
   Scripthash,
   ScripthashStatus,
   ServerSpec,
@@ -116,6 +117,26 @@ export class ElectrumManager {
   private readonly discoverOptions: DiscoverOptions | undefined;
   /** Per-client re-poll timers for peer discovery. */
   private readonly discoverTimers = new Map<ClientId, ReturnType<typeof setTimeout>>();
+  /**
+   * Reconnect backoff. Per-client transport faults trigger an exponential-
+   * backoff retry that multiplies by `factor` per failed attempt, clamped
+   * to `[minMs, maxMs]`, with `+/- jitter * delay` randomization.
+   */
+  private readonly reconnectBackoff: ReconnectBackoff;
+  /** Pending reconnect timers per client. Cleared on stop / removeServer / suspend. */
+  private readonly reconnectTimers = new Map<ClientId, ReturnType<typeof setTimeout>>();
+  /**
+   * Per-client reconnect attempt count. Reset to 0 on successful connect;
+   * incremented on every failed reconnect to drive backoff growth.
+   */
+  private readonly reconnectAttempts = new Map<ClientId, number>();
+  /**
+   * Per-client "user wants this client connected" flag. Set on
+   * `installServer`, cleared on `removeServer` / `stop`. The reconnect
+   * loop only fires while this is true. Suspend / resume don't toggle it
+   * — the lifecycle gate handles those transitions.
+   */
+  private readonly wantsReconnect = new Map<ClientId, boolean>();
   /** True while we're tearing down — guards async tasks against post-stop work. */
   private stopped = false;
   /**
@@ -161,6 +182,12 @@ export class ElectrumManager {
     this.cache = opts.cache;
     this.finalizedConfs = opts.finalizedConfs ?? 6;
     this.discoverOptions = opts.discover;
+    this.reconnectBackoff = opts.reconnectBackoff ?? {
+      minMs: 500,
+      maxMs: 30_000,
+      factor: 2,
+      jitter: 0.2,
+    };
     this.batcher = new MicrotaskBatcher<BatchItem>((items) => {
       this.flushBatch(items).catch((e) => this.emit('error', e));
     });
@@ -259,6 +286,11 @@ export class ElectrumManager {
     }
     for (const t of this.discoverTimers.values()) clearTimeout(t);
     this.discoverTimers.clear();
+    // Auto-reconnect off — clear timers + intent flags so a `disconnected`
+    // event triggered by our own `c.disconnect()` below doesn't reschedule.
+    this.wantsReconnect.clear();
+    for (const t of this.reconnectTimers.values()) clearTimeout(t);
+    this.reconnectTimers.clear();
     if (this.tipUnsub) {
       try {
         await this.tipUnsub();
@@ -374,6 +406,13 @@ export class ElectrumManager {
     // backoff.
     for (const t of this.discoverTimers.values()) clearTimeout(t);
     this.discoverTimers.clear();
+    // Cancel any pending reconnects — sockets we just closed would
+    // otherwise auto-reconnect during suspend. resume() drives the
+    // explicit reconnect path. wantsReconnect stays set so a
+    // disconnect-fault during `running` after resume() resumes the
+    // backoff loop.
+    for (const t of this.reconnectTimers.values()) clearTimeout(t);
+    this.reconnectTimers.clear();
     // Tip becomes stale across suspend; cache writes are gated until
     // `resume()` re-establishes the headers subscription. We INVOKE the
     // tipUnsub (not just null it) — otherwise the registry's per-key
@@ -532,6 +571,11 @@ export class ElectrumManager {
   async removeServer(id: ClientId): Promise<void> {
     const c = this.clients.get(id);
     if (!c) return;
+    // Clear reconnect intent BEFORE disconnect so the resulting
+    // `disconnected` event doesn't reschedule the backoff loop.
+    this.wantsReconnect.delete(id);
+    this.cancelReconnect(id);
+    this.reconnectAttempts.delete(id);
     // Disconnect first so any in-flight retry that races sees the client in
     // its 'disconnected' state via the candidate snapshot rather than missing
     // entirely (the latter would surface as a misleading "client disappeared"
@@ -850,6 +894,9 @@ export class ElectrumManager {
     client.onStateChange((state) => {
       this.emit('client-state', { clientId: spec.id, state });
       if (state === 'connected') {
+        // Fresh connection — reset reconnect backoff; the next disconnect
+        // will start over from `minMs`.
+        this.reconnectAttempts.set(spec.id, 0);
         // Fire-and-forget: rebind any orphaned subs onto the new connection.
         // Errors surface through the manager `error` event via runAttempts.
         this.registry.restoreOrphans().catch((e) => this.emit('error', e));
@@ -872,9 +919,16 @@ export class ElectrumManager {
           clearTimeout(t);
           this.discoverTimers.delete(spec.id);
         }
+        // Schedule a backoff reconnect. Skipped while suspending /
+        // suspended (those states close sockets deliberately and resume()
+        // drives the reconnect) and when the user has explicitly removed
+        // / stopped the manager.
+        this.scheduleReconnect(spec.id);
       }
     });
     this.clients.set(spec.id, client);
+    this.wantsReconnect.set(spec.id, true);
+    this.reconnectAttempts.set(spec.id, 0);
     this.meta.set(spec.id, {
       bannedUntil: undefined,
       capabilities: {},
@@ -984,6 +1038,65 @@ export class ElectrumManager {
     const meta = this.meta.get(id);
     if (meta?.bannedUntil !== undefined && meta.bannedUntil > Date.now()) return false;
     return true;
+  }
+
+  /**
+   * Schedule a backoff reconnect for `id`. Idempotent: a pending timer is
+   * left in place if one is already scheduled. Skipped when:
+   *  - the user has removed / stopped the manager (`wantsReconnect` cleared);
+   *  - the manager is suspending / suspended / resuming (the lifecycle
+   *    drives reconnect on `resume()`);
+   *  - the client has already reconnected by the time the timer fires
+   *    (state-change handler re-invokes this for every disconnect, so
+   *    extra calls are harmless).
+   *
+   * Backoff: `delay = clamp(minMs * factor^attempt, minMs, maxMs)` with
+   * `±jitter * delay` randomization. `attempt` resets to 0 on every
+   * successful `connected` transition.
+   */
+  private scheduleReconnect(id: ClientId): void {
+    if (!this.wantsReconnect.get(id)) return;
+    if (this.lifecycle !== 'running' && this.lifecycle !== 'created') return;
+    if (this.reconnectTimers.has(id)) return;
+    const client = this.clients.get(id);
+    if (!client) return;
+    const attempt = this.reconnectAttempts.get(id) ?? 0;
+    const { minMs, maxMs, factor, jitter } = this.reconnectBackoff;
+    const base = Math.min(maxMs, minMs * Math.pow(factor, attempt));
+    const jitterRange = base * jitter;
+    const delay = Math.max(minMs, base + (Math.random() * 2 - 1) * jitterRange);
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(id);
+      // Re-check at fire time: caller may have removed / stopped the
+      // manager between schedule and fire.
+      if (!this.wantsReconnect.get(id)) return;
+      if (this.lifecycle !== 'running' && this.lifecycle !== 'created') return;
+      const c = this.clients.get(id);
+      if (!c) return;
+      if (c.getState() === 'connected' || c.getState() === 'connecting') return;
+      this.reconnectAttempts.set(id, attempt + 1);
+      c.connect().catch((e) => {
+        this.emit('error', e);
+        // Schedule the next attempt. The state-change handler also fires
+        // `disconnected → schedule`, but only on transitions; if connect
+        // never reached `connected` and bounced back to `disconnected`,
+        // we re-arm here too.
+        this.scheduleReconnect(id);
+      });
+    }, delay);
+    if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+      (timer as { unref: () => void }).unref();
+    }
+    this.reconnectTimers.set(id, timer);
+  }
+
+  /** Cancel any pending reconnect timer for `id`. */
+  private cancelReconnect(id: ClientId): void {
+    const t = this.reconnectTimers.get(id);
+    if (t !== undefined) {
+      clearTimeout(t);
+      this.reconnectTimers.delete(id);
+    }
   }
 
   /** Sum of in-flight requests across every connected client. */
