@@ -3,7 +3,7 @@ import net, { type Server, type Socket } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { TransportError } from '../../../src/errors/types.js';
-import { TcpTransport } from '../../../src/transport/tcp.js';
+import { TcpTransport, type TcpSocketLike } from '../../../src/transport/tcp.js';
 import type { TransportEvent } from '../../../src/transport/types.js';
 
 interface TestTcpServer {
@@ -188,6 +188,39 @@ describe('TcpTransport', () => {
     });
     await t.connect();
     await expect(t.send('a\nb')).rejects.toBeInstanceOf(TransportError);
+    await t.close();
+  });
+
+  it('decodes Uint8Array data chunks via TextDecoder (defensive shim path)', async () => {
+    // Inject a fake socket that emits a raw Uint8Array (mimicking a shim
+    // that ignores setEncoding). The naive `chunk.toString('utf-8')`
+    // fallback would corrupt this into comma-decimals.
+    const { EventEmitter } = await import('node:events');
+    const ee = new EventEmitter();
+    const fakeSocket = {
+      on: ee.on.bind(ee),
+      once: ee.once.bind(ee),
+      emit: ee.emit.bind(ee),
+      setEncoding: () => fakeSocket,
+      write: () => true,
+      end: () => ee.emit('close', false),
+      destroy: () => ee.emit('close', true),
+    };
+    const t = new TcpTransport({
+      endpoint: { host: 'h', port: 1, protocol: 'tcp' },
+      connect: () => fakeSocket as unknown as TcpSocketLike,
+    });
+    const data: string[] = [];
+    t.on((e) => {
+      if (e.type === 'data') data.push(e.text);
+    });
+    const p = t.connect();
+    queueMicrotask(() => ee.emit('connect'));
+    await p;
+
+    ee.emit('data', new TextEncoder().encode('{"id":1}\n'));
+    expect(data).toEqual(['{"id":1}']);
+
     await t.close();
   });
 

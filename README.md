@@ -79,7 +79,14 @@ manager.on('client-banned', ({ clientId, reason }) => {
 
 - **Node** ≥ 20: works out of the box. Global `WebSocket` is stable in Node 22+; Node 20 needs the `--experimental-websocket` flag, or pass `WebSocket` from the `ws` package via `WsTransport`'s `WebSocket` option. TCP / TLS use `node:net` / `node:tls`.
 - **Bun**: works out of the box (`ws`, `tcp`, `tls`).
-- **Browser**: only the `ws` / `wss` transport is supported. Don't construct servers with `protocol: 'tcp'` or `'tls'` — `node:net` / `node:tls` aren't available.
+- **Browser**: only the `ws` / `wss` transport is supported. Don't construct servers with `protocol: 'tcp'` or `'tls'` — `node:net` / `node:tls` aren't available. Until the package ships a separate browser entry (planned for M7), the root `multi-electrum-client` import re-exports the TCP/TLS classes, so browser bundlers will try to resolve `node:net` / `node:tls` at build time even if you never instantiate them. Add a fallback / alias:
+  ```js
+  // webpack
+  resolve.fallback = { 'node:net': false, 'node:tls': false };
+  // vite (vite.config.ts)
+  resolve.alias = { 'node:net': false, 'node:tls': false };
+  ```
+  …or import only the WS surface directly: `import { WsTransport } from 'multi-electrum-client/transport/ws'`.
 - **React Native**: add a metro alias mapping `node:net` and `node:tls` to [`react-native-tcp-socket`](https://github.com/Rapsssito/react-native-tcp-socket). Its API is a 1:1 emulation of the Node modules; no platform branches inside the library. `WebSocket` is built into the RN runtime. For app lifecycle integration, pair `manager.suspend()`/`resume()` with the `bindAppState` helper:
   ```ts
   import { AppState } from 'react-native';
