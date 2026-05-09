@@ -32,7 +32,9 @@ export default [
     },
   },
   {
-    ignores: ['dist/**', 'coverage/**', 'node_modules/**', '*.config.js'],
+    // Examples are illustrative and don't participate in the typechecked
+    // project — skip them in lint too.
+    ignores: ['dist/**', 'coverage/**', 'node_modules/**', '*.config.js', 'examples/**'],
   },
   prettier,
 ];

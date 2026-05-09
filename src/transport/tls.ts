@@ -17,6 +17,7 @@ import { connect as tlsConnect } from 'node:tls';
 
 import type { Endpoint } from '../client.js';
 import { TransportError } from '../errors/types.js';
+import { registerTransport } from './factory.js';
 import { TcpTransport, type TcpSocketLike, type InternalTcpTransportOpts } from './tcp.js';
 import type { Transport, TransportListener } from './types.js';
 
@@ -98,3 +99,7 @@ export class TlsTransport implements Transport {
 
 // Re-export the precise node TLS types for callers who want them.
 export type { TLSSocket, ConnectionOptions };
+
+// Self-register so `defaultTransportFactory` finds us by protocol. Importing
+// this module pulls in `node:tls` — the browser entry intentionally skips it.
+registerTransport('tls', (endpoint) => new TlsTransport({ endpoint }));
