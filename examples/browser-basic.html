@@ -1,12 +1,31 @@
 <!doctype html>
 <!--
-  Browser example — uses the package's `browser` conditional export, which
-  registers ws/wss only (no `node:net` / `node:tls`). Bundle this with vite,
-  webpack, or your bundler of choice.
+  Browser example.
 
-  HTML harness for a build step like:
-    npx vite build examples/browser-basic.html
-  or just include the bundled output below as `<script type="module" src="...">`.
+  This file is meant to be served through a bundler (vite, webpack, esbuild,
+  etc.) that resolves the `multi-electrum-client` bare specifier and respects
+  the package's `browser` conditional export. Quick path:
+
+    pnpm add multi-electrum-client
+    pnpm create vite@latest .       # then drop this file in as index.html
+    pnpm vite
+
+  If you want to run the file directly without a bundler — e.g. for a quick
+  experiment served from a local static server — add an import map that
+  points the bare specifier at a CDN that serves the package's browser
+  build. The block below is commented out by default; uncomment and replace
+  `<VERSION>` with the version you want.
+
+  <script type="importmap">
+    {
+      "imports": {
+        "multi-electrum-client": "https://esm.sh/multi-electrum-client@<VERSION>?bundle"
+      }
+    }
+  </script>
+
+  Without one of these two paths, the browser will reject the bare
+  specifier with "Failed to resolve module specifier 'multi-electrum-client'".
 -->
 <html lang="en">
   <head>
