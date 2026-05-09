@@ -28,6 +28,10 @@ describe('integration: smoke against ElectrumX over TCP', () => {
       servers: SERVERS,
       policy: failover(['ex']),
       autoBatch: false,
+      // We drive `server.version` directly below; ElectrumX 1.16+
+      // rejects a duplicate version call on the same session
+      // (`"server.version already sent"`).
+      handshakeOnConnect: false,
     });
     try {
       await manager.start();

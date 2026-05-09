@@ -66,17 +66,25 @@ const FULCRUM_RATE_LIMIT_SUBSTRINGS = ['subscription limit reached', 'banned'];
 const ELECTRS_RATE_LIMIT_SUBSTRINGS = ['too many requests', 'rate limit', 'connection rejected'];
 
 /**
- * Common across all three implementations (used when `serverSoftware`
- * is unknown — e.g. before / instead of an explicit `server.version`
- * handshake). The strings are specific enough that false-positives on
- * unrelated RPC errors are negligible.
+ * Used when `serverSoftware` is unknown — e.g. an early-handshake
+ * error before `server.version` populates `capabilities.serverSoftware`,
+ * or a server we don't have a vendor table for.
+ *
+ * Each substring is anchored: bare `'excessive'` would false-fire on
+ * `blockchain.transaction.broadcast` policy rejects ("excessive size",
+ * "excessive sigops") and ban an otherwise-healthy server. We match
+ * `'excessive resource'` / `'excessive request'` instead, which only
+ * the resource-throttling paths use.
  */
 const GENERIC_RATE_LIMIT_SUBSTRINGS = [
   'rate limit',
   'rate-limit',
-  'banned',
-  'excessive',
-  'too many',
+  'too many requests',
+  'request limit',
+  'session timed out',
+  'connection rejected',
+  'excessive resource', // ElectrumX / aiorpcx
+  'excessive request',
   'subscription limit reached', // Fulcrum
 ];
 
@@ -95,11 +103,14 @@ function matchesAny(haystack: string, needles: readonly string[]): boolean {
 }
 
 /**
- * Pick the rate-limit substring set for the named software. Anything we
- * don't recognize falls back to the generic list (which is a strict superset
- * of the three vendor lists by design — we'd rather false-positive a ban
- * than miss one and let the client keep hammering a server that's already
- * cutting it off).
+ * Pick the rate-limit substring set for the named software. Unknown
+ * software falls back to the generic list, which collects the
+ * specific phrasings used across the three implementations (it's
+ * NOT a strict superset of the vendor lists — vendor strings like
+ * `"excessive resource usage"` minus the "; bye!" we tolerate are in
+ * the generic list, but loose anchors like bare `"excessive"` are
+ * intentionally omitted to avoid banning servers that emit policy
+ * errors with the substring in unrelated payloads).
  */
 function rateLimitSubstrings(software: string | undefined): readonly string[] {
   if (software === undefined) return GENERIC_RATE_LIMIT_SUBSTRINGS;

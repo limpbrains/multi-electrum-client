@@ -12,6 +12,14 @@ export class MockTransport implements Transport {
   connectCalls = 0;
   /** Override next `connect()` to throw — simulate failed reconnect. */
   nextConnectError: Error | null = null;
+  /**
+   * Auto-reply to `server.version` requests with a synthetic version
+   * tuple instead of enqueueing them in `sent[]`. Default true so
+   * Manager-level tests don't have to reserve a slot for the
+   * implicit handshake `installServer` issues on every connect. Set
+   * to false in tests that drive `server.version` directly.
+   */
+  autoReplyVersion = true;
   private readonly listeners = new Set<TransportListener>();
 
   constructor(endpoint: Endpoint = { host: 'mock', port: 0, protocol: 'ws' }) {
@@ -29,6 +37,26 @@ export class MockTransport implements Transport {
   }
 
   async send(text: string): Promise<void> {
+    if (this.autoReplyVersion) {
+      // Manager issues a `server.version` handshake on every connect
+      // (see `installServer`). Auto-reply with a synthetic version
+      // tuple and DON'T enqueue the request in `sent[]` — tests
+      // assert on the wire calls they actually drive without having
+      // to reserve a slot for the handshake. Tests that exercise
+      // version directly set `autoReplyVersion = false`.
+      try {
+        const parsed = JSON.parse(text) as { id?: number; method?: string };
+        if (parsed && parsed.method === 'server.version' && typeof parsed.id === 'number') {
+          const reply = JSON.stringify({ id: parsed.id, result: ['MockServer 0.0.0', '1.4'] });
+          // Microtask reply so client.send().then() resolves before
+          // the response handler runs.
+          queueMicrotask(() => this.emit({ type: 'data', text: reply }));
+          return;
+        }
+      } catch {
+        // Fall through and treat as a normal send.
+      }
+    }
     this.sent.push(text);
   }
 

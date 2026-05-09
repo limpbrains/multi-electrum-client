@@ -235,4 +235,17 @@ export interface ManagerOptions {
    * and admits ws/wss peers it doesn't already have. See `DiscoverOptions`.
    */
   discover?: DiscoverOptions;
+  /**
+   * Issue `server.version(clientName, protocolVersion)` on every
+   * connect to populate the client's `capabilities.serverSoftware`.
+   * The classifier consults that to pick its per-software substring
+   * table; without the handshake every classification falls through
+   * to the generic table.
+   *
+   * Default: `true`. Set `false` for tests / workflows that drive
+   * `server.version` themselves — ElectrumX 1.16+ rejects a second
+   * version call on the same session with `"server.version already
+   * sent"`.
+   */
+  handshakeOnConnect?: boolean;
 }

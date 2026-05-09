@@ -42,6 +42,9 @@ describe.each(IMPLS)('integration: cross-impl parity — $name', (impl) => {
       policy: failover([impl.spec.id]),
       autoBatch: false,
       requestTimeoutMs: 4000,
+      // We drive `server.version` directly below; ElectrumX rejects a
+      // duplicate version call on the same session.
+      handshakeOnConnect: false,
     });
     try {
       await manager.start();

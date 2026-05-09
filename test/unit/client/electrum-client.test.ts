@@ -116,6 +116,10 @@ describe('ElectrumClient', () => {
 
   it('rejects all in-flight requests when the transport closes unexpectedly', async () => {
     const transport = new MockTransport();
+    // This test exercises raw client.call('server.version', ...) and
+    // expects it to be in-flight when the close arrives — opt out of
+    // the harness's auto-reply.
+    transport.autoReplyVersion = false;
     const client = new ElectrumClient({ id: 'a', endpoint: transport.endpoint, transport });
     await client.connect();
 
