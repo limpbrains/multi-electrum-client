@@ -1,9 +1,8 @@
 // Cross-impl parity. The MVP method set must return shape-compatible
 // results from every Electrum implementation we support. This bucket
-// runs the same assertions against ElectrumX (1.18) and Fulcrum (1.11) —
-// not byte-identical responses (server software stamps differ; Fulcrum
-// emits a different software banner; tip hex is the same regtest header)
-// but matching shape and basic invariants.
+// runs the same assertions against ElectrumX (1.18), Fulcrum (1.11),
+// and electrs (0.11) — not byte-identical responses (server software
+// stamps differ) but matching shape and basic invariants.
 
 import { describe, expect, it } from 'vitest';
 
@@ -27,6 +26,11 @@ const IMPLS: Impl[] = [
     name: 'Fulcrum',
     software: /^Fulcrum\b/,
     spec: { id: 'fc', host: INTEGRATION_HOST, port: PORTS.fulcrumTcp, protocol: 'tcp' },
+  },
+  {
+    name: 'electrs',
+    software: /^electrs/i,
+    spec: { id: 'el', host: INTEGRATION_HOST, port: PORTS.electrsTcp, protocol: 'tcp' },
   },
 ];
 
