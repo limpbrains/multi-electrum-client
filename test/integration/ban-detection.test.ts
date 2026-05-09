@@ -16,7 +16,7 @@
 // produces a real RPC error that the manager can observe and ban on
 // without us needing to invent a transport-level rate-limit heuristic.
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import {
   ElectrumManager,
@@ -46,16 +46,8 @@ const SERVERS: ServerSpec[] = [
 ];
 
 describe('integration: ban detection on Fulcrum with tight max_subs_per_ip', () => {
-  beforeAll(async () => {
-    // Both lanes are direct compose ports; nothing to reset.
-  });
-
-  afterAll(async () => {
-    // Nothing to tear down beyond the manager itself.
-  });
-
   it('bans the strict client on rate-limit and routes future calls to the healthy lane', async () => {
-    const banned: { clientId: ClientId; reason: ErrorKind }[] = [];
+    const banned: { clientId: ClientId; reason: ErrorKind; until: number }[] = [];
     const errors: unknown[] = [];
 
     const manager = new ElectrumManager({
@@ -66,16 +58,20 @@ describe('integration: ban detection on Fulcrum with tight max_subs_per_ip', () 
       policy: failover(['strict', 'default']),
       autoBatch: false,
       requestTimeoutMs: 4000,
-      // Short cooldown — we don't assert on expiry, but a long ban
-      // could leak into later tests if state were shared.
-      cooldownMs: 5_000,
-      // Disable rapid reconnect during the test so a transport blip
-      // doesn't reset Fulcrum's per-IP counter mid-burst. The ban
-      // event fires on the first RPC error well before any reconnect
-      // would be relevant.
+      // Generous cooldown so the `until` we capture below stays in
+      // the future across the rest of the test no matter how slow CI
+      // runs. We don't assert on expiry; only on detection.
+      cooldownMs: 60_000,
+      // Disable rapid reconnect for the duration so a transport blip
+      // doesn't reset Fulcrum's per-IP subscribe counter mid-burst.
+      // 60s minMs effectively means "no reconnect for the test
+      // window"; `manager.stop()` clears the pending timer in the
+      // finally block so this doesn't leak a real timer.
       reconnectBackoff: { minMs: 60_000, maxMs: 60_000, factor: 2, jitter: 0 },
     });
-    manager.on('client-banned', (e) => banned.push({ clientId: e.clientId, reason: e.reason }));
+    manager.on('client-banned', (e) =>
+      banned.push({ clientId: e.clientId, reason: e.reason, until: e.until }),
+    );
     manager.on('error', (e) => errors.push(e));
 
     try {
@@ -99,11 +95,21 @@ describe('integration: ban detection on Fulcrum with tight max_subs_per_ip', () 
         }),
       );
 
-      expect(banned.some((b) => b.clientId === 'strict' && b.reason === 'rate-limit')).toBe(true);
+      // Exactly ONE `client-banned` event for the strict client.
+      // Pre-fix this was ~100 (one per over-cap response in the
+      // burst) — `recordError` re-extended `bannedUntil` and
+      // re-emitted on every rate-limit error. The leading-edge guard
+      // in `manager.ts` collapses subsequent rate-limit errors during
+      // the cooldown window into telemetry without re-emitting.
+      const strictBans = banned.filter((b) => b.clientId === 'strict' && b.reason === 'rate-limit');
+      expect(strictBans).toHaveLength(1);
 
+      const firstBan = strictBans[0]!;
       const strictView = manager.getClientViews().find((v) => v.id === 'strict');
-      expect(strictView?.bannedUntil).toBeDefined();
-      expect(strictView?.bannedUntil).toBeGreaterThan(Date.now());
+      // The view's bannedUntil reflects the same value we observed in
+      // the event, not a fresh `Date.now()` — racy CI runs could
+      // otherwise see the ban expire between assertion lines.
+      expect(strictView?.bannedUntil).toBe(firstBan.until);
 
       // A fresh call resolves: failover routes around the banned client
       // to `default`, which is healthy.

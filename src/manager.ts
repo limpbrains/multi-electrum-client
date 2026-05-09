@@ -115,6 +115,13 @@ export class ElectrumManager {
   /** Disposer for the internal headers subscription. */
   private tipUnsub: (() => Promise<void>) | null = null;
   private readonly discoverOptions: DiscoverOptions | undefined;
+  /**
+   * Auto-handshake `server.version` on every connect. Default `true`;
+   * disabled when the caller wants to drive `server.version` directly
+   * (e.g. ElectrumX 1.16+ rejects a duplicate version call with
+   * `"server.version already sent"`).
+   */
+  private readonly handshakeOnConnect: boolean;
   /** Per-client re-poll timers for peer discovery. */
   private readonly discoverTimers = new Map<ClientId, ReturnType<typeof setTimeout>>();
   /**
@@ -182,6 +189,7 @@ export class ElectrumManager {
     this.cache = opts.cache;
     this.finalizedConfs = opts.finalizedConfs ?? 6;
     this.discoverOptions = opts.discover;
+    this.handshakeOnConnect = opts.handshakeOnConnect ?? true;
     this.reconnectBackoff = opts.reconnectBackoff ?? {
       minMs: 500,
       maxMs: 30_000,
@@ -897,6 +905,12 @@ export class ElectrumManager {
         // Fresh connection — reset reconnect backoff; the next disconnect
         // will start over from `minMs`.
         this.reconnectAttempts.set(spec.id, 0);
+        // Identify the server software so the per-software classifier
+        // tables actually run instead of falling through to the generic
+        // table. Fire-and-forget; failures surface as `error` events.
+        if (this.handshakeOnConnect) {
+          this.handshakeVersion(spec.id, client).catch((e) => this.emit('error', e));
+        }
         // Fire-and-forget: rebind any orphaned subs onto the new connection.
         // Errors surface through the manager `error` event via runAttempts.
         this.registry.restoreOrphans().catch((e) => this.emit('error', e));
@@ -1038,6 +1052,32 @@ export class ElectrumManager {
     const meta = this.meta.get(id);
     if (meta?.bannedUntil !== undefined && meta.bannedUntil > Date.now()) return false;
     return true;
+  }
+
+  /**
+   * Issue `server.version` on a freshly connected client and stash the
+   * returned `[softwareName, protocolVersion]` pair into the client's
+   * `capabilities`. The `ErrorClassifier` consults `serverSoftware` to
+   * pick its per-software substring table; without this handshake every
+   * client would always fall through to the generic table and the
+   * vendor-specific tables would be dead code. Fire-and-forget — a
+   * server that refuses `server.version` (or returns a non-tuple
+   * shape) just keeps `serverSoftware` undefined; the classifier still
+   * works via the generic path.
+   */
+  private async handshakeVersion(id: ClientId, client: ElectrumClient): Promise<void> {
+    let v: unknown;
+    try {
+      v = await client.call('server.version', ['multi-electrum-client', '1.4']);
+    } catch {
+      return; // Server doesn't speak version, or we raced a disconnect.
+    }
+    if (!Array.isArray(v) || v.length < 2) return;
+    const [software, protocolVersion] = v;
+    if (typeof software !== 'string' || typeof protocolVersion !== 'string') return;
+    const meta = this.meta.get(id);
+    if (!meta) return; // Client removed mid-handshake.
+    meta.capabilities = { serverSoftware: software, protocolVersion };
   }
 
   /**
@@ -1493,12 +1533,23 @@ export class ElectrumManager {
     if (!m) return;
     m.telemetry.recordError(kind, latencyMs, Date.now());
     if (kind === 'rate-limit') {
-      m.bannedUntil = Date.now() + this.cooldownMs;
-      this.emit('client-banned', {
-        clientId: id,
-        until: m.bannedUntil,
-        reason: kind,
-      });
+      const now = Date.now();
+      // Coalesce: only the LEADING edge of a ban window emits an event.
+      // Without this, a burst of N parallel calls that all return a
+      // rate-limit RPC error would emit N `client-banned` events and
+      // ratchet `bannedUntil` forward by `cooldownMs` per error,
+      // potentially extending the ban indefinitely while late-arriving
+      // responses keep classifying. Once a client is banned within the
+      // current cooldown window, further rate-limit errors only
+      // contribute to telemetry / `onOutcome` — not a re-ban.
+      if (m.bannedUntil === undefined || m.bannedUntil <= now) {
+        m.bannedUntil = now + this.cooldownMs;
+        this.emit('client-banned', {
+          clientId: id,
+          until: m.bannedUntil,
+          reason: kind,
+        });
+      }
     }
     this.invokeOnOutcome({ kind: 'error', clientId: id, method, error: kind, latencyMs });
   }

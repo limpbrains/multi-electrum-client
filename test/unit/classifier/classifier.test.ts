@@ -105,13 +105,32 @@ describe('defaultClassifier — electrs rate-limit', () => {
 });
 
 describe('defaultClassifier — unknown serverSoftware (generic table)', () => {
-  it('matches the broad generic substrings when software is undefined', () => {
-    expect(defaultClassifier.classify(new RpcError('You have been banned', 1), baseCtx())).toBe(
+  it('matches the canonical resource / rate-limit phrases when software is undefined', () => {
+    expect(defaultClassifier.classify(new RpcError('excessive resource usage', 1), baseCtx())).toBe(
       'rate-limit',
     );
-    expect(defaultClassifier.classify(new RpcError('excessive load', 1), baseCtx())).toBe(
+    expect(
+      defaultClassifier.classify(new RpcError('Subscription limit reached', 1), baseCtx()),
+    ).toBe('rate-limit');
+    expect(defaultClassifier.classify(new RpcError('rate limit hit', 1), baseCtx())).toBe(
       'rate-limit',
     );
+  });
+
+  it('does NOT false-fire on tx-broadcast policy rejects with "excessive ..." substrings', () => {
+    // Bitcoin Core's mempool policy emits "tx-size" / "bad-txns-..." style
+    // strings; a server returning the policy reject verbatim must NOT be
+    // misclassified as rate-limited. The classifier only matches
+    // "excessive resource" / "excessive request", not the bare token.
+    expect(
+      defaultClassifier.classify(
+        new RpcError('excessive size: tx exceeds max weight', 1),
+        baseCtx(),
+      ),
+    ).toBe('rpc-error');
+    expect(
+      defaultClassifier.classify(new RpcError('excessive sigops in transaction', 1), baseCtx()),
+    ).toBe('rpc-error');
   });
 });
 

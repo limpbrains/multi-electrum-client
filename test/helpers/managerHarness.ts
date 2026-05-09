@@ -1,5 +1,11 @@
 // Helpers for Manager unit tests. Builds a transportFactory that registers a
 // MockTransport per ServerSpec.id and lets tests drive each server's wire I/O.
+//
+// MockTransport auto-handles the manager's implicit `server.version`
+// handshake at the transport layer — tests don't see it in `sent[]` and
+// don't need to dispatch a reply for it. Tests that want to assert
+// behavior on the version handshake itself can call
+// `manager.server.version(...)` directly.
 
 import type { Endpoint } from '../../src/client.js';
 import type { Transport } from '../../src/transport/types.js';
