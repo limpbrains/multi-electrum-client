@@ -79,7 +79,8 @@ manager.on('client-banned', ({ clientId, reason }) => {
 | M4 | Subscriptions registry (replay + catch-up diff) + per-server-software error classifier + cache + peer discovery (`server.peers.subscribe`) | ✅ |
 | M5 | Lifecycle (`suspend` / `resume`) + `bindAppState` helper | ✅ |
 | M6 | TCP + TLS transports | ✅ |
-| M7 | Polish + integration suite + 0.1.0 release | in progress |
+| M7 | Polish + integration suite + property tests | ✅ |
+| M8 | RN parity tests + 0.1.0 release | in progress |
 
 ## Platform notes
 
