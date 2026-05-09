@@ -104,7 +104,7 @@ Runnable snippets in [`examples/`](examples/):
 
 ```bash
 pnpm install
-pnpm test            # 230+ unit tests
+pnpm test            # unit tests
 pnpm typecheck
 pnpm lint
 pnpm build           # tsup -> dist/ (ESM + .d.ts)
