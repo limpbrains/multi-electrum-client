@@ -9,9 +9,10 @@
 //   4. `manager.resume()` — reconnect, registry's `restoreOrphans` re-issues
 //      `headers.subscribe`, handler fires synthetically with the drifted tip.
 //
-// (We don't auto-reconnect on transport errors yet — that's deferred. This
-// test exercises the lifecycle-driven reconnect path which IS shipped, and
-// covers the same registry / catch-up code as the eventual auto-reconnect.)
+// This test covers the lifecycle path; the transport-fault path (auto-
+// reconnect after toxiproxy drops the link) is exercised by
+// `auto-reconnect.test.ts`. Both end up driving the same registry /
+// catch-up code, but the entry points are independent.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 

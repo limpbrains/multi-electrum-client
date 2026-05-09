@@ -12,5 +12,12 @@ export default defineConfig({
     // Real network + bitcoind RPC + electrum handshake takes a while.
     testTimeout: 60_000,
     hookTimeout: 60_000,
+    // Run files sequentially: every integration test shares the same
+    // toxiproxy admin and bitcoind regtest chain, so parallel files
+    // would race on toxic state and chain height. Vitest's default
+    // worker-per-file setup happily lets `failover` and `auto-reconnect`
+    // both poke `electrumx-tcp` at the same time and one undoes the
+    // other's `disable`.
+    fileParallelism: false,
   },
 });

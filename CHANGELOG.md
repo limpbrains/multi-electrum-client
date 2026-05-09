@@ -16,6 +16,7 @@ Pre-release. The unit-test surface is complete, but the integration suite agains
 - **Peer discovery** — optional `discover: { enabled, onDiscover?, intervalMs? }` calls `server.peers.subscribe` on every connect; admitted ws/wss peers join the pool via `addServer`.
 - **Error classifier** — pluggable; default heuristics for ElectrumX, Fulcrum, electrs ban / rate-limit strings + ECONNRESET / WS abnormal-closure mapping. `composeClassifier` for caller overrides.
 - **Lifecycle** — `manager.suspend({ graceMs?, cancelInFlight? })` / `resume()`; FIFO transition chain handles 3+ overlapping calls correctly. Suspended calls queue and replay (or reject with `failOnSuspend: true`). `bindAppState(manager, AppState)` wires RN's AppState to lifecycle without importing react-native.
+- **Auto-reconnect** — transport-level disconnects schedule an exponential-backoff reconnect (`reconnectBackoff: { minMs, maxMs, factor, jitter }`, default `500ms→30s`, ×2, ±20%). Successful connects reset the attempt counter; `removeServer` / `stop` / `suspend` cancel pending timers; suspend / resume keeps the lifecycle path in charge of reconnect.
 - **Transports** — `WsTransport` (universal: Node 22+, browser, RN, Bun), `TcpTransport` (`node:net`), `TlsTransport` (`node:tls`, awaits `secureConnect`). Shared `LineFramer` for all three. Transport registry lets the package ship a separate browser entry that registers only ws/wss.
 - **Conditional package exports** — root `.` resolves to `index.browser.js` for browser bundlers (no `node:net` / `node:tls`), `index.js` for Node / RN / Bun.
 - **Examples** — `examples/{node,bun,browser,rn}-basic.*`.
@@ -26,6 +27,3 @@ Pre-release. The unit-test surface is complete, but the integration suite agains
 - RN parity tests via `react-native-harness`.
 - CI workflows for `integration` and `rn`.
 
-### Test stats (unit only)
-
-233 unit tests covering policies, framing, registry, classifier, cache, discovery, lifecycle, transports.
