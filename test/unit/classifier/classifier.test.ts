@@ -60,19 +60,10 @@ describe('defaultClassifier — ElectrumX rate-limit', () => {
 });
 
 describe('defaultClassifier — Fulcrum rate-limit', () => {
-  it('detects "excessive resource usage; bye!"', () => {
+  it('detects "Subscription limit reached" (per-IP cap exceeded)', () => {
     expect(
       defaultClassifier.classify(
-        new RpcError('excessive resource usage; bye!', 1),
-        baseCtx('Fulcrum 1.10.0'),
-      ),
-    ).toBe('rate-limit');
-  });
-
-  it('detects "too many concurrent"', () => {
-    expect(
-      defaultClassifier.classify(
-        new RpcError('too many concurrent connections', 1),
+        new RpcError('Subscription limit reached', 1),
         baseCtx('Fulcrum 1.10.0'),
       ),
     ).toBe('rate-limit');
@@ -85,6 +76,17 @@ describe('defaultClassifier — Fulcrum rate-limit', () => {
         baseCtx('Fulcrum 1.10.0'),
       ),
     ).toBe('rate-limit');
+  });
+
+  it('does NOT match "excessive resource usage" against Fulcrum (that is ElectrumX)', () => {
+    // Fulcrum never emits this string; matching it here would mask actual
+    // bugs in the ElectrumX path. Stays as `rpc-error`.
+    expect(
+      defaultClassifier.classify(
+        new RpcError('excessive resource usage', 1),
+        baseCtx('Fulcrum 1.10.0'),
+      ),
+    ).toBe('rpc-error');
   });
 });
 
@@ -141,8 +143,8 @@ describe('defaultClassifier — untyped network errors', () => {
     // the socket; we want rate-limit, not transport.
     expect(
       defaultClassifier.classify(
-        new Error('excessive resource usage; bye!'),
-        baseCtx('Fulcrum 1.10.0'),
+        new Error('excessive resource usage'),
+        baseCtx('ElectrumX 1.16.0'),
       ),
     ).toBe('rate-limit');
   });

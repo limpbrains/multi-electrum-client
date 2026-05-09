@@ -9,6 +9,7 @@ export const INTEGRATION_HOST = process.env['INTEGRATION_HOST'] ?? '127.0.0.1';
 export const PORTS = {
   electrumxTcp: Number(process.env['ELECTRUMX_TCP_PORT'] ?? '50001'),
   fulcrumTcp: Number(process.env['FULCRUM_TCP_PORT'] ?? '50101'),
+  fulcrumStrictTcp: Number(process.env['FULCRUM_STRICT_TCP_PORT'] ?? '50102'),
   electrsTcp: Number(process.env['ELECTRS_TCP_PORT'] ?? '50201'),
   toxiproxyAdmin: Number(process.env['TOXIPROXY_PORT'] ?? '8474'),
   toxiproxyElectrumxTcp: Number(process.env['TOXI_ELECTRUMX_TCP_PORT'] ?? '60001'),

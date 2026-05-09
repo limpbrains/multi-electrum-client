@@ -26,11 +26,16 @@ import {
 // --- Per-software substring tables -----------------------------------------
 
 /**
- * Substrings that ElectrumX uses in its JSON-RPC error messages when it's
- * rejecting a client for resource reasons. Source:
- * https://github.com/spesmilo/electrumx — `electrumx/server/session.py`
- * (`'excessive resource usage'` is the canonical phrase, with mild variants
- * across versions).
+ * Substrings ElectrumX (via aiorpcx) uses when rejecting a client for
+ * resource reasons. The canonical phrase is `"excessive resource usage"`
+ * — emitted by aiorpcx's `ExcessiveSessionCostError` path with JSON-RPC
+ * code -101. Source:
+ *   - aiorpcx `aiorpcx/session.py` raises
+ *     `RPCError(JSONRPC.EXCESSIVE_RESOURCE_USAGE, 'excessive resource usage')`.
+ *   - https://github.com/spesmilo/electrumx — `electrumx/server/session.py`.
+ *
+ * Note: the literal `"; bye!"` suffix some older docs reference is a
+ * client-side wallet rendering artifact, not part of the wire payload.
  */
 const ELECTRUMX_RATE_LIMIT_SUBSTRINGS = [
   'excessive resource usage',
@@ -41,15 +46,17 @@ const ELECTRUMX_RATE_LIMIT_SUBSTRINGS = [
 ];
 
 /**
- * Fulcrum's distinctive ban string: `"excessive resource usage; bye!"`.
- * Source: https://github.com/cculianu/Fulcrum — `src/Servers.cpp`.
+ * Fulcrum's rate-limit / ban payloads. The canonical message emitted by
+ * `impl_generic_subscribe` when `max_subs_per_ip` is exceeded is
+ * `"Subscription limit reached"` (JSON-RPC code
+ * `RPC::Code_App_LimitExceeded`). Other paths (`max_clients_per_ip`,
+ * `Excessive errors...disconnecting`) drop the socket without an RPC
+ * payload — those surface as `transport`, not `rate-limit`.
+ *
+ * Source: https://github.com/cculianu/Fulcrum — `src/Servers.cpp`
+ * (`impl_generic_subscribe` / `impl_generic_handle_subs_limitreached_exc`).
  */
-const FULCRUM_RATE_LIMIT_SUBSTRINGS = [
-  'excessive resource usage; bye!',
-  'excessive resource usage',
-  'too many concurrent',
-  'banned',
-];
+const FULCRUM_RATE_LIMIT_SUBSTRINGS = ['subscription limit reached', 'banned'];
 
 /**
  * electrs has the loosest rate-limit signaling — typically just closes the
@@ -58,13 +65,19 @@ const FULCRUM_RATE_LIMIT_SUBSTRINGS = [
  */
 const ELECTRS_RATE_LIMIT_SUBSTRINGS = ['too many requests', 'rate limit', 'connection rejected'];
 
-/** Common across all three (used when `serverSoftware` is unknown). */
+/**
+ * Common across all three implementations (used when `serverSoftware`
+ * is unknown — e.g. before / instead of an explicit `server.version`
+ * handshake). The strings are specific enough that false-positives on
+ * unrelated RPC errors are negligible.
+ */
 const GENERIC_RATE_LIMIT_SUBSTRINGS = [
   'rate limit',
   'rate-limit',
   'banned',
   'excessive',
   'too many',
+  'subscription limit reached', // Fulcrum
 ];
 
 // --- Helpers ---------------------------------------------------------------
@@ -141,8 +154,9 @@ export const defaultClassifier: ErrorClassifier = {
 
     // Untyped error: fall back to message inspection. Rate-limit checks come
     // before transport because some servers send a final RPC-shaped error
-    // ("excessive resource usage; bye!") immediately before slamming the
-    // socket closed; we want to ban-list them, not just retry on transport.
+    // ("excessive resource usage", "Subscription limit reached") immediately
+    // before slamming the socket closed; we want to ban-list them, not just
+    // retry on transport.
     const msg = lowerMessage(error);
     if (matchesAny(msg, rateLimitSubstrings(ctx.serverSoftware))) {
       return 'rate-limit';

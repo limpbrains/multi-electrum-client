@@ -112,6 +112,32 @@ services:
       retries: 30
       start_period: 15s
 
+  fulcrum-strict:
+    # Fulcrum's `max_subs_per_ip` cap (configured at its hard minimum
+    # of 500) so a burst of ~501 scripthash subscribes trips
+    # `RPC::Code_App_LimitExceeded` and Fulcrum replies with
+    # `RpcError("Subscription limit reached")`. The default classifier
+    # maps that to `rate-limit` and the manager bans the client. Used
+    # by the ban-detection integration test.
+    image: cculianu/fulcrum:v1.11.1
+    profiles: [slim, full]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+      bitcoind-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./fulcrum/configs/strict.conf:/etc/fulcrum.conf:ro
+    command: ['Fulcrum', '/etc/fulcrum.conf']
+    ports:
+      - '50102:50001' # strict lane
+    healthcheck:
+      test: ['CMD', 'bash', '-c', 'echo > /dev/tcp/127.0.0.1/50001']
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
   electrs-default:
     image: getumbrel/electrs:v0.11.0
     profiles: [slim, full]
