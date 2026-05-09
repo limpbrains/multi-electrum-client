@@ -4,12 +4,14 @@ Multi-server Electrum (Bitcoin) client for TypeScript with ban-aware routing,
 partial-batch redirect, subscription restore, and lifecycle support for
 Node, React Native, browser, and Bun.
 
-> **Status:** `0.1.0`. All MVP features land: WS / TCP / TLS transports, manager
-> + routing + auto-batch + retry, typed method registry + namespace API,
-> subscriptions with replay + catch-up diff, finality-gated cache, peer
-> discovery, per-server-software error classifier, lifecycle (suspend / resume +
-> bindAppState). Integration suite against the Docker compose stack ships next.
-> See
+> **Status:** pre-release. All MVP features land at the unit level — WS / TCP /
+> TLS transports, manager + routing + auto-batch + retry, typed method registry
+> + namespace API, subscriptions with replay + catch-up diff, finality-gated
+> cache, peer discovery, per-server-software error classifier, lifecycle
+> (suspend / resume + bindAppState). The integration suite against the Docker
+> compose stack (cross-impl parity, failover under toxiproxy, partial-batch
+> retry, subscription catch-up, ban detection) is not yet wired up; no `0.1.0`
+> tag until it is. See
 > [`docs/specs/2026-05-08-multi-electrum-client-design.md`](docs/specs/2026-05-08-multi-electrum-client-design.md)
 > for the full design.
 
@@ -76,7 +78,7 @@ manager.on('client-banned', ({ clientId, reason }) => {
 | M4 | Subscriptions registry (replay + catch-up diff) + per-server-software error classifier + cache + peer discovery (`server.peers.subscribe`) | ✅ |
 | M5 | Lifecycle (`suspend` / `resume`) + `bindAppState` helper | ✅ |
 | M6 | TCP + TLS transports | ✅ |
-| M7 | Polish + 0.1 release | ✅ |
+| M7 | Polish + integration suite + 0.1.0 release | in progress |
 
 ## Platform notes
 
