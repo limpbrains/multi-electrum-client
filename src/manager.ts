@@ -1064,8 +1064,18 @@ export class ElectrumManager {
    * server that refuses `server.version` (or returns a non-tuple
    * shape) just keeps `serverSoftware` undefined; the classifier still
    * works via the generic path.
+   *
+   * Skipped if `capabilities.serverSoftware` is already populated —
+   * server software doesn't change between disconnects on the same
+   * `ServerSpec`, and ElectrumX 1.16+ rejects a duplicate
+   * `server.version` call with `"server.version already sent"` if the
+   * server-side session somehow persisted (rare but possible). This
+   * also keeps `resume()` cheap: no extra round-trip per client when
+   * we already know the software.
    */
   private async handshakeVersion(id: ClientId, client: ElectrumClient): Promise<void> {
+    const existing = this.meta.get(id);
+    if (existing?.capabilities.serverSoftware !== undefined) return;
     let v: unknown;
     try {
       v = await client.call('server.version', ['multi-electrum-client', '1.4']);
