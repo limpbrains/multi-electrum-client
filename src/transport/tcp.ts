@@ -203,11 +203,29 @@ export class TcpTransport implements Transport {
       // Use `once` if the socket implementation supports it so calling
       // close() repeatedly doesn't stack listeners. Falls back to `on`
       // for socket shims that don't expose `once`.
-      const handler = (): void => resolve();
+      let settled = false;
+      const settle = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(backstop);
+        resolve();
+      };
+      // Backstop: a slow / dead peer may never send FIN-ACK in response
+      // to our `end()`. Wait at most 500ms before forcibly destroying
+      // the socket so callers (manager.stop, suspend) don't hang on
+      // teardown.
+      const backstop = setTimeout(() => {
+        try {
+          socket.destroy();
+        } catch {
+          // ignore
+        }
+        settle();
+      }, 500);
       if (typeof socket.once === 'function') {
-        socket.once('close', handler);
+        socket.once('close', settle);
       } else {
-        socket.on('close', handler);
+        socket.on('close', settle);
       }
       try {
         socket.end();
@@ -217,7 +235,7 @@ export class TcpTransport implements Transport {
         } catch {
           // ignore
         }
-        resolve();
+        settle();
       }
     });
   }
