@@ -25,6 +25,7 @@ import {
 } from '../../src/index.js';
 
 import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { electrumxKnowsHeight } from './helpers/electrumxPoll.js';
 import { getBlockCount, mineBlocks } from './helpers/regtestRpc.js';
 import * as toxic from './helpers/toxic.js';
 import { waitFor } from './helpers/wait.js';
@@ -76,10 +77,21 @@ describe('integration: auto-reconnect on transport fault', () => {
         timeoutMs: 5_000,
       });
 
-      // Mine while the link is down — server learns a new tip.
+      // Mine while the link is down — server learns a new tip via
+      // its own bitcoind poll. Wait for ElectrumX to actually catch
+      // up via the direct lane (port 50001, NOT the toxiproxy lane
+      // which is still disabled). Without this gate the reconnect
+      // race against ElectrumX's poll cycle made this test flaky.
       await mineBlocks(2);
+      await waitFor(() => electrumxKnowsHeight(heightBefore + 2), {
+        label: 'electrumx caught up to mined tip',
+        timeoutMs: 30_000,
+        intervalMs: 500,
+      });
 
-      // Re-enable and let the backoff loop reconnect.
+      // Re-enable and let the backoff loop reconnect. Now the
+      // restoreOrphans subscribe response carries the new tip
+      // directly — handler fires synthetically with drift.
       await toxic.enable(PROXY);
 
       await waitFor(() => states.lastIndexOf('ex:connected') > states.indexOf('ex:disconnected'), {
