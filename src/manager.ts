@@ -6,13 +6,7 @@
 // finality), lifecycle suspend/resume (M5), and TCP/TLS transports (M6) plug
 // in here in subsequent milestones.
 
-import {
-  findCacheSpec,
-  isFinalized,
-  readFromCache,
-  writeToCache,
-  type CacheSpec,
-} from './cache/finality.js';
+import { findCacheSpec, isFinalized, MISS, readFromCache, writeToCache } from './cache/finality.js';
 import type { CacheStore } from './cache/types.js';
 import type { ClientId, ClientView, ConnectionState, Endpoint, Telemetry } from './client.js';
 import { ElectrumClient } from './client.js';
@@ -681,29 +675,22 @@ export class ElectrumManager {
 
     // Cache lookup happens up-front: if the method is on the cacheable
     // allow-list and we already have a value, return it without ever
-    // touching the wire. Cache writes happen after a successful wire call
-    // (see `runAttempts` resolution + `dispatchGroup`). `bypassCache` opts
-    // out of both the read and the write.
-    const spec: CacheSpec | null = opts?.bypassCache
-      ? null
-      : findCacheSpec(this.cache, method, params);
-    if (spec && this.cache) {
-      const hit = await readFromCache(this.cache, this.network, spec, (e) => this.emit('error', e));
-      if (hit !== undefined) return hit;
+    // touching the wire. Cache writes happen after a successful wire
+    // call. `bypassCache` opts out of both the read and the write.
+    const cache = this.cache;
+    const spec = cache && !opts?.bypassCache ? findCacheSpec(method, params) : null;
+    const onCacheError = (e: unknown): void => this.emit('error', e);
+    if (cache && spec) {
+      const hit = await readFromCache(cache, this.network, spec, onCacheError);
+      if (hit !== MISS) return hit;
     }
 
     const value = await this.callInner(method, params, opts);
-    if (
-      spec &&
-      this.cache &&
-      isFinalized(spec.finalityHeight, this.tipHeight, this.finalizedConfs) &&
-      !opts?.bypassCache
-    ) {
-      // Fire-and-forget: a slow cache adapter must not block the caller.
-      // A failed cache write just means the next call refetches.
-      void writeToCache(this.cache, this.network, spec, value, (e) => this.emit('error', e)).catch(
-        (e) => this.emit('error', e),
-      );
+    if (cache && spec && isFinalized(spec.finalityHeight, this.tipHeight, this.finalizedConfs)) {
+      // Fire-and-forget: a slow cache adapter must not block the
+      // caller. `writeToCache` catches every failure internally and
+      // routes through `onCacheError`, so no outer `.catch` is needed.
+      void writeToCache(cache, this.network, spec, value, onCacheError);
     }
     return value;
   }
@@ -934,11 +921,11 @@ export class ElectrumManager {
         // Fire-and-forget: rebind any orphaned subs onto the new connection.
         // Errors surface through the manager `error` event via runAttempts.
         this.registry.restoreOrphans().catch((e) => this.emit('error', e));
-        // Kick off a peer-discovery probe on this fresh connection. Idempotent:
-        // already-known peers are skipped without consulting onDiscover.
-        if (this.discovery?.enabled) {
-          this.discovery.runFor(spec.id).catch((e) => this.emit('error', e));
-        }
+        // Kick off a peer-discovery probe on this fresh connection.
+        // `runFor` self-no-ops when discovery is disabled; we don't
+        // gate at the call site so the runner stays the single source
+        // of truth for "is discovery active right now".
+        this.discovery?.runFor(spec.id).catch((e) => this.emit('error', e));
       } else if (state === 'disconnected') {
         this.registry.clientDisconnected(spec.id);
         // Subs bound to this client are now orphaned — immediately try to
