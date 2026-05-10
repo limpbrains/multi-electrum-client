@@ -14,53 +14,15 @@
 // `auto-reconnect.test.ts`. Both end up driving the same registry /
 // catch-up code, but the entry points are independent.
 
-import { createConnection } from 'node:net';
-
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { ElectrumManager, failover, type BlockHeader, type ServerSpec } from '../../src/index.js';
 
 import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { electrumxKnowsHeight } from './helpers/electrumxPoll.js';
 import { getBlockCount, mineBlocks } from './helpers/regtestRpc.js';
 import * as toxic from './helpers/toxic.js';
 import { waitFor } from './helpers/wait.js';
-
-/**
- * Open a one-shot TCP socket to ElectrumX, send `headers.subscribe`,
- * read one reply, close. Used as a side-channel poll while the manager
- * is suspended — the suspended manager has no open socket and we don't
- * want to wake it just to peek at ElectrumX's view of the tip.
- */
-async function electrumxKnowsHeight(targetHeight: number): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    const sock = createConnection(PORTS.electrumxTcp, INTEGRATION_HOST);
-    let buf = '';
-    const cleanup = (result: boolean): void => {
-      sock.destroy();
-      resolve(result);
-    };
-    sock.setTimeout(3000);
-    sock.on('connect', () => {
-      sock.write(
-        JSON.stringify({ id: 1, method: 'blockchain.headers.subscribe', params: [] }) + '\n',
-      );
-    });
-    sock.on('data', (chunk) => {
-      buf += chunk.toString('utf8');
-      const nl = buf.indexOf('\n');
-      if (nl < 0) return;
-      try {
-        const msg = JSON.parse(buf.slice(0, nl));
-        const height = msg?.result?.height;
-        cleanup(typeof height === 'number' && height >= targetHeight);
-      } catch {
-        cleanup(false);
-      }
-    });
-    sock.on('error', () => cleanup(false));
-    sock.on('timeout', () => cleanup(false));
-  });
-}
 
 const SERVERS: ServerSpec[] = [
   { id: 'ex', host: INTEGRATION_HOST, port: PORTS.electrumxTcp, protocol: 'tcp' },
