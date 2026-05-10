@@ -132,15 +132,11 @@ export class PeerDiscoveryRunner {
     this.deps = deps;
   }
 
-  /** True iff the runner is enabled by the user's options. */
-  get enabled(): boolean {
-    return this.options.enabled;
-  }
-
   /**
    * Probe `clientId` for peers and admit any that pass the user's
    * filter. Schedules the next re-poll on success. No-op when
-   * disabled or after the manager is stopped.
+   * disabled, after the manager is stopped, or once the client itself
+   * is no longer in the pool.
    */
   async runFor(clientId: ClientId): Promise<void> {
     if (!this.options.enabled) return;
@@ -157,6 +153,10 @@ export class PeerDiscoveryRunner {
 
     const candidates = parsePeerList(response);
     for (const cand of candidates) {
+      // Pre-await dedup: skip peers already in the pool. The re-check
+      // post-`onDiscover` below is a separate guard against the user's
+      // callback racing the pool (e.g. calling `addServer` on this
+      // same id from inside its own handler).
       if (this.deps.hasClient(cand.id)) continue;
       let admit: boolean;
       if (this.options.onDiscover) {
@@ -170,8 +170,10 @@ export class PeerDiscoveryRunner {
         admit = true;
       }
       if (!admit) continue;
-      // Re-check after each await: pool / lifecycle may have changed
-      // during the user's callback.
+      // Post-await re-check: lifecycle and pool may have changed while
+      // `onDiscover` ran. The user's callback can synchronously call
+      // `addServer` / `removeServer`, so this isn't redundant with the
+      // pre-await dedup above.
       if (this.deps.isStopped()) return;
       if (this.deps.hasClient(cand.id)) continue;
       try {
@@ -185,6 +187,11 @@ export class PeerDiscoveryRunner {
     const interval = this.options.intervalMs ?? DEFAULT_DISCOVER_INTERVAL_MS;
     if (interval <= 0) return;
     if (this.deps.isStopped()) return;
+    // The probe `await`s above may have outlasted the client itself
+    // (manager `cancelFor` + `removeServer` on disconnect), so a re-poll
+    // timer for an id that's no longer in the pool would just retry
+    // against a stale endpoint. Skip when the pool no longer has us.
+    if (!this.deps.hasClient(clientId)) return;
     const prev = this.timers.get(clientId);
     if (prev !== undefined) clearTimeout(prev);
     const t = setTimeout(() => {
