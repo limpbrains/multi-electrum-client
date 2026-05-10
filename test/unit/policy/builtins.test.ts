@@ -70,28 +70,13 @@ describe('roundRobin', () => {
     expect(policy.pick(ctx(cs))).toBeNull();
   });
 
-  it('skips clients banned via bannedUntil > now', () => {
-    const policy = roundRobin();
-    const future = Date.now() + 60_000;
-    const cs = [view('a', { bannedUntil: future }), view('b')];
-    expect(policy.pick(ctx(cs))).toBe('b');
-    expect(policy.pick(ctx(cs))).toBe('b');
-  });
+  // bannedUntil-skip + orderHint ordering are covered exhaustively by
+  // `properties.test.ts` (every state combination, every hint
+  // permutation). Concrete cases here only cover what the property
+  // runner can't shrink toward — the empty-hint default.
 });
 
 describe('failover', () => {
-  it('picks first eligible in orderHint', () => {
-    const policy = failover(['c', 'a', 'b']);
-    const cs = [view('a'), view('b'), view('c')];
-    expect(policy.pick(ctx(cs))).toBe('c');
-  });
-
-  it('falls back to next hint when first is ineligible', () => {
-    const policy = failover(['a', 'b']);
-    const cs = [view('a', { state: 'disconnected' }), view('b')];
-    expect(policy.pick(ctx(cs))).toBe('b');
-  });
-
   it('without orderHint, picks first eligible candidate', () => {
     const policy = failover();
     const cs = [view('a'), view('b')];

@@ -4,38 +4,30 @@ Multi-server Electrum (Bitcoin) client for TypeScript with ban-aware routing,
 partial-batch redirect, subscription restore, and lifecycle support for
 Node, React Native, browser, and Bun.
 
-> **Status:** pre-release. All MVP features land at the unit level — WS / TCP /
-> TLS transports, manager + routing + auto-batch + retry, typed method registry
-> + namespace API, subscriptions with replay + catch-up diff, finality-gated
-> cache, peer discovery, per-server-software error classifier, lifecycle
-> (suspend / resume + bindAppState). The integration suite against the Docker
-> compose stack (cross-impl parity, failover under toxiproxy, partial-batch
-> retry, subscription catch-up, ban detection) is not yet wired up; no `0.1.0`
-> tag until it is. See
-> [`docs/specs/2026-05-08-multi-electrum-client-design.md`](docs/specs/2026-05-08-multi-electrum-client-design.md)
-> for the full design.
+> **Status:** pre-release. Unit + integration suites green (Docker
+> Compose stack covers cross-impl parity, failover under toxiproxy fault
+> injection, partial-batch retry, subscription catch-up, auto-reconnect,
+> and ban detection). RN parity tests deferred — see [CHANGELOG](CHANGELOG.md).
+> No `0.1.0` tag yet. Full design at
+> [`docs/specs/2026-05-08-multi-electrum-client-design.md`](docs/specs/2026-05-08-multi-electrum-client-design.md).
 
 ## Why
 
 Existing JS Electrum clients are single-server, weakly typed, and not friendly
 to React Native. This library is a single, well-typed, multi-platform package
-whose value proposition is **resilience**:
+whose value proposition is **resilience**, not raw speed:
 
-- One library instance manages multiple server connections; routing per request.
+- One library instance manages multiple server connections; per-request routing.
 - Ban / rate-limit detection per server software (ElectrumX, Fulcrum, electrs).
 - Partial batch failures auto-redirect to another server, per item.
 - Subscriptions replay + catch-up diff on reconnect — handlers don't miss events.
 - Auto-reconnect on transport faults with exponential backoff + jitter.
 - `suspend()` / `resume()` for React Native background lifecycle.
 
-## What works today
+## Quick start
 
 ```ts
-import {
-  ElectrumManager,
-  preferFastest,
-  withSticky,
-} from 'multi-electrum-client';
+import { ElectrumManager, preferFastest, withSticky } from 'multi-electrum-client';
 
 const manager = new ElectrumManager({
   network: 'mainnet',
@@ -48,25 +40,127 @@ const manager = new ElectrumManager({
 
 await manager.start();
 
-// Typed method registry — params + result inferred from the wire name:
+// Typed namespace API — params and result are inferred from the wire name.
 const balance = await manager.scripthash.getBalance(scripthash);
 //    ^? { confirmed: number; unconfirmed: number }
 
 const txid = await manager.transaction.broadcast(rawTxHex);
 
 // Auto-batch coalescing: same-microtask calls bound for the same server
-// go out as a single JSON-RPC array; partial failures retry on another
-// server transparently.
-const [a, b, c] = await Promise.all([
+// go out as a single JSON-RPC array; partial failures auto-retry on a
+// different server.
+const [bal, hist, tx] = await Promise.all([
   manager.scripthash.getBalance(h1),
   manager.scripthash.getHistory(h2),
   manager.transaction.get(txid),
 ]);
 
 manager.on('client-banned', ({ clientId, reason }) => {
-  // 'rate-limit' detected on `clientId`; manager will route around it.
+  // 'rate-limit' detected on `clientId`; manager routes around it.
 });
+
+await manager.stop();
 ```
+
+## Examples
+
+### Subscriptions with replay on reconnect
+
+Handler-based subscriptions; the manager owns the wire `subscribe` and re-binds
+across disconnects. If the subscription state drifts during the disconnect
+window, the handler fires synthetically with the new status on reconnect — no
+events missed.
+
+```ts
+const unsub = await manager.scripthash.subscribe(scripthash, (status) => {
+  // Initial status fires synchronously; subsequent fires on every server push.
+  console.log('status:', status);
+});
+
+manager.on('subscription-restored', ({ method, drift }) => {
+  if (drift) console.log(`${method} drifted during reconnect; handler fired with new status`);
+});
+
+// Last-handler unsubscribe.
+await unsub();
+```
+
+### Background lifecycle (mobile-friendly)
+
+`suspend()` drains in-flight, closes sockets, and queues new calls. `resume()`
+reconnects, replays subscriptions with catch-up, and drains the queue in order.
+Pair with `bindAppState` on React Native to wire app foreground / background
+events automatically.
+
+```ts
+import { AppState } from 'react-native';
+import { bindAppState, ElectrumManager } from 'multi-electrum-client';
+
+const manager = new ElectrumManager({ /* ... */ });
+await manager.start();
+
+const dispose = bindAppState(manager, AppState);
+// app backgrounded → manager.suspend({ graceMs: 2000 })
+// app foregrounded → manager.resume()
+
+// On teardown:
+dispose();
+await manager.stop();
+```
+
+### Caching past finality
+
+Caller-injected `CacheStore`; library writes only entries past `finalizedConfs`
+(default 6) confirmations. Reads short-circuit the wire call; writes are
+fire-and-forget. Built-in `MemoryCache` ships with the package; bring your own
+adapter for AsyncStorage / IndexedDB / SQLite.
+
+```ts
+import { ElectrumManager, MemoryCache } from 'multi-electrum-client';
+
+const manager = new ElectrumManager({
+  network: 'mainnet',
+  servers: [/* ... */],
+  policy: preferFastest(),
+  cache: new MemoryCache(),
+  finalizedConfs: 6,
+});
+
+// First call hits the wire; second call (after the block has finalized)
+// returns from cache without a round-trip.
+const header1 = await manager.headers.getHeader(700_000);
+const header2 = await manager.headers.getHeader(700_000); // cache hit
+```
+
+### Custom routing policy
+
+`RoutingPolicy` is a plain `(ctx) => ClientId | null` interface. Compose your
+own by wrapping a built-in:
+
+```ts
+import { failover, withSticky, type RoutingPolicy } from 'multi-electrum-client';
+
+// Round-robin across two trusted servers, prefer the first whenever it's up.
+const policy: RoutingPolicy = withSticky(failover(['primary', 'secondary']), 'scripthash');
+```
+
+`PickContext` carries `request`, `attempt`, `excluded`, `candidates` (with live
+telemetry), `now`, and an optional `stickyKey`. Return `null` to bail with
+`NoClientAvailableError`.
+
+### Manager events
+
+```ts
+manager.on('client-state', ({ clientId, state }) => {
+  // 'connecting' | 'connected' | 'disconnected' | 'banned'
+});
+manager.on('client-banned', ({ clientId, until, reason }) => { /* observability */ });
+manager.on('subscription-restored', ({ method, params, drift }) => { /* observability */ });
+manager.on('error', (err) => { /* recoverable transport / classifier failures */ });
+```
+
+The `error` event is observability-only — promises still reject. Use it for
+metrics and debug logging, not control flow.
 
 ## Roadmap
 
@@ -76,25 +170,20 @@ manager.on('client-banned', ({ clientId, reason }) => {
 | M1 | Single-client WebSocket transport + JSON-RPC framing + ElectrumClient | ✅ |
 | M2 | ElectrumManager + RoutingPolicy built-ins + auto-batch coalescing + per-client telemetry + retry | ✅ |
 | M3 | Typed method registry + namespace API (`manager.scripthash.*`, `manager.transaction.*`, …) + domain types | ✅ |
-| M4 | Subscriptions registry (replay + catch-up diff) + per-server-software error classifier + cache + peer discovery (`server.peers.subscribe`) | ✅ |
+| M4 | Subscriptions registry (replay + catch-up diff) + per-server-software error classifier + cache + peer discovery | ✅ |
 | M5 | Lifecycle (`suspend` / `resume`) + `bindAppState` helper | ✅ |
 | M6 | TCP + TLS transports | ✅ |
 | M7 | Polish + integration suite + property tests | ✅ |
-| M8 | RN parity tests + 0.1.0 release | in progress |
+| M8 | 0.1.0 release | in progress |
 
 ## Platform notes
 
-- **Node** ≥ 20: works out of the box. Global `WebSocket` is stable in Node 22+; Node 20 needs the `--experimental-websocket` flag, or pass `WebSocket` from the `ws` package via `WsTransport`'s `WebSocket` option. TCP / TLS use `node:net` / `node:tls`.
+- **Node** ≥ 20: works out of the box. Global `WebSocket` is stable in Node 22+; Node 20 needs `--experimental-websocket`, or pass `WebSocket` from the `ws` package via `WsTransport`'s `WebSocket` option. TCP / TLS use `node:net` / `node:tls`.
 - **Bun**: works out of the box (`ws`, `tcp`, `tls`).
 - **Browser**: only `ws` / `wss` are supported. The package's `browser` conditional export points to a separate entry that registers only the WebSocket transport — `node:net` / `node:tls` are never reached by your bundler's resolution graph. Constructing a server with `protocol: 'tcp'` / `'tls'` still throws `ProtocolError` clearly at runtime (rather than at bundle time).
-- **React Native**: add a metro alias mapping `node:net` and `node:tls` to [`react-native-tcp-socket`](https://github.com/Rapsssito/react-native-tcp-socket). Its API is a 1:1 emulation of the Node modules; no platform branches inside the library. `WebSocket` is built into the RN runtime. For app lifecycle integration, pair `manager.suspend()`/`resume()` with the `bindAppState` helper:
-  ```ts
-  import { AppState } from 'react-native';
-  import { bindAppState } from 'multi-electrum-client';
-  const dispose = bindAppState(manager, AppState);
-  ```
+- **React Native**: add a metro alias mapping `node:net` and `node:tls` to [`react-native-tcp-socket`](https://github.com/Rapsssito/react-native-tcp-socket). Its API is a 1:1 emulation of the Node modules; no platform branches inside the library. `WebSocket` is built into the RN runtime.
 
-## Examples
+## More examples
 
 Runnable snippets in [`examples/`](examples/):
 - [`node-basic.ts`](examples/node-basic.ts) — Node 22+, mixed TLS / TCP transports.
@@ -112,7 +201,7 @@ pnpm lint
 pnpm build           # tsup -> dist/ (ESM + .d.ts)
 ```
 
-Integration tests (M4+) require Docker:
+Integration tests require Docker:
 
 ```bash
 docker compose -f docker/compose.yml --profile slim up -d --wait
