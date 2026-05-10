@@ -46,6 +46,8 @@ export type {
   ScripthashStatus,
   ServerVersion,
   FeeEstimate,
+  FeeHistogram,
+  FeeHistogramEntry,
   Scripthash,
   TxId,
   RawTxHex,

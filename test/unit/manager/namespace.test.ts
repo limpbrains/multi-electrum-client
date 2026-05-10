@@ -178,4 +178,62 @@ describe('namespace API → call() → wire', () => {
 
     await manager.stop();
   });
+
+  it('transaction.idFromPos passes height + position', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    const p = manager.transaction.idFromPos(700_000, 3);
+    await delay(0);
+    const sent = JSON.parse(h.transports.get('a')!.sent[0]!);
+    expect(sent.method).toBe('blockchain.transaction.id_from_pos');
+    expect(sent.params).toEqual([700_000, 3, false]);
+
+    h.reply('a', (req: { id: number }) => ({ id: req.id, result: 'aabbcc' }));
+    expect(await p).toBe('aabbcc');
+
+    await manager.stop();
+  });
+
+  it('mempool.getFeeHistogram issues mempool.get_fee_histogram with no params', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    const p = manager.mempool.getFeeHistogram();
+    await delay(0);
+    const sent = JSON.parse(h.transports.get('a')!.sent[0]!);
+    expect(sent.method).toBe('mempool.get_fee_histogram');
+    expect(sent.params).toEqual([]);
+
+    h.reply('a', (req: { id: number }) => ({
+      id: req.id,
+      result: [
+        [120, 250_000],
+        [50, 800_000],
+        [10, 1_500_000],
+      ],
+    }));
+    const result = await p;
+    expect(result).toEqual([
+      [120, 250_000],
+      [50, 800_000],
+      [10, 1_500_000],
+    ]);
+
+    await manager.stop();
+  });
 });

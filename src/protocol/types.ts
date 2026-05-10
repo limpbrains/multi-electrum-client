@@ -180,6 +180,25 @@ export type ServerVersion = readonly [serverSoftware: string, protocolVersion: s
  */
 export type FeeEstimate = number;
 
+/**
+ * Mempool fee histogram entry from `mempool.get_fee_histogram`. Wire shape
+ * is `[fee, vsize]` where:
+ *  - `fee` is the **rounded-up** fee rate in sat/vB,
+ *  - `vsize` is the cumulative virtual size (bytes) of mempool transactions
+ *    paying at least that fee rate.
+ *
+ * The server returns the array in **descending fee order**, so the entry
+ * at index 0 covers the highest-paying mempool slice. Wallets reach
+ * `nextBlock` fee by walking entries until cumulative `vsize` exceeds the
+ * remaining block weight.
+ *
+ * Source: Electrum protocol 1.4+ — https://electrumx.readthedocs.io
+ */
+export type FeeHistogramEntry = readonly [feeSatVb: number, vsize: number];
+
+/** Full histogram is just an array of entries. Empty mempool → `[]`. */
+export type FeeHistogram = readonly FeeHistogramEntry[];
+
 // --- Call-site options -----------------------------------------------------
 
 export interface CallOpts {
