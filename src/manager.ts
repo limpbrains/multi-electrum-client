@@ -29,13 +29,13 @@ import type {
   ManagerOptions,
   Network,
   RawTxHex,
-  ReconnectBackoff,
   Scripthash,
   ScripthashStatus,
   ServerSpec,
   TxId,
   TxVerbose,
 } from './protocol/types.js';
+import { ReconnectRunner } from './reconnect.js';
 import { SubscriptionRegistry } from './subscriptions/registry.js';
 import type { SubscriptionHandler } from './subscriptions/types.js';
 import { defaultTransportFactory } from './transport/factory.js';
@@ -123,25 +123,12 @@ export class ElectrumManager {
    */
   private readonly handshakeOnConnect: boolean;
   /**
-   * Reconnect backoff. Per-client transport faults trigger an exponential-
-   * backoff retry that multiplies by `factor` per failed attempt, clamped
-   * to `[minMs, maxMs]`, with `+/- jitter * delay` randomization.
+   * Per-client backoff reconnect loop. See `./reconnect.ts` for the
+   * lifecycle / cancellation contract; the manager just installs /
+   * removes / cancels through the runner's API and forwards
+   * connect-failure errors to the `error` event.
    */
-  private readonly reconnectBackoff: ReconnectBackoff;
-  /** Pending reconnect timers per client. Cleared on stop / removeServer / suspend. */
-  private readonly reconnectTimers = new Map<ClientId, ReturnType<typeof setTimeout>>();
-  /**
-   * Per-client reconnect attempt count. Reset to 0 on successful connect;
-   * incremented on every failed reconnect to drive backoff growth.
-   */
-  private readonly reconnectAttempts = new Map<ClientId, number>();
-  /**
-   * Per-client "user wants this client connected" flag. Set on
-   * `installServer`, cleared on `removeServer` / `stop`. The reconnect
-   * loop only fires while this is true. Suspend / resume don't toggle it
-   * — the lifecycle gate handles those transitions.
-   */
-  private readonly wantsReconnect = new Map<ClientId, boolean>();
+  private readonly reconnect: ReconnectRunner;
   /** True while we're tearing down — guards async tasks against post-stop work. */
   private stopped = false;
   /**
@@ -197,12 +184,14 @@ export class ElectrumManager {
         })
       : undefined;
     this.handshakeOnConnect = opts.handshakeOnConnect ?? true;
-    this.reconnectBackoff = opts.reconnectBackoff ?? {
-      minMs: 500,
-      maxMs: 30_000,
-      factor: 2,
-      jitter: 0.2,
-    };
+    this.reconnect = new ReconnectRunner(
+      opts.reconnectBackoff ?? { minMs: 500, maxMs: 30_000, factor: 2, jitter: 0.2 },
+      {
+        getClient: (id) => this.clients.get(id),
+        isRunning: () => this.lifecycle === 'running' || this.lifecycle === 'created',
+        onError: (e) => this.emit('error', e),
+      },
+    );
     this.batcher = new MicrotaskBatcher<BatchItem>((items) => {
       this.flushBatch(items).catch((e) => this.emit('error', e));
     });
@@ -302,9 +291,7 @@ export class ElectrumManager {
     this.discovery?.cancelAll();
     // Auto-reconnect off — clear timers + intent flags so a `disconnected`
     // event triggered by our own `c.disconnect()` below doesn't reschedule.
-    this.wantsReconnect.clear();
-    for (const t of this.reconnectTimers.values()) clearTimeout(t);
-    this.reconnectTimers.clear();
+    this.reconnect.clear();
     if (this.tipUnsub) {
       try {
         await this.tipUnsub();
@@ -421,11 +408,10 @@ export class ElectrumManager {
     this.discovery?.cancelAll();
     // Cancel any pending reconnects — sockets we just closed would
     // otherwise auto-reconnect during suspend. resume() drives the
-    // explicit reconnect path. wantsReconnect stays set so a
-    // disconnect-fault during `running` after resume() resumes the
-    // backoff loop.
-    for (const t of this.reconnectTimers.values()) clearTimeout(t);
-    this.reconnectTimers.clear();
+    // explicit reconnect path. `cancelAllTimers` preserves the
+    // per-client `wants` flags so a disconnect-fault during `running`
+    // after resume() resumes the backoff loop.
+    this.reconnect.cancelAllTimers();
     // Tip becomes stale across suspend; cache writes are gated until
     // `resume()` re-establishes the headers subscription. We INVOKE the
     // tipUnsub (not just null it) — otherwise the registry's per-key
@@ -586,9 +572,7 @@ export class ElectrumManager {
     if (!c) return;
     // Clear reconnect intent BEFORE disconnect so the resulting
     // `disconnected` event doesn't reschedule the backoff loop.
-    this.wantsReconnect.delete(id);
-    this.cancelReconnect(id);
-    this.reconnectAttempts.delete(id);
+    this.reconnect.unregister(id);
     // Disconnect first so any in-flight retry that races sees the client in
     // its 'disconnected' state via the candidate snapshot rather than missing
     // entirely (the latter would surface as a misleading "client disappeared"
@@ -911,7 +895,7 @@ export class ElectrumManager {
       if (state === 'connected') {
         // Fresh connection — reset reconnect backoff; the next disconnect
         // will start over from `minMs`.
-        this.reconnectAttempts.set(spec.id, 0);
+        this.reconnect.resetAttempts(spec.id);
         // Identify the server software so the per-software classifier
         // tables actually run instead of falling through to the generic
         // table. Fire-and-forget; failures surface as `error` events.
@@ -940,12 +924,11 @@ export class ElectrumManager {
         // suspended (those states close sockets deliberately and resume()
         // drives the reconnect) and when the user has explicitly removed
         // / stopped the manager.
-        this.scheduleReconnect(spec.id);
+        this.reconnect.schedule(spec.id);
       }
     });
     this.clients.set(spec.id, client);
-    this.wantsReconnect.set(spec.id, true);
-    this.reconnectAttempts.set(spec.id, 0);
+    this.reconnect.register(spec.id);
     this.meta.set(spec.id, {
       bannedUntil: undefined,
       capabilities: {},
@@ -1093,64 +1076,10 @@ export class ElectrumManager {
     meta.capabilities = { serverSoftware: software, protocolVersion };
   }
 
-  /**
-   * Schedule a backoff reconnect for `id`. Idempotent: a pending timer is
-   * left in place if one is already scheduled. Skipped when:
-   *  - the user has removed / stopped the manager (`wantsReconnect` cleared);
-   *  - the manager is suspending / suspended / resuming (the lifecycle
-   *    drives reconnect on `resume()`);
-   *  - the client has already reconnected by the time the timer fires
-   *    (state-change handler re-invokes this for every disconnect, so
-   *    extra calls are harmless).
-   *
-   * Backoff: `delay = clamp(minMs * factor^attempt, minMs, maxMs)` with
-   * `±jitter * delay` randomization. `attempt` resets to 0 on every
-   * successful `connected` transition.
-   */
-  private scheduleReconnect(id: ClientId): void {
-    if (!this.wantsReconnect.get(id)) return;
-    if (this.lifecycle !== 'running' && this.lifecycle !== 'created') return;
-    if (this.reconnectTimers.has(id)) return;
-    const client = this.clients.get(id);
-    if (!client) return;
-    const attempt = this.reconnectAttempts.get(id) ?? 0;
-    const { minMs, maxMs, factor, jitter } = this.reconnectBackoff;
-    const base = Math.min(maxMs, minMs * Math.pow(factor, attempt));
-    const jitterRange = base * jitter;
-    const delay = Math.max(minMs, base + (Math.random() * 2 - 1) * jitterRange);
-    const timer = setTimeout(() => {
-      this.reconnectTimers.delete(id);
-      // Re-check at fire time: caller may have removed / stopped the
-      // manager between schedule and fire.
-      if (!this.wantsReconnect.get(id)) return;
-      if (this.lifecycle !== 'running' && this.lifecycle !== 'created') return;
-      const c = this.clients.get(id);
-      if (!c) return;
-      if (c.getState() === 'connected' || c.getState() === 'connecting') return;
-      this.reconnectAttempts.set(id, attempt + 1);
-      c.connect().catch((e) => {
-        this.emit('error', e);
-        // Schedule the next attempt. The state-change handler also fires
-        // `disconnected → schedule`, but only on transitions; if connect
-        // never reached `connected` and bounced back to `disconnected`,
-        // we re-arm here too.
-        this.scheduleReconnect(id);
-      });
-    }, delay);
-    if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
-      (timer as { unref: () => void }).unref();
-    }
-    this.reconnectTimers.set(id, timer);
-  }
-
-  /** Cancel any pending reconnect timer for `id`. */
-  private cancelReconnect(id: ClientId): void {
-    const t = this.reconnectTimers.get(id);
-    if (t !== undefined) {
-      clearTimeout(t);
-      this.reconnectTimers.delete(id);
-    }
-  }
+  // Reconnect loop is implemented as `ReconnectRunner` in
+  // `./reconnect.ts`; manager's onStateChange / lifecycle / removeServer
+  // paths drive it through `register` / `schedule` / `resetAttempts` /
+  // `cancelAllTimers` / `clear`.
 
   /** Sum of in-flight requests across every connected client. */
   private totalInFlight(): number {
