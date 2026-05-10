@@ -75,12 +75,13 @@ describe('integration: subscription catch-up across suspend / resume', () => {
 
       await waitFor(() => headers.some((h) => h.height >= heightBefore + 3), {
         label: 'headers caught up',
-        // CI is slow: ElectrumX 1.18 has ~1s response padding per call,
-        // bitcoind→ElectrumX poll interval is 2-5s, plus the implicit
-        // handshake + restoreOrphans round-trips on resume. 25s gives
-        // headroom over the ~7s local-machine baseline without leaking
-        // into the test's 30s budget.
-        timeoutMs: 25_000,
+        // CI is consistently slower than local: ElectrumX 1.18 has ~1s
+        // response padding per call, bitcoind→ElectrumX poll interval
+        // is 2-5s, plus the implicit handshake + restoreOrphans
+        // round-trips on resume. Local-machine baseline is ~7s; CI has
+        // variably hit 26s+ after the suite grew. 40s gives headroom
+        // and keeps within the test's 60s budget.
+        timeoutMs: 40_000,
       });
 
       // The restore event always fires (with drift true OR false depending
@@ -91,5 +92,5 @@ describe('integration: subscription catch-up across suspend / resume', () => {
     } finally {
       await manager.stop();
     }
-  }, 30_000);
+  }, 60_000);
 });
