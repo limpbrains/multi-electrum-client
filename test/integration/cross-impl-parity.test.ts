@@ -92,4 +92,52 @@ describe.each(IMPLS)('integration: cross-impl parity — $name', (impl) => {
       await manager.stop();
     }
   });
+
+  it('transaction.idFromPos returns a 64-char hex txid for the regtest coinbase', async () => {
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [impl.spec],
+      policy: failover([impl.spec.id]),
+      autoBatch: false,
+      requestTimeoutMs: 4000,
+    });
+    try {
+      await manager.start();
+      // `bitcoind-init` mines block 1 with one coinbase tx; pos 0
+      // always resolves on regtest. Use height 1 not 0 — genesis is a
+      // special case in some indexers (electrs).
+      const txid = await manager.transaction.idFromPos(1, 0);
+      expect(typeof txid).toBe('string');
+      expect(txid).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      await manager.stop();
+    }
+  });
+
+  it('mempool.getFeeHistogram returns an array of [fee, vsize] pairs', async () => {
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [impl.spec],
+      policy: failover([impl.spec.id]),
+      autoBatch: false,
+      requestTimeoutMs: 4000,
+    });
+    try {
+      await manager.start();
+      const hist = await manager.mempool.getFeeHistogram();
+      // Empty mempool on a fresh regtest is `[]`. With txs, every entry
+      // is a 2-tuple of finite numbers.
+      expect(Array.isArray(hist)).toBe(true);
+      for (const entry of hist) {
+        expect(Array.isArray(entry)).toBe(true);
+        expect(entry).toHaveLength(2);
+        expect(typeof entry[0]).toBe('number');
+        expect(typeof entry[1]).toBe('number');
+        expect(Number.isFinite(entry[0])).toBe(true);
+        expect(Number.isFinite(entry[1])).toBe(true);
+      }
+    } finally {
+      await manager.stop();
+    }
+  });
 });

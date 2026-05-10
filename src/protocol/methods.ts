@@ -15,6 +15,7 @@ import type {
   Balance,
   BlockHeader,
   FeeEstimate,
+  FeeHistogram,
   HistoryEntry,
   MerkleProof,
   RawTxHex,
@@ -73,6 +74,24 @@ export interface Methods {
     readonly [txid: TxId, height: number],
     MerkleProof
   >;
+  /**
+   * Reverse lookup: txid at a given block position. Wire arity is
+   * always 3 — `merkle=false` is required (electrs rejects 2-arg
+   * calls with `"invalid params"`).
+   *
+   * Result is a union: ElectrumX / Fulcrum return a bare string, but
+   * electrs ≥ 0.11 envelopes it as `{tx_id}`. The
+   * `manager.transaction.idFromPos(...)` namespace wrapper unwraps so
+   * callers see `Promise<TxId>` uniformly; raw `manager.call`
+   * consumers must narrow.
+   *
+   * For the merkle-bundled form (`{tx_hash, merkle: [...]}`) call
+   * `manager.call(method, [h, p, true])` with your own typing.
+   */
+  'blockchain.transaction.id_from_pos': MethodSpec<
+    readonly [height: number, txPos: number, merkle: false],
+    TxId | { readonly tx_id: TxId }
+  >;
 
   // blockchain.headers.*
   'blockchain.headers.subscribe': MethodSpec<readonly [], BlockHeader>;
@@ -80,6 +99,9 @@ export interface Methods {
 
   // blockchain.estimatefee
   'blockchain.estimatefee': MethodSpec<readonly [confirmationTarget: number], FeeEstimate>;
+
+  // mempool.*
+  'mempool.get_fee_histogram': MethodSpec<readonly [], FeeHistogram>;
 }
 
 export type MethodName = keyof Methods;
@@ -104,9 +126,11 @@ export const methodNames = [
   'blockchain.transaction.get',
   'blockchain.transaction.broadcast',
   'blockchain.transaction.get_merkle',
+  'blockchain.transaction.id_from_pos',
   'blockchain.headers.subscribe',
   'blockchain.block.header',
   'blockchain.estimatefee',
+  'mempool.get_fee_histogram',
 ] as const satisfies readonly MethodName[];
 
 export type MethodNames = typeof methodNames;

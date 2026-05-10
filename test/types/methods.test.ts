@@ -19,6 +19,7 @@ import type {
   Balance,
   BlockHeader,
   FeeEstimate,
+  FeeHistogram,
   HistoryEntry,
   MerkleProof,
   RawTxHex,
@@ -59,6 +60,14 @@ function _typeAssertions(): void {
   >();
   expectTypeOf(m.call('blockchain.headers.subscribe', [])).toEqualTypeOf<Promise<BlockHeader>>();
   expectTypeOf(m.call('blockchain.estimatefee', [6])).toEqualTypeOf<Promise<FeeEstimate>>();
+  // Result is a union: ElectrumX / Fulcrum return bare TxId; electrs
+  // wraps as `{tx_id}`. Namespace wrapper `m.transaction.idFromPos`
+  // unwraps to `Promise<TxId>` (asserted further down).
+  expectTypeOf(m.call('blockchain.transaction.id_from_pos', [100, 0, false])).toEqualTypeOf<
+    Promise<TxId | { readonly tx_id: TxId }>
+  >();
+  expectTypeOf(m.call('mempool.get_fee_histogram', [])).toEqualTypeOf<Promise<FeeHistogram>>();
+  expectTypeOf(m.call('mempool.get_fee_histogram')).toEqualTypeOf<Promise<FeeHistogram>>();
   expectTypeOf(m.call('server.version', ['client', '1.4'])).toEqualTypeOf<Promise<ServerVersion>>();
   expectTypeOf(m.call('server.ping', [])).toEqualTypeOf<Promise<null>>();
 
@@ -109,6 +118,8 @@ function _typeAssertions(): void {
   expectTypeOf(m.server.banner()).toEqualTypeOf<Promise<string>>();
 
   expectTypeOf(m.estimateFee(6)).toEqualTypeOf<Promise<FeeEstimate>>();
+  expectTypeOf(m.transaction.idFromPos(100, 0)).toEqualTypeOf<Promise<TxId>>();
+  expectTypeOf(m.mempool.getFeeHistogram()).toEqualTypeOf<Promise<FeeHistogram>>();
 
   // --- @ts-expect-error: bad namespace args ---
 

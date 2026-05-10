@@ -776,6 +776,30 @@ export class ElectrumManager {
       this.call('blockchain.transaction.broadcast', [rawTx], opts),
     getMerkle: (txid: TxId, height: number, opts?: CallOpts) =>
       this.call('blockchain.transaction.get_merkle', [txid, height], opts),
+    /**
+     * Reverse lookup: txid at `txPos` in the block at `height`. Useful for
+     * chasing the txid of a position-encoded reference (e.g. some SPV
+     * proof formats). Non-merkle form — for the merkle-bundled variant
+     * call `manager.call(..., [height, pos, true])` directly.
+     *
+     * Wire-shape quirks normalized here:
+     *  - electrs rejects the 2-arg form as `"invalid params"`, so we
+     *    always send `merkle=false` as the 3rd arg.
+     *  - electrs ≥ 0.11 returns `{tx_id: string}` instead of a bare
+     *    string for the non-merkle form. We unwrap so callers across
+     *    every server impl see `Promise<TxId>`.
+     */
+    idFromPos: async (height: number, txPos: number, opts?: CallOpts): Promise<TxId> => {
+      const r = await this.call('blockchain.transaction.id_from_pos', [height, txPos, false], opts);
+      if (typeof r === 'string') return r;
+      // electrs envelope: { tx_id: "..." }
+      if (r && typeof r === 'object' && 'tx_id' in r && typeof r.tx_id === 'string') {
+        return r.tx_id;
+      }
+      throw new ProtocolError(
+        `blockchain.transaction.id_from_pos: unexpected result shape ${JSON.stringify(r)}`,
+      );
+    },
   };
 
   readonly headers = {
@@ -817,6 +841,17 @@ export class ElectrumManager {
   estimateFee(confirmationTarget: number, opts?: CallOpts) {
     return this.call('blockchain.estimatefee', [confirmationTarget], opts);
   }
+
+  readonly mempool = {
+    /**
+     * Fetch the server's mempool fee histogram. Returns `[[feeSatVb,
+     * vsize], ...]` in **descending** fee order; an empty mempool is
+     * `[]`. Wallets walk the array to derive a "next-block" fee from
+     * cumulative `vsize`. Not finality-gated and not cached — mempool
+     * state changes on every block and every broadcast.
+     */
+    getFeeHistogram: (opts?: CallOpts) => this.call('mempool.get_fee_histogram', [], opts),
+  };
 
   /**
    * Run a list of requests; each gets its own routing decision. Returns one
