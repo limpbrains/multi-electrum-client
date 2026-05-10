@@ -58,21 +58,10 @@ describe.each(IMPLS)('integration: cross-impl parity — $name', (impl) => {
     }
   });
 
-  it('server.ping resolves with null', async () => {
-    const manager = new ElectrumManager({
-      network: 'regtest',
-      servers: [impl.spec],
-      policy: failover([impl.spec.id]),
-      autoBatch: false,
-      requestTimeoutMs: 4000,
-    });
-    try {
-      await manager.start();
-      expect(await manager.server.ping()).toBeNull();
-    } finally {
-      await manager.stop();
-    }
-  });
+  // server.ping per impl is redundant with the smoke test against
+  // ElectrumX + every other parity test reaching `manager.start()`
+  // against Fulcrum/electrs. Dropped to keep the integration suite
+  // tight.
 
   it('headers.getTip returns a 80-byte block header', async () => {
     const manager = new ElectrumManager({
@@ -136,6 +125,35 @@ describe.each(IMPLS)('integration: cross-impl parity — $name', (impl) => {
         expect(Number.isFinite(entry[0])).toBe(true);
         expect(Number.isFinite(entry[1])).toBe(true);
       }
+    } finally {
+      await manager.stop();
+    }
+  });
+
+  it('scripthash.subscribe returns initial status (null for never-seen) and unsubscribe resolves', async () => {
+    // Subscriptions are the most divergent surface across server impls
+    // (initial-status timing, scriptpubkey indexing, retention), so
+    // exercising the full registry+wire round-trip per impl is worth
+    // its own test. We pick a never-seen scripthash so initial status
+    // is reliably `null` on every impl.
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [impl.spec],
+      policy: failover([impl.spec.id]),
+      autoBatch: false,
+      requestTimeoutMs: 4000,
+    });
+    try {
+      await manager.start();
+      const SCRIPTHASH = 'a'.repeat(64);
+      const seen: Array<unknown> = [];
+      const unsub = await manager.scripthash.subscribe(SCRIPTHASH, (status) => {
+        seen.push(status);
+      });
+      // Initial-status handler fires synchronously inside `subscribe`.
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toBeNull(); // never-seen address → null status across all impls
+      await unsub(); // last-handler unsubscribe must resolve cleanly
     } finally {
       await manager.stop();
     }

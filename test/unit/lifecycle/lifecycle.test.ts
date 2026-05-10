@@ -126,23 +126,9 @@ describe('Manager lifecycle — suspend / resume', () => {
     await manager.stop();
   });
 
-  it('idempotent: suspend while suspended is a no-op', async () => {
-    const h = buildHarness();
-    const manager = new ElectrumManager({
-      network: 'regtest',
-      servers: SERVERS,
-      policy: failover(['a']),
-      transportFactory: h.factory,
-      autoBatch: false,
-    });
-    await manager.start();
-    await manager.suspend({ graceMs: 0 });
-    expect(manager.state).toBe('suspended');
-    await manager.suspend({ graceMs: 0 });
-    expect(manager.state).toBe('suspended');
-    await manager.resume();
-    await manager.stop();
-  });
+  // Idempotency on the same target state is the trivial corollary of
+  // the FIFO chain semantics — covered by the `3-transition stack`
+  // and the cross-direction tests below. No separate test for it here.
 
   it('idempotent: resume while running is a no-op', async () => {
     const h = buildHarness();
@@ -239,22 +225,10 @@ describe('Manager lifecycle — suspend / resume', () => {
     await manager.stop();
   });
 
-  it('overlapping suspend()s collapse onto the same in-flight transition', async () => {
-    const h = buildHarness();
-    const manager = new ElectrumManager({
-      network: 'regtest',
-      servers: SERVERS,
-      policy: failover(['a']),
-      transportFactory: h.factory,
-      autoBatch: false,
-    });
-    await manager.start();
-    // Both suspends should settle without throwing; second observes
-    // 'suspending' and bails idempotent.
-    await Promise.all([manager.suspend({ graceMs: 0 }), manager.suspend({ graceMs: 0 })]);
-    expect(manager.state).toBe('suspended');
-    await manager.stop();
-  });
+  // Two parallel suspends collapsing onto a single transition is a
+  // sub-case of `concurrent suspend()s share the same in-flight
+  // transition promise` further down (which adds an in-flight call to
+  // exercise the grace window). Single test suffices.
 
   it('tipUnsub is reset on suspend so resume re-installs a fresh headers sub', async () => {
     const h = buildHarness();

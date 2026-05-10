@@ -15,7 +15,14 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { ElectrumManager, failover, type BlockHeader, type ServerSpec } from '../../src/index.js';
+import {
+  ElectrumManager,
+  failover,
+  RpcError,
+  TransportError,
+  type BlockHeader,
+  type ServerSpec,
+} from '../../src/index.js';
 
 import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
 import { getBlockCount, mineBlocks } from './helpers/regtestRpc.js';
@@ -86,6 +93,15 @@ describe('integration: auto-reconnect on transport fault', () => {
       });
 
       expect(restored).toContain('blockchain.headers.subscribe');
+
+      // Errors during a forced disconnect are expected (TransportError
+      // for the dropped in-flight, RpcError if a reconnect attempt
+      // races the proxy re-enable). What we DON'T want is anything
+      // else surfacing as a manager `error` event during the cycle.
+      const unexpected = errors.filter(
+        (e) => !(e instanceof TransportError) && !(e instanceof RpcError),
+      );
+      expect(unexpected).toEqual([]);
 
       await unsub();
     } finally {

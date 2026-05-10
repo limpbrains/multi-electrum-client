@@ -62,14 +62,16 @@ describe('integration: ban detection on Fulcrum with tight max_subs_per_ip', () 
       // the future across the rest of the test no matter how slow CI
       // runs. We don't assert on expiry; only on detection.
       cooldownMs: 60_000,
-      // Disable rapid reconnect for the duration so a transport blip
-      // doesn't reset Fulcrum's per-IP subscribe counter mid-burst.
-      // Use 120s — decoupled from the 60s test timeout so the timer
-      // CAN'T fire near the deadline (Fulcrum closes the socket on
-      // some over-cap responses; a reconnect timer firing right at
-      // 60s would race the test's cleanup). `manager.stop()` clears
+      // Disable rapid reconnect for the duration. The minMs is set to
+      // 1 day — far beyond any plausible test runtime — so the timer
+      // never fires regardless of CI load. `manager.stop()` clears
       // the pending timer in the finally block so this doesn't leak.
-      reconnectBackoff: { minMs: 120_000, maxMs: 120_000, factor: 2, jitter: 0 },
+      reconnectBackoff: {
+        minMs: 24 * 60 * 60 * 1000,
+        maxMs: 24 * 60 * 60 * 1000,
+        factor: 2,
+        jitter: 0,
+      },
     });
     manager.on('client-banned', (e) =>
       banned.push({ clientId: e.clientId, reason: e.reason, until: e.until }),
@@ -116,6 +118,12 @@ describe('integration: ban detection on Fulcrum with tight max_subs_per_ip', () 
       // A fresh call resolves: failover routes around the banned client
       // to `default`, which is healthy.
       expect(await manager.server.ping()).toBeNull();
+
+      // Rate-limit responses are caught + classified; no `error` event
+      // should fire (those are reserved for unhandled paths). If this
+      // ever blows up, look for cache adapter / classifier
+      // regressions surfacing through the burst.
+      expect(errors).toEqual([]);
     } finally {
       await manager.stop();
     }
