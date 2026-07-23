@@ -12,7 +12,7 @@ export const PORTS = {
   fulcrumStrictTcp: Number(process.env['FULCRUM_STRICT_TCP_PORT'] ?? '50102'),
   electrsTcp: Number(process.env['ELECTRS_TCP_PORT'] ?? '50201'),
   toxiproxyAdmin: Number(process.env['TOXIPROXY_PORT'] ?? '8474'),
-  toxiproxyElectrumxTcp: Number(process.env['TOXI_ELECTRUMX_TCP_PORT'] ?? '60001'),
-  toxiproxyFulcrumTcp: Number(process.env['TOXI_FULCRUM_TCP_PORT'] ?? '60101'),
-  toxiproxyElectrsTcp: Number(process.env['TOXI_ELECTRS_TCP_PORT'] ?? '60201'),
+  toxiproxyElectrumxTcp: Number(process.env['TOXI_ELECTRUMX_TCP_PORT'] ?? '52001'),
+  toxiproxyFulcrumTcp: Number(process.env['TOXI_FULCRUM_TCP_PORT'] ?? '52101'),
+  toxiproxyElectrsTcp: Number(process.env['TOXI_ELECTRS_TCP_PORT'] ?? '52201'),
 };

@@ -173,9 +173,9 @@ services:
       - ./toxiproxy/config.json:/etc/toxiproxy.json:ro
     ports:
       - '8474:8474' # admin HTTP
-      - '60001:60001' # electrumx-tcp lane
-      - '60101:60101' # fulcrum-tcp lane
-      - '60201:60201' # electrs-tcp lane
+      - '52001:52001' # electrumx-tcp lane
+      - '52101:52101' # fulcrum-tcp lane
+      - '52201:52201' # electrs-tcp lane
     # No healthcheck: the toxiproxy image is scratch-based and ships only
     # the `toxiproxy-server` binary — nothing to drive a `bash` / `python`
     # / `curl` probe with. No other service gates on toxiproxy; CI's `up

@@ -1,6 +1,6 @@
 // Failover under live transport faults. The compose stack exposes the same
 // ElectrumX backend on two routes: a direct lane (:50001) and a toxiproxy
-// lane (:60001). Register both as separate clients, kill the toxiproxy
+// lane (:52001). Register both as separate clients, kill the toxiproxy
 // lane mid-test via the admin API, and verify the manager transparently
 // routes around it.
 //
