@@ -191,6 +191,20 @@ Runnable snippets in [`examples/`](examples/):
 - [`browser-basic.html`](examples/browser-basic.html) — `wss` only, `visibilitychange` → `suspend` / `resume`.
 - [`rn-basic.tsx`](examples/rn-basic.tsx) — React Native, `bindAppState`, headers subscription.
 
+### Interactive demo
+
+A small web app ([`examples/demo`](examples/demo)) that connects to all
+three local electrum servers (ElectrumX, Fulcrum, electrs) through
+ws↔tcp bridges and visualizes live routing: packets flying per policy
+decision, per-server telemetry, a rolling latency chart, policy
+hot-swapping, lane cutting / latency injection via toxiproxy, and
+suspend / resume.
+
+```bash
+docker compose -f docker/compose.yml --profile slim --profile demo up -d --wait
+pnpm demo            # then open http://localhost:5173
+```
+
 ## Development
 
 ```bash

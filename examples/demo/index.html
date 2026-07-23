@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>multi-electrum-client — live routing demo</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>multi-electrum-client</h1>
+      <span class="subtitle">live multi-server routing — regtest docker stack</span>
+      <span id="manager-state" class="badge">created</span>
+      <span id="tip" class="tip">tip: —</span>
+      <div class="spacer"></div>
+      <label>
+        policy
+        <select id="policy">
+          <option value="roundRobin">roundRobin</option>
+          <option value="preferFastest">preferFastest (20%)</option>
+          <option value="failover">failover (electrumx first)</option>
+        </select>
+      </label>
+      <label>
+        traffic <span id="rate-label">2/s</span>
+        <input id="rate" type="range" min="0" max="10" step="1" value="2" />
+      </label>
+      <button id="suspend">suspend</button>
+      <button id="mine">mine block ⛏</button>
+    </header>
+
+    <main>
+      <section id="viz">
+        <svg id="lanes"></svg>
+        <div id="browser-node">
+          <div class="node-icon">🌐</div>
+          <div>browser</div>
+          <div id="browser-sub" class="mono small">manager</div>
+        </div>
+        <div id="cards"></div>
+      </section>
+
+      <section id="chart-wrap">
+        <h2>latency, last 60 s <span class="small">(successful calls, per server)</span></h2>
+        <canvas id="chart" height="160"></canvas>
+      </section>
+
+      <section id="log-wrap">
+        <h2>events</h2>
+        <div id="log"></div>
+      </section>
+    </main>
+
+    <template id="card-template">
+      <div class="card">
+        <div class="card-head">
+          <span class="dot"></span>
+          <span class="name"></span>
+          <span class="state badge">disconnected</span>
+        </div>
+        <div class="stats mono">
+          <span data-k="ema">ema —</span>
+          <span data-k="p50">p50 —</span>
+          <span data-k="p95">p95 —</span>
+          <span data-k="ok">ok 0</span>
+          <span data-k="err">err 0%</span>
+          <span data-k="inflight">inflight 0</span>
+        </div>
+        <div class="controls">
+          <button data-k="toggle">disconnect</button>
+          <button data-k="cut">cut lane</button>
+          <label class="small">
+            +lag <span data-k="lag-label">0</span>ms
+            <input data-k="lag" type="range" min="0" max="2000" step="100" value="0" />
+          </label>
+        </div>
+      </div>
+    </template>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -41,7 +41,7 @@ export default [
     // options for the examples folder so lint passes without the type-aware
     // rules that need a project. RN example depends on react / react-native
     // types we don't ship as devDeps — skip it in lint too.
-    files: ['examples/**/*.ts', 'examples/**/*.tsx'],
+    files: ['examples/**/*.ts', 'examples/**/*.tsx', 'docker/wsbridge/*.ts'],
     languageOptions: {
       parserOptions: {
         project: null,
