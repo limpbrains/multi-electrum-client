@@ -32,7 +32,7 @@ export default [
     },
   },
   {
-    ignores: ['dist/**', 'coverage/**', 'node_modules/**', '*.config.js'],
+    ignores: ['dist/**', 'coverage/**', 'node_modules/**', '*.config.js', 'test/rn/app/**'],
   },
   {
     // Examples now participate in `pnpm typecheck` via tsconfig.examples.json,

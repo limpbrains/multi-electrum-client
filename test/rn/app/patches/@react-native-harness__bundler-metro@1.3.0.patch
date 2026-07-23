@@ -1,0 +1,22 @@
+diff --git a/dist/getHarnessSerializer.js b/dist/getHarnessSerializer.js
+index 7d339daf2b0f4373ad76e98eed2d5fff2e0a2314..52851239a7c0601e9a18888a42d7bea8fa7b6c72 100644
+--- a/dist/getHarnessSerializer.js
++++ b/dist/getHarnessSerializer.js
+@@ -1,11 +1,14 @@
+ import { createRequire } from 'node:module';
+ const require = createRequire(import.meta.url);
++// Metro compiles these modules with Babel, so depending on the Metro
++// version they export the function directly or as exports.default.
++const interopDefault = (mod) => (mod && mod.__esModule && mod.default ? mod.default : mod);
+ const getBaseSerializer = () => {
+-    const baseJSBundle = require('metro/private/DeltaBundler/Serializers/baseJSBundle');
+-    const bundleToString = require('metro/private/lib/bundleToString');
++    const baseJSBundle = interopDefault(require('metro/private/DeltaBundler/Serializers/baseJSBundle'));
++    const bundleToString = interopDefault(require('metro/private/lib/bundleToString'));
+     return (entryPoint, prepend, graph, bundleOptions) => bundleToString(baseJSBundle(entryPoint, prepend, graph, bundleOptions));
+ };
+-const getAllFiles = require('metro/private/DeltaBundler/Serializers/getAllFiles');
++const getAllFiles = interopDefault(require('metro/private/DeltaBundler/Serializers/getAllFiles'));
+ export const getHarnessSerializer = () => {
+     const baseSerializer = getBaseSerializer();
+     let mainEntryPointModules = new Set();
