@@ -191,6 +191,25 @@ describe('ElectrumClient', () => {
     expect(notifications).toBe(1);
   });
 
+  it('reports malformed frames via onProtocolError and keeps the stream alive', async () => {
+    const transport = new MockTransport();
+    const client = new ElectrumClient({ id: 'a', endpoint: transport.endpoint, transport });
+    const seen: Error[] = [];
+    client.onProtocolError((e) => seen.push(e));
+    await client.connect();
+
+    transport.pushFromServer('this is not json');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.name).toBe('ProtocolError');
+
+    // Stream survives: a valid response after the garbage still resolves.
+    const p = client.call('server.ping', []);
+    await delay(0);
+    const id = JSON.parse(transport.sent[0]!).id;
+    transport.pushFromServer(`{"jsonrpc":"2.0","id":${id},"result":null}`);
+    expect(await p).toBe(null);
+  });
+
   it('disconnect closes transport and rejects pending', async () => {
     const transport = new MockTransport();
     const client = new ElectrumClient({ id: 'a', endpoint: transport.endpoint, transport });

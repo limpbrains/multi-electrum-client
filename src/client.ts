@@ -10,7 +10,7 @@
 // Manager can compose a ClientView snapshot for the RoutingPolicy.
 
 import type { ErrorKind } from './errors/types.js';
-import { RpcError, TimeoutError, TransportError } from './errors/types.js';
+import { ProtocolError, RpcError, TimeoutError, TransportError } from './errors/types.js';
 import {
   decodeMessage,
   encodeBatch,
@@ -91,6 +91,7 @@ export class ElectrumClient {
   private connectedAt: number | undefined;
   private notifListener: ((n: JsonRpcNotification) => void) | undefined;
   private stateListener: ((state: ConnectionState) => void) | undefined;
+  private protocolErrorListener: ((e: ProtocolError) => void) | undefined;
   private detachTransport: (() => void) | undefined;
 
   constructor(opts: ElectrumClientOpts) {
@@ -205,6 +206,18 @@ export class ElectrumClient {
   }
 
   /**
+   * Set the listener for malformed inbound frames (one per client). Fired
+   * when a line from the server fails JSON-RPC decoding. The connection
+   * stays up — framing is line-delimited, so the next line usually parses
+   * fine; the Manager uses this to record a `protocol` error against the
+   * client's telemetry so routing policies see the real cause instead of
+   * the eventual request timeout.
+   */
+  onProtocolError(listener: (e: ProtocolError) => void): void {
+    this.protocolErrorListener = listener;
+  }
+
+  /**
    * Set a listener fired on every state transition. Used by Manager to drive
    * SubscriptionRegistry rebinds when a client connects / disconnects.
    * Replaces the previous listener if called twice.
@@ -265,10 +278,18 @@ export class ElectrumClient {
     let msgs: JsonRpcMessage | JsonRpcMessage[];
     try {
       msgs = decodeMessage(ev.text);
-    } catch {
-      // TODO(M4): forward to ErrorClassifier as a 'protocol' error against
-      // this client. For M1 we silently drop so a misbehaving server can't
-      // take the whole client down.
+    } catch (e) {
+      // Malformed frame. Keep the connection alive — a misbehaving server
+      // must not take the whole client down, and the next line usually
+      // parses fine. Surface to the listener instead of dropping silently;
+      // the in-flight request this frame answered (if any) falls back to
+      // its per-request timeout.
+      const err = e instanceof ProtocolError ? e : new ProtocolError(String(e));
+      try {
+        this.protocolErrorListener?.(err);
+      } catch {
+        // Listener errors must not break the read path.
+      }
       return;
     }
     if (Array.isArray(msgs)) {

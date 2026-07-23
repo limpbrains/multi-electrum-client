@@ -58,6 +58,32 @@ describe('ElectrumManager — basic call routing', () => {
     await manager.stop();
   });
 
+  it('records a protocol error in telemetry when a server sends a malformed frame', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    const errors: unknown[] = [];
+    manager.on('error', (e) => errors.push(e));
+    await manager.start();
+
+    h.transports.get('a')!.pushFromServer('garbage not json');
+
+    const a = manager.getClientViews().find((v) => v.id === 'a')!;
+    expect(a.telemetry.errors.lastKind).toBe('protocol');
+    expect(a.telemetry.errors.consecutive).toBe(1);
+    // Latency stats untouched — no zero sample dragging the EMA down.
+    expect(a.telemetry.latency.samples).toBe(0);
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).name).toBe('ProtocolError');
+
+    await manager.stop();
+  });
+
   it('recovers when policy returns a stale id (client no longer in pool)', async () => {
     const h = buildHarness();
     let calls = 0;

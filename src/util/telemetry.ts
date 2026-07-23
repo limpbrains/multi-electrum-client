@@ -38,6 +38,19 @@ export class TelemetryAccumulator {
     this.consecutiveErrors++;
   }
 
+  /**
+   * Record an error that has no associated request latency (e.g. a
+   * malformed inbound frame). Updates counts / lastKind / consecutive but
+   * leaves the latency EMA and percentile samples untouched — a zero
+   * sample would drag the EMA down and make a broken server look fast.
+   */
+  recordErrorNoLatency(kind: ErrorKind, now: number): void {
+    this.errorCount++;
+    this.lastErrorKind = kind;
+    this.lastErrorAt = now;
+    this.consecutiveErrors++;
+  }
+
   latency(): Telemetry['latency'] {
     if (this.samples.length === 0) {
       return { ema: 0, p50: 0, p95: 0, samples: 0 };

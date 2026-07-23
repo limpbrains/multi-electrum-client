@@ -924,6 +924,17 @@ export class ElectrumManager {
         this.emit('error', e);
       }
     });
+    client.onProtocolError((e) => {
+      // Malformed frame from this server. Classify (default: 'protocol')
+      // and record against the client's telemetry so routing policies see
+      // the real cause instead of the eventual request timeout, then
+      // surface for observability. Not routed through `recordError`: a
+      // decode failure is not a request outcome (no latency, no
+      // `policy.onOutcome`, no ban bookkeeping).
+      const kind = this.classifyFor(spec.id, '<decode>', e, 0);
+      this.meta.get(spec.id)?.telemetry.recordErrorNoLatency(kind, Date.now());
+      this.emit('error', e);
+    });
     client.onStateChange((state) => {
       this.emit('client-state', { clientId: spec.id, state });
       if (state === 'connected') {
