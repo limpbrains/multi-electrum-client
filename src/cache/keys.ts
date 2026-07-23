@@ -72,7 +72,8 @@ const CACHEABLE: Record<string, CacheExtractor> = {
  * not cacheable. Manager calls this once per request before enqueuing.
  */
 export function cacheSpec(method: string, params: readonly unknown[]): CacheableSpec | null {
-  const extract = CACHEABLE[method];
-  if (!extract) return null;
-  return extract(params);
+  // `method` is caller-controlled: hasOwn guard keeps prototype keys
+  // ('constructor', 'toString', …) from resolving to inherited functions.
+  if (!Object.hasOwn(CACHEABLE, method)) return null;
+  return CACHEABLE[method]!(params);
 }

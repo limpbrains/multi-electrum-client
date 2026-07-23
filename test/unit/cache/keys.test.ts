@@ -44,4 +44,10 @@ describe('cacheSpec', () => {
     expect(cacheSpec('blockchain.transaction.get', ['txid'])).toBeNull();
     expect(cacheSpec('server.ping', [])).toBeNull();
   });
+
+  it('returns null for prototype-key method names', () => {
+    expect(cacheSpec('constructor', [1])).toBeNull();
+    expect(cacheSpec('toString', [])).toBeNull();
+    expect(cacheSpec('hasOwnProperty', ['x'])).toBeNull();
+  });
 });

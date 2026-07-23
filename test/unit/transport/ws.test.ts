@@ -99,6 +99,38 @@ describe('WsTransport', () => {
     expect(datas).toEqual(['{"id":1,"result":"ok"}']);
   });
 
+  it('drops a stale partial line when reconnecting on the same transport', async () => {
+    let connections = 0;
+    srv.server.on('connection', (sock) => {
+      connections++;
+      if (connections === 1) {
+        // Partial line, never completed — must not leak into the next connection.
+        sock.send('{"id":1,"resu');
+      } else {
+        sock.send('{"id":2,"result":"fresh"}\n');
+      }
+    });
+
+    const transport = new WsTransport({
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
+      WebSocket: WebSocketCtor,
+    });
+
+    const datas: string[] = [];
+    transport.on((ev) => {
+      if (ev.type === 'data') datas.push(ev.text);
+    });
+
+    await transport.connect();
+    await delay(30);
+    await transport.close();
+    await transport.connect();
+    await delay(30);
+    await transport.close();
+
+    expect(datas).toEqual(['{"id":2,"result":"fresh"}']);
+  });
+
   it('rejects send before connect', async () => {
     const transport = new WsTransport({
       endpoint: { host: HOST, port: srv.port, protocol: 'ws' },

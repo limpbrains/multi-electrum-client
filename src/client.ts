@@ -244,6 +244,11 @@ export class ElectrumClient {
   private handle(ev: TransportEvent): void {
     if (ev.type === 'close') {
       this.connectedAt = undefined;
+      // Detach from the transport now: the next connect() attaches a fresh
+      // listener, and leaving this one bound would accumulate one duplicate
+      // handler per reconnect cycle (notifications dispatched N times).
+      this.detachTransport?.();
+      this.detachTransport = undefined;
       const reason =
         ev.code !== undefined
           ? `socket closed (code=${ev.code}${ev.reason ? `, reason=${ev.reason}` : ''})`

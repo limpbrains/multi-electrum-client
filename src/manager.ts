@@ -229,6 +229,14 @@ export class ElectrumManager {
     }
     this.stopped = false;
     this.lifecycle = 'running';
+    // Re-arm auto-reconnect for every installed client. A prior stop()
+    // ran `reconnect.clear()`, which drops the per-client `wants` flags;
+    // without re-registering, a manager restarted after stop() would
+    // never auto-reconnect. Harmless on first start (register resets
+    // the attempt counter, which is already 0).
+    for (const id of this.clients.keys()) {
+      this.reconnect.register(id);
+    }
     const tasks = [...this.clients.values()].map(async (c) => {
       try {
         await c.connect();
@@ -238,25 +246,39 @@ export class ElectrumManager {
     });
     await Promise.all(tasks);
     // If a cache is configured we need a tip to gate finalized writes.
-    // Wire an internal headers subscription whose handler updates
-    // `tipHeight`. Best-effort: errors surface as `error` events, the
-    // cache simply remains read-only until the tip is known.
-    if (this.cache && this.tipUnsub === null) {
-      try {
-        this.tipUnsub = await this.registry.subscribe<BlockHeader>(
-          'blockchain.headers.subscribe',
-          [],
-          (h) => {
-            // Validate at the boundary; an arbitrary registry handler
-            // shape shouldn't be trusted to be a BlockHeader.
-            if (h && typeof (h as BlockHeader).height === 'number') {
-              this.tipHeight = (h as BlockHeader).height;
-            }
-          },
-        );
-      } catch (e) {
-        this.emit('error', e);
-      }
+    await this.installTipSubscription();
+  }
+
+  /**
+   * Wire the internal headers subscription whose handler updates
+   * `tipHeight`. No-op unless a cache is configured and no subscription
+   * is live. Best-effort: errors surface as `error` events, the cache
+   * simply remains read-only until the tip is known.
+   */
+  private async installTipSubscription(): Promise<void> {
+    if (!this.cache || this.tipUnsub !== null) return;
+    try {
+      this.tipUnsub = await this.registry.subscribe<BlockHeader>(
+        'blockchain.headers.subscribe',
+        [],
+        (h) => {
+          // Validate at the boundary; an arbitrary registry handler
+          // shape shouldn't be trusted to be a BlockHeader.
+          if (h && typeof (h as BlockHeader).height === 'number') {
+            this.tipHeight = (h as BlockHeader).height;
+          }
+        },
+      );
+    } catch (e) {
+      this.emit('error', e);
+    }
+  }
+
+  /** Reject and drain every call queued during suspend. */
+  private rejectSuspendQueue(message: string): void {
+    while (this.suspendQueue.length > 0) {
+      const item = this.suspendQueue.shift()!;
+      item.def.reject(new SuspendedError(message));
     }
   }
 
@@ -284,10 +306,7 @@ export class ElectrumManager {
     // safely `await` without try/catch.
     await this.transitionTail;
     // Reject anything queued during a prior suspend so callers don't dangle.
-    while (this.suspendQueue.length > 0) {
-      const item = this.suspendQueue.shift()!;
-      item.def.reject(new SuspendedError('manager stopped before resume'));
-    }
+    this.rejectSuspendQueue('manager stopped before resume');
     this.discovery?.cancelAll();
     // Auto-reconnect off — clear timers + intent flags so a `disconnected`
     // event triggered by our own `c.disconnect()` below doesn't reschedule.
@@ -492,38 +511,18 @@ export class ElectrumManager {
     // earlier `=== 'suspended'` check and doesn't know a concurrent stop()
     // can mutate it across awaits.
     if ((this.lifecycle as LifecycleState) === 'stopped') {
-      while (this.suspendQueue.length > 0) {
-        const item = this.suspendQueue.shift()!;
-        item.def.reject(new SuspendedError('manager stopped during resume'));
-      }
+      this.rejectSuspendQueue('manager stopped during resume');
       return;
     }
     // Re-install the tip subscription if a cache was configured. `tipUnsub`
     // was cleared inside `suspend()`; it should always be `null` here.
-    if (this.cache && this.tipUnsub === null) {
-      try {
-        this.tipUnsub = await this.registry.subscribe<BlockHeader>(
-          'blockchain.headers.subscribe',
-          [],
-          (h) => {
-            if (h && typeof (h as BlockHeader).height === 'number') {
-              this.tipHeight = (h as BlockHeader).height;
-            }
-          },
-        );
-      } catch (e) {
-        this.emit('error', e);
-      }
-    }
+    await this.installTipSubscription();
     // Re-check after the second await for the same race window.
     // Cast through LifecycleState because TS narrows `lifecycle` from the
     // earlier `=== 'suspended'` check and doesn't know a concurrent stop()
     // can mutate it across awaits.
     if ((this.lifecycle as LifecycleState) === 'stopped') {
-      while (this.suspendQueue.length > 0) {
-        const item = this.suspendQueue.shift()!;
-        item.def.reject(new SuspendedError('manager stopped during resume'));
-      }
+      this.rejectSuspendQueue('manager stopped during resume');
       return;
     }
     // Drain order matters: splice the queue while we're still `resuming`

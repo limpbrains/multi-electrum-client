@@ -173,6 +173,24 @@ describe('ElectrumClient', () => {
     await first;
   });
 
+  it('does not accumulate transport listeners across close/reconnect cycles', async () => {
+    const transport = new MockTransport();
+    const client = new ElectrumClient({ id: 'a', endpoint: transport.endpoint, transport });
+    let notifications = 0;
+    client.onNotification(() => notifications++);
+
+    await client.connect();
+    transport.pushClose(1006);
+    await client.connect();
+    transport.pushClose(1006);
+    await client.connect();
+
+    // With a leaked listener per reconnect, this notification would be
+    // dispatched once per surviving listener instead of exactly once.
+    transport.pushFromServer('{"method":"blockchain.headers.subscribe","params":[{"height":1}]}');
+    expect(notifications).toBe(1);
+  });
+
   it('disconnect closes transport and rejects pending', async () => {
     const transport = new MockTransport();
     const client = new ElectrumClient({ id: 'a', endpoint: transport.endpoint, transport });

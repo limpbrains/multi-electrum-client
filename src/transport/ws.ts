@@ -61,6 +61,10 @@ export class WsTransport implements Transport {
   }
 
   async connect(): Promise<void> {
+    // Drop any partial line buffered from a previous connection — stale
+    // bytes would otherwise prepend to the first message on this socket.
+    // (TcpTransport resets in its close handler; WS resets here.)
+    this.framer.reset();
     const scheme = this.endpoint.protocol === 'wss' ? 'wss' : 'ws';
     const path = this.endpoint.path ?? '';
     const url = `${scheme}://${this.endpoint.host}:${this.endpoint.port}${path}`;
