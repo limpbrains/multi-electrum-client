@@ -216,27 +216,24 @@ export class ElectrumManager {
 
   /**
    * Connect every server in parallel. Errors do not throw; they fire
-   * `error` events. Only valid from `created` (fresh manager) or
-   * `stopped` (re-init after a terminal stop). To wake from `suspended`
-   * use `resume()`; calling `start()` instead would re-install the
-   * tip subscription on top of a live one and skip queue draining.
+   * `error` events. Only valid from `created` (fresh manager). `stop()`
+   * is terminal — restarting a stopped manager throws; construct a new
+   * instance instead. To wake from `suspended` use `resume()`; calling
+   * `start()` instead would re-install the tip subscription on top of a
+   * live one and skip queue draining.
    */
   async start(): Promise<void> {
-    if (this.lifecycle !== 'created' && this.lifecycle !== 'stopped') {
+    if (this.lifecycle === 'stopped') {
+      throw new SuspendedError(
+        'manager is stopped — construct a new ElectrumManager; use suspend()/resume() to pause',
+      );
+    }
+    if (this.lifecycle !== 'created') {
       throw new SuspendedError(
         `cannot start from ${this.lifecycle}; use resume() to wake a suspended manager`,
       );
     }
-    this.stopped = false;
     this.lifecycle = 'running';
-    // Re-arm auto-reconnect for every installed client. A prior stop()
-    // ran `reconnect.clear()`, which drops the per-client `wants` flags;
-    // without re-registering, a manager restarted after stop() would
-    // never auto-reconnect. Harmless on first start (register resets
-    // the attempt counter, which is already 0).
-    for (const id of this.clients.keys()) {
-      this.reconnect.register(id);
-    }
     const tasks = [...this.clients.values()].map(async (c) => {
       try {
         await c.connect();
@@ -283,7 +280,10 @@ export class ElectrumManager {
   }
 
   /**
-   * Disconnect every server and drop all subscriptions. Terminal.
+   * Disconnect every server and drop all subscriptions. Terminal — a
+   * stopped manager cannot be restarted (`start()` throws); construct a
+   * new `ElectrumManager` instead. For a pause that preserves
+   * subscriptions and event listeners, use `suspend()` / `resume()`.
    *
    * Awaits the FIFO transition tail before tearing down — any
    * already-queued suspend / resume calls observe `lifecycle === 'stopped'`

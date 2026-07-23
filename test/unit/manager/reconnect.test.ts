@@ -278,35 +278,4 @@ describe('ElectrumManager — auto-reconnect', () => {
     await manager.stop();
   });
 
-  it('re-arms auto-reconnect on start() after a terminal stop()', async () => {
-    const h = buildHarness();
-    const manager = new ElectrumManager({
-      network: 'regtest',
-      servers: SERVERS,
-      policy: failover(['a']),
-      transportFactory: h.factory,
-      autoBatch: false,
-      reconnectBackoff: { minMs: 100, maxMs: 5000, factor: 2, jitter: 0 },
-    });
-    let startP = manager.start();
-    await flush();
-    await startP;
-    const t = h.transports.get('a')!;
-    expect(t.connectCalls).toBe(1);
-
-    await manager.stop();
-    // stop() ran reconnect.clear(); start() must re-register every client.
-    startP = manager.start();
-    await flush();
-    await startP;
-    expect(t.connectCalls).toBe(2);
-
-    t.pushClose(1006);
-    await flush();
-    await vi.advanceTimersByTimeAsync(100);
-    await flush();
-    expect(t.connectCalls).toBe(3);
-
-    await manager.stop();
-  });
 });

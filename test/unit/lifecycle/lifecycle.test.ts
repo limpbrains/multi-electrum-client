@@ -145,6 +145,22 @@ describe('Manager lifecycle — suspend / resume', () => {
     await manager.stop();
   });
 
+  it('start() on a stopped manager throws — stop is terminal', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.stop();
+    await expect(manager.start()).rejects.toBeInstanceOf(SuspendedError);
+    await expect(manager.start()).rejects.toThrow(/construct a new ElectrumManager/);
+    expect(manager.state).toBe('stopped');
+  });
+
   it('rejects suspend / resume on a stopped manager', async () => {
     const h = buildHarness();
     const manager = new ElectrumManager({
@@ -295,22 +311,6 @@ describe('Manager lifecycle — suspend / resume', () => {
     });
     await manager.start();
     await expect(manager.start()).rejects.toBeInstanceOf(SuspendedError);
-    await manager.stop();
-  });
-
-  it('start() works again after stop (re-init)', async () => {
-    const h = buildHarness();
-    const manager = new ElectrumManager({
-      network: 'regtest',
-      servers: SERVERS,
-      policy: failover(['a']),
-      transportFactory: h.factory,
-      autoBatch: false,
-    });
-    await manager.start();
-    await manager.stop();
-    await manager.start();
-    expect(manager.state).toBe('running');
     await manager.stop();
   });
 
