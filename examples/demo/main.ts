@@ -114,6 +114,18 @@ interface CardRefs {
   fields: Record<string, HTMLElement>;
   toggle: HTMLButtonElement;
   cut: HTMLButtonElement;
+  lag: HTMLInputElement;
+  lagLabel: HTMLElement;
+}
+
+/** UI-side view of each demo toxiproxy lane; synced from the admin API on boot. */
+const laneCut = new Map<string, boolean>();
+
+function setCutUi(id: string, cut: boolean): void {
+  laneCut.set(id, cut);
+  const refs = cards.get(id)!;
+  refs.cut.textContent = cut ? 'restore lane' : 'cut lane';
+  refs.cut.classList.toggle('active', cut);
 }
 
 const cards = new Map<string, CardRefs>();
@@ -137,6 +149,8 @@ for (const s of DEMO_SERVERS) {
     fields,
     toggle: root.querySelector('[data-k="toggle"]')!,
     cut: root.querySelector('[data-k="cut"]')!,
+    lag: root.querySelector('[data-k="lag"]')!,
+    lagLabel: root.querySelector('[data-k="lag-label"]')!,
   };
   cards.set(s.id, refs);
   cardsWrap.appendChild(root);
@@ -157,27 +171,51 @@ for (const s of DEMO_SERVERS) {
   });
 
   // Cut / restore the toxiproxy lane (transport-level fault).
-  let lanesCut = false;
   refs.cut.addEventListener('click', () => {
-    lanesCut = !lanesCut;
-    refs.cut.textContent = lanesCut ? 'restore lane' : 'cut lane';
-    refs.cut.classList.toggle('active', lanesCut);
-    void toxiproxy(`/proxies/${s.proxy}`, 'POST', { enabled: !lanesCut });
-    log(`${s.id}: lane ${lanesCut ? 'CUT' : 'restored'}`, lanesCut ? 'err' : 'good');
+    const cut = !laneCut.get(s.id);
+    setCutUi(s.id, cut);
+    void toxiproxy(`/proxies/${s.proxy}`, 'POST', { enabled: !cut });
+    log(`${s.id}: lane ${cut ? 'CUT' : 'restored'}`, cut ? 'err' : 'good');
   });
 
   // Latency toxic slider.
-  const lag = root.querySelector<HTMLInputElement>('[data-k="lag"]')!;
-  const lagLabel = root.querySelector<HTMLElement>('[data-k="lag-label"]')!;
-  lag.addEventListener('change', () => {
-    const ms = Number(lag.value);
-    lagLabel.textContent = String(ms);
+  refs.lag.addEventListener('change', () => {
+    const ms = Number(refs.lag.value);
+    refs.lagLabel.textContent = String(ms);
     void setLatencyToxic(s.proxy, ms);
     log(`${s.id}: +${ms}ms lane latency`);
   });
-  lag.addEventListener('input', () => {
-    lagLabel.textContent = lag.value;
+  refs.lag.addEventListener('input', () => {
+    refs.lagLabel.textContent = refs.lag.value;
   });
+}
+
+/**
+ * Sync cut buttons and latency sliders with the actual toxiproxy state.
+ * Without this, a page reload after cutting a lane (or leaving a toxic
+ * set) shows controls that disagree with reality.
+ */
+async function syncToxiproxyUi(): Promise<void> {
+  try {
+    const res = await toxiproxy('/proxies', 'GET');
+    if (!res.ok) return;
+    const proxies = (await res.json()) as Record<
+      string,
+      { enabled: boolean; toxics?: Array<{ name: string; attributes?: { latency?: number } }> }
+    >;
+    for (const s of DEMO_SERVERS) {
+      const p = proxies[s.proxy];
+      if (!p) continue;
+      setCutUi(s.id, !p.enabled);
+      const lagMs = p.toxics?.find((t) => t.name === 'demo-latency')?.attributes?.latency ?? 0;
+      const refs = cards.get(s.id)!;
+      refs.lag.value = String(lagMs);
+      refs.lagLabel.textContent = String(lagMs);
+    }
+  } catch {
+    // Toxiproxy unreachable — controls stay at defaults; cut/lag clicks
+    // will surface their own failures in the log.
+  }
 }
 
 async function toxiproxy(path: string, method: string, body?: unknown): Promise<Response> {
@@ -440,6 +478,7 @@ $<HTMLButtonElement>('#mine').addEventListener('click', () => {
 
 void (async () => {
   log('starting manager…');
+  void syncToxiproxyUi();
   await manager.start();
   updateManagerBadge();
   await manager.headers.subscribe((h) => {
@@ -452,4 +491,10 @@ void (async () => {
   });
   applyRate();
   log('running — subscribed to headers');
-})().catch((e: unknown) => log(`boot failed: ${(e as Error).message}`, 'err'));
+})().catch((e: unknown) =>
+  log(
+    `boot failed: ${(e as Error).message} — is the docker stack up? ` +
+      `(docker compose -f docker/compose.yml --profile slim --profile demo up -d --wait)`,
+    'err',
+  ),
+);
