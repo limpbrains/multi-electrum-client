@@ -131,6 +131,30 @@ describe('WsTransport', () => {
     expect(datas).toEqual(['{"id":2,"result":"fresh"}']);
   });
 
+  it('close() during in-flight connect aborts it and rejects the connect promise', async () => {
+    srv.server.on('connection', () => {
+      // accept silently
+    });
+    const transport = new WsTransport({
+      endpoint: { host: HOST, port: srv.port, protocol: 'ws' },
+      WebSocket: WebSocketCtor,
+    });
+    const events: TransportEvent[] = [];
+    transport.on((ev) => events.push(ev));
+
+    const pending = transport.connect();
+    await transport.close();
+    await expect(pending).rejects.toThrow('closed during connect');
+
+    // No stray close event from the aborted connection.
+    await delay(30);
+    expect(events).toEqual([]);
+
+    // Transport stays usable: a fresh connect succeeds.
+    await transport.connect();
+    await transport.close();
+  });
+
   it('rejects send before connect', async () => {
     const transport = new WsTransport({
       endpoint: { host: HOST, port: srv.port, protocol: 'ws' },

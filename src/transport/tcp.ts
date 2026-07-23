@@ -23,9 +23,9 @@
 // payloads are appended `\n`; incoming chunks are split on `\r?\n` with
 // partial lines buffered across reads.
 //
-// TODO(M7): close()-during-in-flight-connect leaks the in-flight socket.
-// Same gap WsTransport flags. Worth a coordinated abort path before
-// reconnect logic starts retrying connects.
+// close() during an in-flight connect() aborts it: the pending socket is
+// destroyed and the connect promise rejects with
+// `TransportError('closed during connect')`.
 
 import type { Socket as NodeSocket } from 'node:net';
 import { connect as netConnect } from 'node:net';
@@ -95,6 +95,12 @@ export class TcpTransport implements Transport {
   private readonly readyEvent: 'connect' | 'secureConnect';
   /** True after `connect()` resolves. Gates emit() so pre-connect / post-timeout close events don't surface. */
   private opened = false;
+  /**
+   * Set only while a `connect()` is in flight. Invoking it destroys the
+   * pending socket and rejects the connect promise — `close()` calls it
+   * so a close-during-connect doesn't leak a half-open socket.
+   */
+  private abortConnect: (() => void) | null = null;
 
   constructor(opts: TcpTransportOpts) {
     const internal = opts as InternalOpts;
@@ -160,6 +166,7 @@ export class TcpTransport implements Transport {
     let connected = false;
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
+        this.abortConnect = null;
         reject(new TransportError(`connect timeout after ${this.connectTimeoutMs}ms`));
         try {
           socket.destroy();
@@ -167,13 +174,25 @@ export class TcpTransport implements Transport {
           // ignore
         }
       }, this.connectTimeoutMs);
+      this.abortConnect = () => {
+        this.abortConnect = null;
+        clearTimeout(timer);
+        reject(new TransportError('closed during connect'));
+        try {
+          socket.destroy();
+        } catch {
+          // ignore
+        }
+      };
       socket.on(this.readyEvent, () => {
+        this.abortConnect = null;
         clearTimeout(timer);
         connected = true;
         resolve();
       });
       socket.on('error', (err) => {
         if (!connected) {
+          this.abortConnect = null;
           clearTimeout(timer);
           reject(new TransportError('connect error', err));
         } else {
@@ -195,6 +214,12 @@ export class TcpTransport implements Transport {
   }
 
   async close(): Promise<void> {
+    // Close during an in-flight connect: abort it (destroys the pending
+    // socket, rejects the connect promise) instead of leaking the socket.
+    if (this.abortConnect) {
+      this.abortConnect();
+      return;
+    }
     const socket = this.socket;
     if (!socket) return;
     this.socket = null;

@@ -232,4 +232,34 @@ describe('TcpTransport', () => {
         }),
     ).toThrow(TransportError);
   });
+
+  it('close() during in-flight connect destroys the pending socket', async () => {
+    const { EventEmitter } = await import('node:events');
+    const ee = new EventEmitter();
+    let destroyed = false;
+    // Never emits 'connect' — the connect() stays pending until aborted.
+    const fakeSocket = {
+      on: ee.on.bind(ee),
+      once: ee.once.bind(ee),
+      setEncoding: () => fakeSocket,
+      write: () => true,
+      end: () => undefined,
+      destroy: () => {
+        destroyed = true;
+      },
+    };
+    const t = new TcpTransport({
+      endpoint: { host: 'h', port: 1, protocol: 'tcp' },
+      connect: () => fakeSocket as unknown as TcpSocketLike,
+    });
+    const events: TransportEvent[] = [];
+    t.on((e) => events.push(e));
+
+    const pending = t.connect();
+    await t.close();
+    await expect(pending).rejects.toThrow('closed during connect');
+    expect(destroyed).toBe(true);
+    // No stray close event from the aborted connection.
+    expect(events).toEqual([]);
+  });
 });

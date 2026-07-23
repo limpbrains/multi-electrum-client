@@ -9,9 +9,9 @@
 // buffers across frames so partial lines reassemble correctly if a proxy
 // splits messages.
 //
-// TODO(M2): close() during in-flight connect() leaves the ws to finish
-// opening into this.ws — needs a coordinated abort path before reconnect
-// logic in M2 starts retrying connects.
+// close() during an in-flight connect() aborts it: the pending WebSocket
+// is closed and the connect promise rejects with
+// `TransportError('closed during connect')`.
 
 import type { Endpoint } from '../client.js';
 import { TransportError } from '../errors/types.js';
@@ -41,6 +41,12 @@ export class WsTransport implements Transport {
   private readonly connectTimeoutMs: number;
   private readonly framer = new LineFramer();
   private readonly decoder = new TextDecoder();
+  /**
+   * Set only while a `connect()` is in flight. Invoking it closes the
+   * pending WebSocket and rejects the connect promise — `close()` calls
+   * it so a close-during-connect doesn't leak a half-open socket.
+   */
+  private abortConnect: (() => void) | null = null;
 
   constructor(opts: WsTransportOpts) {
     if (opts.endpoint.protocol !== 'ws' && opts.endpoint.protocol !== 'wss') {
@@ -82,7 +88,13 @@ export class WsTransport implements Transport {
       }
     });
 
+    let connected = false;
     ws.addEventListener('close', (ev) => {
+      // Suppress close events from a connect that never completed
+      // (timeout / abort / handshake error): the connect promise has
+      // already rejected, a stray 'close' would surface to listeners as
+      // an event on a connection they never saw open.
+      if (!connected) return;
       const ce = ev as CloseEvent;
       const out: TransportEvent = {
         type: 'close',
@@ -92,9 +104,9 @@ export class WsTransport implements Transport {
       this.emit(out);
     });
 
-    let connected = false;
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
+        this.abortConnect = null;
         reject(new TransportError(`connect timeout after ${this.connectTimeoutMs}ms`));
         try {
           ws.close();
@@ -102,9 +114,20 @@ export class WsTransport implements Transport {
           // ignore
         }
       }, this.connectTimeoutMs);
+      this.abortConnect = () => {
+        this.abortConnect = null;
+        clearTimeout(timer);
+        reject(new TransportError('closed during connect'));
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      };
       ws.addEventListener(
         'open',
         () => {
+          this.abortConnect = null;
           clearTimeout(timer);
           connected = true;
           resolve();
@@ -113,6 +136,7 @@ export class WsTransport implements Transport {
       );
       ws.addEventListener('error', (ev) => {
         if (!connected) {
+          this.abortConnect = null;
           clearTimeout(timer);
           reject(new TransportError('connect error', ev));
         } else {
@@ -139,6 +163,12 @@ export class WsTransport implements Transport {
   }
 
   async close(): Promise<void> {
+    // Close during an in-flight connect: abort it (closes the pending
+    // WebSocket, rejects the connect promise) instead of leaking it.
+    if (this.abortConnect) {
+      this.abortConnect();
+      return;
+    }
     const ws = this.ws;
     if (!ws) return;
     if (ws.readyState === ws.CLOSED) {
