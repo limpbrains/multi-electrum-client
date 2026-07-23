@@ -13,6 +13,10 @@
   "include": ["examples/**/*.ts"],
   "exclude": [
     "node_modules",
+    // Demo's vite.config.ts imports `vite`, which lives in the demo's own
+    // package (examples/demo/package.json), not the root devDependencies.
+    // The app itself (main.ts) is still typechecked.
+    "examples/demo/vite.config.ts",
     "dist",
     "coverage",
     // RN example needs `@types/react` + `@types/react-native` which we

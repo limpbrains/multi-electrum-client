@@ -74,7 +74,7 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "demo": "vite --config examples/demo/vite.config.ts"
+    "demo": "pnpm -C examples/demo install && pnpm -C examples/demo dev"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
@@ -90,7 +90,6 @@
     "tsd": "^0.31.0",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0",
-    "vite": "^8.1.5",
     "vitest": "^2.0.0",
     "ws": "^8.20.0"
   },
