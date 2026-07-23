@@ -1,0 +1,288 @@
+:root {
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --panel-2: #1d2740;
+  --text: #dbe4f5;
+  --muted: #8494b3;
+  --green: #5fd68a;
+  --amber: #f9c74f;
+  --red: #ef6461;
+  --blue: #4f9cf9;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font:
+    14px/1.45 system-ui,
+    sans-serif;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.small {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid #263252;
+  flex-wrap: wrap;
+}
+
+header h1 {
+  font-size: 16px;
+  margin: 0;
+}
+
+.subtitle {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.tip {
+  color: var(--green);
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px;
+  transition: transform 0.15s;
+}
+
+.tip.pulse {
+  transform: scale(1.35);
+  color: #fff;
+}
+
+label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+select,
+button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid #2c3a60;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--blue);
+}
+
+input[type='range'] {
+  width: 110px;
+  accent-color: var(--blue);
+}
+
+main {
+  padding: 14px 18px;
+  display: grid;
+  gap: 14px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+h2 {
+  font-size: 13px;
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* --- viz ------------------------------------------------------------- */
+
+#viz {
+  position: relative;
+  display: grid;
+  grid-template-columns: 170px 1fr;
+  gap: 12px;
+  min-height: 330px;
+}
+
+#lanes {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+
+#browser-node {
+  align-self: center;
+  text-align: center;
+  background: var(--panel);
+  border: 1px solid #2c3a60;
+  border-radius: 12px;
+  padding: 18px 10px;
+  z-index: 2;
+  width: 130px;
+}
+
+.node-icon {
+  font-size: 30px;
+}
+
+#cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  z-index: 2;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid #2c3a60;
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin-left: 220px;
+  transition: border-color 0.2s;
+}
+
+.card.state-connected {
+  border-color: #2e5d43;
+}
+
+.card.state-disconnected,
+.card.state-removed {
+  border-color: #6e3341;
+  opacity: 0.75;
+}
+
+.card.state-banned {
+  border-color: #806a2a;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.card-head .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.card-head .name {
+  font-weight: 600;
+}
+
+.badge {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.badge.connected,
+.badge.running {
+  background: #1d3a2a;
+  color: var(--green);
+}
+
+.badge.disconnected,
+.badge.removed,
+.badge.stopped {
+  background: #3a1d24;
+  color: var(--red);
+}
+
+.badge.banned,
+.badge.suspended,
+.badge.connecting {
+  background: #3a331d;
+  color: var(--amber);
+}
+
+.stats {
+  display: flex;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+
+.controls {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.controls button {
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
+.controls button.active {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* --- chart / log ----------------------------------------------------- */
+
+#chart-wrap,
+#log-wrap {
+  background: var(--panel);
+  border: 1px solid #2c3a60;
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+#chart {
+  width: 100%;
+  display: block;
+}
+
+#log {
+  height: 170px;
+  overflow-y: auto;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+#log .row {
+  padding: 1px 0;
+  border-bottom: 1px solid #1c2438;
+}
+
+#log .t {
+  color: #56648a;
+  margin-right: 8px;
+}
+
+#log .err {
+  color: var(--red);
+}
+
+#log .good {
+  color: var(--green);
+}

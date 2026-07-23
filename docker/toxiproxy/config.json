@@ -16,5 +16,23 @@
     "listen": "0.0.0.0:52201",
     "upstream": "electrs-default:50001",
     "enabled": true
+  },
+  {
+    "name": "electrumx-demo",
+    "listen": "0.0.0.0:52011",
+    "upstream": "electrumx-default:50001",
+    "enabled": true
+  },
+  {
+    "name": "fulcrum-demo",
+    "listen": "0.0.0.0:52111",
+    "upstream": "fulcrum-default:50001",
+    "enabled": true
+  },
+  {
+    "name": "electrs-demo",
+    "listen": "0.0.0.0:52211",
+    "upstream": "electrs-default:50001",
+    "enabled": true
   }
 ]
