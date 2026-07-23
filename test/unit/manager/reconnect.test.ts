@@ -277,5 +277,4 @@ describe('ElectrumManager — auto-reconnect', () => {
 
     await manager.stop();
   });
-
 });
