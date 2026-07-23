@@ -10,23 +10,47 @@
     <header>
       <h1>multi-electrum-client</h1>
       <span class="subtitle">live multi-server routing — regtest docker stack</span>
-      <span id="manager-state" class="badge">created</span>
-      <span id="tip" class="tip">tip: —</span>
+      <span
+        id="manager-state"
+        class="badge"
+        title="Manager lifecycle state: created → running ⇄ suspended → stopped"
+        >created</span
+      >
+      <span
+        id="tip"
+        class="tip"
+        title="Current chain tip height, live from the headers subscription"
+        >tip: —</span
+      >
       <div class="spacer"></div>
-      <label>
+      <label
+        title="Routing policy — swapped live; connections stay up across the switch. preferFastest picks the lowest-latency server; anything within +20% of the best EMA counts as tied (tie-break: least in-flight)."
+      >
         policy
         <select id="policy">
           <option value="roundRobin">roundRobin</option>
-          <option value="preferFastest">preferFastest (20%)</option>
+          <option value="preferFastest">preferFastest (ties within +20%)</option>
           <option value="failover">failover (electrumx first)</option>
         </select>
       </label>
-      <label>
+      <label
+        title="Generated request rate — rotates server.ping / estimatefee / block.header / scripthash.get_balance"
+      >
         traffic <span id="rate-label">2/s</span>
         <input id="rate" type="range" min="0" max="10" step="1" value="2" />
       </label>
-      <button id="suspend">suspend</button>
-      <button id="mine">mine block ⛏</button>
+      <button
+        id="suspend"
+        title="manager.suspend(): drain in-flight, close all sockets, keep subscriptions. Resume reconnects and replays them with catch-up."
+      >
+        suspend
+      </button>
+      <button
+        id="mine"
+        title="Mine one regtest block via bitcoind RPC — every server pushes a headers notification"
+      >
+        mine block ⛏
+      </button>
     </header>
 
     <main>
@@ -59,17 +83,38 @@
           <span class="state badge">disconnected</span>
         </div>
         <div class="stats mono">
-          <span data-k="ema">ema —</span>
-          <span data-k="p50">p50 —</span>
-          <span data-k="p95">p95 —</span>
-          <span data-k="ok">ok 0</span>
-          <span data-k="err">err 0%</span>
-          <span data-k="inflight">inflight 0</span>
+          <span
+            data-k="ema"
+            title="Exponential moving average of request latency (α=0.2). Errored requests count too — timeouts drag it up, which is how preferFastest learns to avoid a bad server."
+            >ema —</span
+          >
+          <span data-k="p50" title="Median latency over the last 32 requests, ms">p50 —</span>
+          <span data-k="p95" title="95th-percentile latency over the last 32 requests, ms"
+            >p95 —</span
+          >
+          <span data-k="ok" title="Successful requests this server has answered">ok 0</span>
+          <span data-k="err" title="Error rate: errors / (successes + errors)">err 0%</span>
+          <span data-k="inflight" title="Requests currently awaiting a response on this connection"
+            >inflight 0</span
+          >
         </div>
         <div class="controls">
-          <button data-k="toggle">disconnect</button>
-          <button data-k="cut">cut lane</button>
-          <label class="small">
+          <button
+            data-k="toggle"
+            title="removeServer(): drop this server from the pool entirely. Click again to add it back and reconnect."
+          >
+            disconnect
+          </button>
+          <button
+            data-k="cut"
+            title="Kill this server's TCP lane via toxiproxy — a real transport fault. Watch traffic reroute while the manager retries with growing backoff."
+          >
+            cut lane
+          </button>
+          <label
+            class="small"
+            title="Inject artificial latency into this server's lane (toxiproxy latency toxic). Dots slow down, the chart line rises, preferFastest starts avoiding it."
+          >
             +lag <span data-k="lag-label">0</span>ms
             <input data-k="lag" type="range" min="0" max="2000" step="100" value="0" />
           </label>
