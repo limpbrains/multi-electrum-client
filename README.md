@@ -224,12 +224,17 @@ pnpm test:integration
 
 ### Running the unit suite on-device (React Native)
 
-The same unit tests run unmodified inside a real React Native runtime
-(Hermes) through [react-native-harness](https://github.com/callstackincubator/react-native-harness),
+The same unit tests — all 26 files — run unmodified inside a real React
+Native runtime (Hermes) through [react-native-harness](https://github.com/callstackincubator/react-native-harness),
 hosted by the RN app in `test/rn/app/`. A Metro alias maps `vitest` onto the
 harness runtime and `node:net` / `node:tls` onto `react-native-tcp-socket`,
-so the tcp/tls transport tests talk to the real native socket module. The two
-files that spin up a node `ws` server on the host are excluded on-device.
+so the tcp/tls transport tests talk to the real native socket module. The
+`ws`-server-backed tests run against a minimal on-device WebSocket server
+(`test/rn/app/harness/ws-shim.ts`) built on the same native socket module.
+
+The docker-backed integration suite runs on-device too: the device reaches
+the compose stack on the host (iOS simulator via `127.0.0.1`, Android
+emulator via `10.0.2.2`).
 
 Prerequisites: Xcode + an iOS simulator, and/or the Android SDK with an AVD.
 
@@ -237,8 +242,12 @@ Prerequisites: Xcode + an iOS simulator, and/or the Android SDK with an AVD.
 pnpm test:rn:setup   # install app deps + pods (once)
 # build & install the host app on your simulator/emulator (once per native change):
 pnpm -C test/rn/app ios       # or: pnpm -C test/rn/app android
-pnpm test:rn:ios     # run the suite on the iOS simulator
-pnpm test:rn:android # run the suite on the Android emulator
+pnpm test:rn:ios     # run the unit suite on the iOS simulator
+pnpm test:rn:android # run the unit suite on the Android emulator
+
+# integration on-device (docker stack must be up, see above):
+pnpm test:rn:integration:ios
+pnpm test:rn:integration:android
 ```
 
 Device pins live in `test/rn/app/rn-harness.config.mjs`; override locally

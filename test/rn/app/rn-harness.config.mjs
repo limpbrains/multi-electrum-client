@@ -19,7 +19,15 @@ export default {
     }),
     androidPlatform({
       name: 'android',
-      device: androidEmulator(ANDROID_AVD, { apiLevel: 35, profile: 'pixel_6' }),
+      // diskSize/heapSize match the schema defaults but are stated
+      // explicitly: the v1.2.0 GitHub Action reads them without applying
+      // defaults and crashes on undefined.
+      device: androidEmulator(ANDROID_AVD, {
+        apiLevel: 35,
+        profile: 'pixel_6',
+        diskSize: '1G',
+        heapSize: '1G',
+      }),
       bundleId: 'com.harnessapp',
     }),
   ],

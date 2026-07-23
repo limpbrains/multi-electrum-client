@@ -15,6 +15,9 @@ const repoRoot = path.resolve(appRoot, '..', '..', '..');
 //  - node:events: the npm 'events' package is API-compatible.
 const ALIASES = {
   vitest: path.join(appRoot, 'harness', 'vitest-shim.ts'),
+  // The ws-backed tests start a WebSocketServer inside the test body; the
+  // shim implements the needed RFC 6455 slice on react-native-tcp-socket.
+  ws: path.join(appRoot, 'harness', 'ws-shim.ts'),
   'node:net': path.join(appRoot, 'harness', 'node-net.ts'),
   'node:tls': path.join(appRoot, 'harness', 'node-tls.ts'),
   'node:timers/promises': path.join(appRoot, 'harness', 'node-timers-promises.ts'),
