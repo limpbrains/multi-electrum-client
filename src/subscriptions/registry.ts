@@ -357,7 +357,24 @@ export class SubscriptionRegistry {
     if (existing) return existing;
     const task = (async () => {
       try {
-        await this.rebind(record);
+        // A failed wire subscribe must not strand the record until the next
+        // client state transition — on flaky links (mobile networks, the
+        // Android emulator's NAT) a freshly reconnected socket can accept
+        // the connection yet drop the first request. Retry with backoff for
+        // as long as some client is connected; a disconnect ends the loop
+        // and the next connect starts a fresh one.
+        let delayMs = 1_000;
+        for (;;) {
+          await this.rebind(record);
+          if (!this.subs.has(record.key)) return; // unsubscribed meanwhile
+          if (record.clientId !== null) return; // bound — done
+          if (this.env.pickConnectedClient() === null) return; // next connect retries
+          await new Promise((r) => setTimeout(r, delayMs));
+          delayMs = Math.min(delayMs * 2, 10_000);
+          // Re-check after the pause: an unsubscribe or a concurrent rebind
+          // may have settled the record while we slept.
+          if (!this.subs.has(record.key) || record.clientId !== null) return;
+        }
       } finally {
         this.pendingRebinds.delete(record.key);
       }
@@ -379,9 +396,11 @@ export class SubscriptionRegistry {
         stickyKey: record.key,
       });
     } catch {
-      // Rebind failed (e.g. server doesn't support the method). Leave
-      // orphaned for the next connect to retry. Manager 'error' event has
-      // already surfaced the underlying failure via runAttempts.
+      // Rebind failed (e.g. server doesn't support the method, or the
+      // request timed out on a bad link). Leave orphaned — rebindOnce's
+      // retry loop / the next connect will try again. Manager 'error'
+      // events have already surfaced the underlying failure via
+      // runAttempts.
       return;
     }
     // Record may have been unsubscribed between the env.call dispatch and

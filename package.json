@@ -73,6 +73,8 @@
     "test:rn:setup": "pnpm -C test/rn/app install && pnpm -C test/rn/app pods",
     "test:rn:ios": "pnpm -C test/rn/app harness:ios",
     "test:rn:android": "pnpm -C test/rn/app harness:android",
+    "test:rn:integration:ios": "pnpm -C test/rn/app harness:integration:ios",
+    "test:rn:integration:android": "pnpm -C test/rn/app harness:integration:android",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",

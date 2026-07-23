@@ -8,7 +8,9 @@
     "start": "react-native start",
     "pods": "pod install --project-directory=ios",
     "harness:ios": "react-native-harness --harnessRunner ios",
-    "harness:android": "react-native-harness --harnessRunner android"
+    "harness:android": "react-native-harness --harnessRunner android",
+    "harness:integration:ios": "react-native-harness -c jest.harness.integration.config.mjs --harnessRunner ios",
+    "harness:integration:android": "react-native-harness -c jest.harness.integration.config.mjs --harnessRunner android"
   },
   "dependencies": {
     "buffer": "^6.0.3",
