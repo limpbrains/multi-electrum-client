@@ -181,7 +181,7 @@ metrics and debug logging, not control flow.
 - **Node** ≥ 20: works out of the box. Global `WebSocket` is stable in Node 22+; Node 20 needs `--experimental-websocket`, or pass `WebSocket` from the `ws` package via `WsTransport`'s `WebSocket` option. TCP / TLS use `node:net` / `node:tls`.
 - **Bun**: works out of the box (`ws`, `tcp`, `tls`).
 - **Browser**: only `ws` / `wss` are supported. The package's `browser` conditional export points to a separate entry that registers only the WebSocket transport — `node:net` / `node:tls` are never reached by your bundler's resolution graph. Constructing a server with `protocol: 'tcp'` / `'tls'` still throws `ProtocolError` clearly at runtime (rather than at bundle time).
-- **React Native**: add a metro alias mapping `node:net` and `node:tls` to [`react-native-tcp-socket`](https://github.com/Rapsssito/react-native-tcp-socket). Its API is a 1:1 emulation of the Node modules; no platform branches inside the library. `WebSocket` is built into the RN runtime.
+- **React Native**: add a metro alias mapping `node:net` and `node:tls` to [`react-native-tcp-socket`](https://github.com/Rapsssito/react-native-tcp-socket). Its API is a 1:1 emulation of the Node modules; no platform branches inside the library. `WebSocket` is built into the RN runtime. This isn't theoretical: the library's own unit suite runs on-device in CI (iOS simulator + Android emulator, via [react-native-harness](https://github.com/callstackincubator/react-native-harness)) with exactly this alias — see `test/rn/app/metro.config.js`.
 
 ## More examples
 
@@ -221,6 +221,28 @@ Integration tests require Docker:
 docker compose -f docker/compose.yml --profile slim up -d --wait
 pnpm test:integration
 ```
+
+### Running the unit suite on-device (React Native)
+
+The same unit tests run unmodified inside a real React Native runtime
+(Hermes) through [react-native-harness](https://github.com/callstackincubator/react-native-harness),
+hosted by the RN app in `test/rn/app/`. A Metro alias maps `vitest` onto the
+harness runtime and `node:net` / `node:tls` onto `react-native-tcp-socket`,
+so the tcp/tls transport tests talk to the real native socket module. The two
+files that spin up a node `ws` server on the host are excluded on-device.
+
+Prerequisites: Xcode + an iOS simulator, and/or the Android SDK with an AVD.
+
+```bash
+pnpm test:rn:setup   # install app deps + pods (once)
+# build & install the host app on your simulator/emulator (once per native change):
+pnpm -C test/rn/app ios       # or: pnpm -C test/rn/app android
+pnpm test:rn:ios     # run the suite on the iOS simulator
+pnpm test:rn:android # run the suite on the Android emulator
+```
+
+Device pins live in `test/rn/app/rn-harness.config.mjs`; override locally
+with `HARNESS_IOS_SIM` / `HARNESS_IOS_VERSION` / `HARNESS_ANDROID_AVD`.
 
 ## License
 

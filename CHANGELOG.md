@@ -20,6 +20,7 @@ Pre-release. The integration suite against the Docker compose stack now covers c
 - **Transports** — `WsTransport` (universal: Node 22+, browser, RN, Bun), `TcpTransport` (`node:net`), `TlsTransport` (`node:tls`, awaits `secureConnect`). Shared `LineFramer` for all three. Transport registry lets the package ship a separate browser entry that registers only ws/wss.
 - **Conditional package exports** — root `.` resolves to `index.browser.js` for browser bundlers (no `node:net` / `node:tls`), `index.js` for Node / RN / Bun.
 - **Examples** — `examples/{node,bun,browser,rn}-basic.*`.
+- **On-device React Native test runs** — the node unit suite (24 of 26 files, 231 tests) runs unmodified inside a real React Native runtime (Hermes) on iOS simulators and Android emulators via `react-native-harness`. A Metro alias maps `vitest` to a thin shim (`test/rn/app/harness/vitest-shim.ts`) — harness's `expect` is `@vitest/expect` and its mocks are `@vitest/spy`, so only fake timers (`@sinonjs/fake-timers`) and `describe.each` needed filling. `node:net` / `node:tls` resolve to `react-native-tcp-socket` through the exact alias the README documents for RN consumers, so the tcp/tls transport tests exercise the real native socket module on-device. Excluded on-device: `transport/ws.test.ts` and `client/electrum-client.ws.test.ts` (both need a node `ws` server on the host). Scripts: `test:rn`, `test:rn:setup`, `test:rn:ios`, `test:rn:android`; CI jobs `rn-ios` / `rn-android`.
 
 ### Fixed
 
@@ -27,6 +28,5 @@ Pre-release. The integration suite against the Docker compose stack now covers c
 
 ### Pending before 0.1.0
 
-- RN parity tests. The original plan called for `react-native-harness`, but on inspection the package requires a full RN host app + simulator/emulator (it's designed for testing TurboModules in real native environments, not for running a JS-only library's test suite under Hermes/JSC). It's the wrong tool for our shape: a pure-JS library with no native modules. We'll evaluate alternatives (running the suite under Hermes directly via `react-native/jest-preset`'s standalone JS-engine path, or just shipping a thin smoke test inside an example app).
-- CI workflow for `rn` once the strategy above is settled.
+- ~~RN parity tests~~ Landed via `react-native-harness` after all, reversing the earlier abandonment note. The objection stands factually — it does require a full RN host app (`test/rn/app/`) plus a simulator/emulator — but that cost buys the signal a standalone-Hermes run could not: the tcp/tls transports talking to a real native socket module (`react-native-tcp-socket`) under real Hermes timers and microtask scheduling, on both platforms.
 

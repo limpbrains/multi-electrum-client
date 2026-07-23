@@ -377,3 +377,13 @@ Total ≈ 11.5 wks of work; realistic solo calendar 14–16 wks.
 - toxiproxy: https://github.com/Shopify/toxiproxy — HTTP API, supported toxics.
 - `tsd`: https://github.com/tsdjs/tsd — type-level assertions.
 - `fast-check`: https://github.com/dubzzz/fast-check — property tests for policies.
+
+## Addendum (2026-07-23): RN parity as-built
+
+The `react-native-harness` plan above shipped, with deviations:
+
+- Single `ci.yml` gains `rn-ios` / `rn-android` jobs instead of a separate `rn.yml`.
+- The on-device run reuses `test/unit/**` verbatim instead of dedicated `test/rn/*.test.ts` files: a Metro alias maps `vitest` to `test/rn/app/harness/vitest-shim.ts` (harness's `expect` is `@vitest/expect`, its mocks are `@vitest/spy`; the shim adds `@sinonjs/fake-timers`-backed `vi.useFakeTimers`/`advanceTimersByTimeAsync` and a local `describe.each`).
+- `node:net` / `node:tls` resolve to `react-native-tcp-socket` through the same alias the README documents for consumers, so `transport/{tcp,tls}.test.ts` exercise the real native socket module on-device (including an on-device TCP echo server).
+- Excluded on-device: `transport/ws.test.ts` and `client/electrum-client.ws.test.ts` — both start a node `ws` `WebSocketServer` on the host.
+- Host app lives at `test/rn/app/` (RN 0.82 CLI scaffold, pnpm `node-linker=hoisted`, patched `@react-native-harness/bundler-metro` for Metro 0.83's `exports.default` shape). Bundle entries must live inside the app root, so `test/rn/app/suite/` holds one auto-generated re-import wrapper per unit test file.

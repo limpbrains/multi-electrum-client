@@ -1,0 +1,49 @@
+{
+  "name": "HarnessApp",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "android": "react-native run-android",
+    "ios": "react-native run-ios",
+    "start": "react-native start",
+    "pods": "pod install --project-directory=ios",
+    "harness:ios": "react-native-harness --harnessRunner ios",
+    "harness:android": "react-native-harness --harnessRunner android"
+  },
+  "dependencies": {
+    "buffer": "^6.0.3",
+    "event-target-shim": "^6.0.2",
+    "events": "^3.3.0",
+    "react": "19.1.1",
+    "react-native": "0.82.1",
+    "react-native-tcp-socket": "^6.3.0",
+    "util": "^0.12.5"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.2",
+    "@babel/preset-env": "^7.25.3",
+    "@babel/runtime": "^7.25.0",
+    "@react-native-community/cli": "20.0.0",
+    "@react-native-community/cli-platform-android": "20.0.0",
+    "@react-native-community/cli-platform-ios": "20.0.0",
+    "@react-native-harness/platform-android": "1.3.0",
+    "@react-native-harness/platform-apple": "1.3.0",
+    "@react-native/babel-preset": "0.82.1",
+    "@react-native/metro-config": "0.82.1",
+    "@react-native/typescript-config": "0.82.1",
+    "@sinonjs/fake-timers": "^11.2.2",
+    "@types/react": "^19.1.1",
+    "babel-plugin-dynamic-import-node": "^2.3.3",
+    "fast-check": "^3.0.0",
+    "react-native-harness": "1.3.0",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "@react-native-harness/bundler-metro@1.3.0": "patches/@react-native-harness__bundler-metro@1.3.0.patch"
+    }
+  }
+}

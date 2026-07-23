@@ -31,5 +31,5 @@
     "baseUrl": "."
   },
   "include": ["src/**/*", "test/**/*", "*.config.ts"],
-  "exclude": ["node_modules", "dist", "coverage"]
+  "exclude": ["node_modules", "dist", "coverage", "test/rn/app"]
 }

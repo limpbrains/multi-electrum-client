@@ -59,6 +59,103 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
+  rn-android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    # On-device run of the unit suite (Android emulator via react-native-harness).
+    # Parallel to integration; does not gate build.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -C test/rn/app install
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build Android app
+        run: cd test/rn/app/android && ./gradlew assembleDebug
+      # Pin the action to the newest published tag; the npm packages in
+      # test/rn/app are pinned to 1.3.0 (no matching action tag exists yet).
+      - uses: callstackincubator/react-native-harness@v1.2.0
+        with:
+          runner: android
+          app: test/rn/app/android/app/build/outputs/apk/debug/app-debug.apk
+          projectRoot: test/rn/app
+          packageManager: pnpm
+          cacheAvd: true
+      - name: Upload harness logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-logs-rn-android
+          path: test/rn/app/.harness/logs
+          if-no-files-found: ignore
+
+  rn-ios:
+    runs-on: macos-15
+    timeout-minutes: 45
+    # On-device run of the unit suite (iOS simulator via react-native-harness).
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -C test/rn/app install
+      - name: CocoaPods cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            test/rn/app/ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: rn-harness-pods-${{ runner.os }}-${{ hashFiles('test/rn/app/ios/Podfile.lock') }}
+          restore-keys: rn-harness-pods-${{ runner.os }}-
+      - name: Install pods
+        run: cd test/rn/app/ios && pod install
+      - name: Pick an available simulator
+        # Device pins in rn-harness.config.mjs default to iPhone 16 / iOS 18.x;
+        # resolve whatever the runner image actually ships so image updates
+        # don't break the job.
+        run: |
+          xcrun simctl list runtimes iOS
+          RUNTIME=$(xcrun simctl list runtimes iOS -j | python3 -c "import json,sys; rs=[r for r in json.load(sys.stdin)['runtimes'] if r['isAvailable']]; print(rs[-1]['version'])")
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)['devices']
+          names=[d['name'] for ds in data.values() for d in ds if d['name'].startswith('iPhone')]
+          print(sorted(names)[-1])")
+          echo "HARNESS_IOS_SIM=$DEVICE" >> "$GITHUB_ENV"
+          echo "HARNESS_IOS_VERSION=$RUNTIME" >> "$GITHUB_ENV"
+          echo "Using $DEVICE on iOS $RUNTIME"
+      - name: Build iOS app
+        run: cd test/rn/app && npx react-native build-ios --mode Debug --buildFolder ./ios/build
+      - uses: callstackincubator/react-native-harness@v1.2.0
+        with:
+          runner: ios
+          app: test/rn/app/ios/build/Build/Products/Debug-iphonesimulator/HarnessApp.app
+          projectRoot: test/rn/app
+          packageManager: pnpm
+      - name: Upload harness logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-logs-rn-ios
+          path: test/rn/app/.harness/logs
+          if-no-files-found: ignore
+
   integration:
     runs-on: ubuntu-latest
     # Real Docker stack — slower than unit; run in parallel with the rest
