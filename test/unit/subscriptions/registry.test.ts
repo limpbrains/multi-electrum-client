@@ -193,6 +193,16 @@ describe('SubscriptionRegistry — notify dispatch', () => {
   });
 });
 
+// Drain the microtask queue so promise chains (e.g. a rejected wire call
+// propagating through rebind's catch into its backoff setTimeout) settle
+// before the test advances fake timers. Plain awaits, no timers — works
+// identically under vitest's timer mock (node) and the on-device
+// @sinonjs/fake-timers shim, whose tickAsync would otherwise start before
+// the retry timer exists and advance an empty clock.
+const flushMicrotasks = async (rounds = 20): Promise<void> => {
+  for (let i = 0; i < rounds; i++) await Promise.resolve();
+};
+
 describe('SubscriptionRegistry — disconnect / restore', () => {
   it('orphans subs on clientDisconnected, rebinds on restoreOrphans', async () => {
     const env = fakeEnv();
@@ -258,6 +268,106 @@ describe('SubscriptionRegistry — disconnect / restore', () => {
     // No re-call attempted; record stays orphaned.
     handler.mockClear();
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('retries a failed rebind with backoff while a client stays connected', async () => {
+    vi.useFakeTimers();
+    try {
+      const env = fakeEnv();
+      env.setStatus('blockchain.scripthash.subscribe', ['H'], 'INIT');
+      const reg = new SubscriptionRegistry(env);
+      const handler = vi.fn();
+      await reg.subscribe('blockchain.scripthash.subscribe', ['H'], handler);
+      handler.mockClear();
+
+      reg.clientDisconnected('A');
+      // Rebind lands on a connected client but the wire subscribe fails
+      // (e.g. request timeout on an established-but-dead reconnect).
+      const hold = env.holdNextCall();
+      const restore = reg.restoreOrphans();
+      await flushMicrotasks(); // let the held call be issued
+      hold.reject(new Error('subscribe timed out'));
+      await flushMicrotasks(); // let the failure schedule the backoff timer
+
+      // The retry fires after the 1s backoff and succeeds.
+      env.setStatus('blockchain.scripthash.subscribe', ['H'], 'AFTER_RETRY');
+      await vi.advanceTimersByTimeAsync(1_000);
+      await restore;
+
+      expect(
+        env.callLog.filter((c) => c.method === 'blockchain.scripthash.subscribe'),
+      ).toHaveLength(
+        3, // initial subscribe + failed rebind + successful retry
+      );
+      expect(handler).toHaveBeenCalledWith('AFTER_RETRY');
+      expect(env.emitted[env.emitted.length - 1]).toMatchObject({
+        event: 'subscription-restored',
+        payload: { drift: true },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops retrying a failed rebind once no client is connected', async () => {
+    vi.useFakeTimers();
+    try {
+      const env = fakeEnv();
+      env.setStatus('blockchain.scripthash.subscribe', ['H'], 'INIT');
+      const reg = new SubscriptionRegistry(env);
+      await reg.subscribe('blockchain.scripthash.subscribe', ['H'], vi.fn());
+
+      reg.clientDisconnected('A');
+      const hold = env.holdNextCall();
+      const restore = reg.restoreOrphans();
+      await flushMicrotasks();
+      hold.reject(new Error('subscribe timed out'));
+      await flushMicrotasks();
+
+      // The client drops during the backoff pause — the loop must end
+      // without another wire call; the next connect owns the retry.
+      env.setNoClient();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await restore;
+
+      expect(
+        env.callLog.filter((c) => c.method === 'blockchain.scripthash.subscribe'),
+      ).toHaveLength(
+        2, // initial subscribe + the single failed rebind
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops retrying a failed rebind after the last handler unsubscribes', async () => {
+    vi.useFakeTimers();
+    try {
+      const env = fakeEnv();
+      env.setStatus('blockchain.scripthash.subscribe', ['H'], 'INIT');
+      const reg = new SubscriptionRegistry(env);
+      const unsub = await reg.subscribe('blockchain.scripthash.subscribe', ['H'], vi.fn());
+
+      reg.clientDisconnected('A');
+      const hold = env.holdNextCall();
+      const restore = reg.restoreOrphans();
+      await flushMicrotasks();
+      hold.reject(new Error('subscribe timed out'));
+      await flushMicrotasks();
+
+      // Caller gives up during the backoff pause.
+      await unsub();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await restore;
+
+      expect(
+        env.callLog.filter((c) => c.method === 'blockchain.scripthash.subscribe'),
+      ).toHaveLength(
+        2, // initial subscribe + the single failed rebind; no retry after unsub
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

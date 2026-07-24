@@ -194,6 +194,27 @@ jobs:
           app: ios/build/Build/Products/Debug-iphonesimulator/HarnessApp.app
           projectRoot: test/rn/app
           packageManager: pnpm
+      # The on-device INTEGRATION suite cannot run in this job: it needs the
+      # docker compose stack, and GitHub's macOS runners have no Docker
+      # daemon (no nested virtualization). It runs in CI on rn-android, and
+      # locally on iOS wherever Docker is available:
+      #   docker compose -f docker/compose.yml --profile slim up -d --wait
+      #   pnpm test:rn:integration:ios
+      # If macOS runners ever gain Docker, mirror the rn-android steps:
+      # - name: boot integration stack
+      #   run: docker compose -f docker/compose.yml --profile slim up -d --wait
+      # - uses: callstackincubator/react-native-harness@v1.2.0
+      #   env:
+      #     NODE_OPTIONS: --max-old-space-size=4096
+      #   with:
+      #     runner: ios
+      #     app: ios/build/Build/Products/Debug-iphonesimulator/HarnessApp.app
+      #     projectRoot: test/rn/app
+      #     packageManager: pnpm
+      #     harnessArgs: '-c jest.harness.integration.config.mjs'
+      # - name: tear down integration stack
+      #   if: always()
+      #   run: docker compose -f docker/compose.yml --profile slim down -v
       - name: Upload harness logs
         if: always()
         uses: actions/upload-artifact@v4
