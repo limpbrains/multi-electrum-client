@@ -224,6 +224,52 @@ describe('TcpTransport', () => {
     await t.close();
   });
 
+  it('works without a global TextDecoder (Hermes): strings flow, raw bytes surface an error', async () => {
+    // Stock React Native Hermes has no TextDecoder. connect() must not
+    // require one (it used to construct one eagerly and threw), string
+    // chunks must flow normally, and a raw Uint8Array chunk must surface
+    // as a transport error instead of crashing.
+    const g = globalThis as { TextDecoder?: unknown };
+    const saved = g.TextDecoder;
+    g.TextDecoder = undefined;
+    try {
+      const { EventEmitter } = await import('node:events');
+      const ee = new EventEmitter();
+      const fakeSocket = {
+        on: ee.on.bind(ee),
+        once: ee.once.bind(ee),
+        emit: ee.emit.bind(ee),
+        setEncoding: () => fakeSocket,
+        write: () => true,
+        end: () => ee.emit('close', false),
+        destroy: () => ee.emit('close', true),
+      };
+      const t = new TcpTransport({
+        endpoint: { host: 'h', port: 1, protocol: 'tcp' },
+        connect: () => fakeSocket as unknown as TcpSocketLike,
+      });
+      const events: TransportEvent[] = [];
+      t.on((e) => events.push(e));
+      const p = t.connect();
+      queueMicrotask(() => ee.emit('connect'));
+      await p;
+
+      ee.emit('data', '{"id":1}\n');
+      expect(events).toContainEqual({ type: 'data', text: '{"id":1}' });
+
+      ee.emit('data', new Uint8Array([0x7b, 0x7d, 0x0a]));
+      expect(
+        events.some(
+          (e) => e.type === 'error' && String(e.cause).includes('unexpected data chunk type'),
+        ),
+      ).toBe(true);
+
+      await t.close();
+    } finally {
+      g.TextDecoder = saved;
+    }
+  });
+
   it('refuses non-tcp protocol', () => {
     expect(
       () =>

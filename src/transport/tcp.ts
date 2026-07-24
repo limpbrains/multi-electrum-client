@@ -128,14 +128,20 @@ export class TcpTransport implements Transport {
     // ignores the encoding hint and emits a Buffer, `Buffer.toString`
     // decodes correctly; a raw `Uint8Array` would not (its `toString`
     // returns comma-decimals), so we route those through `TextDecoder`.
-    const decoder = new TextDecoder();
+    //
+    // The decoder is created lazily INSIDE that branch: Hermes (React
+    // Native) has no global TextDecoder, and constructing it eagerly here
+    // made every connect() throw on stock RN even though the normal
+    // string / Buffer paths never need it.
+    let decoder: TextDecoder | undefined;
     socket.on('data', (chunk) => {
       let text: string;
       if (typeof chunk === 'string') {
         text = chunk;
       } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(chunk)) {
         text = chunk.toString('utf-8');
-      } else if (chunk instanceof Uint8Array) {
+      } else if (chunk instanceof Uint8Array && typeof TextDecoder !== 'undefined') {
+        decoder ??= new TextDecoder();
         text = decoder.decode(chunk);
       } else {
         // Unknown shape — surface as an error rather than silently
