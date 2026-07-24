@@ -99,7 +99,10 @@ jobs:
           app: android/app/build/outputs/apk/debug/app-debug.apk
           projectRoot: test/rn/app
           packageManager: pnpm
-          cacheAvd: true
+          # A cache-restored AVD boots from its quickboot snapshot with stale
+          # guest network state — 10.0.2.2 (host loopback) stops routing and
+          # every integration fetch fails. Fresh AVD each run is reliable.
+          cacheAvd: false
       # Boot the docker stack only now: the 7 GB runner hosts the emulator,
       # gradle, and the compose stack; keeping them all alive for the whole
       # job risks the OOM killer taking out containers mid-run.
@@ -120,7 +123,7 @@ jobs:
           app: android/app/build/outputs/apk/debug/app-debug.apk
           projectRoot: test/rn/app
           packageManager: pnpm
-          cacheAvd: true
+          cacheAvd: false
           harnessArgs: '-c jest.harness.integration.config.mjs'
       - name: dump stack state on failure
         if: failure()
