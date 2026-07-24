@@ -40,7 +40,13 @@ export class WsTransport implements Transport {
   private readonly Ctor: WebSocketCtor;
   private readonly connectTimeoutMs: number;
   private readonly framer = new LineFramer();
-  private readonly decoder = new TextDecoder();
+  /**
+   * Created lazily on the first binary frame: Hermes (React Native) has no
+   * global TextDecoder, and constructing one in the field initializer made
+   * `new WsTransport(...)` throw there — even though Electrum servers speak
+   * text frames and the decoder is never needed on the normal path.
+   */
+  private decoder: TextDecoder | undefined;
   /**
    * Set only while a `connect()` is in flight. Invoking it closes the
    * pending WebSocket and rejects the connect promise — `close()` calls
@@ -82,7 +88,16 @@ export class WsTransport implements Transport {
     // drop frames the server may send immediately on its connection handler.
     ws.addEventListener('message', (ev) => {
       const text = this.toText((ev as MessageEvent).data);
-      if (text === undefined) return;
+      if (text === undefined) {
+        // Undecodable frame (unknown data type, or binary data on a
+        // runtime without TextDecoder) — surface it instead of silently
+        // dropping; a dropped frame otherwise shows up as a hung request.
+        this.emit({
+          type: 'error',
+          cause: new TransportError('undecodable message data from socket'),
+        });
+        return;
+      }
       for (const line of this.framer.push(text)) {
         this.emit({ type: 'data', text: line });
       }
@@ -204,12 +219,20 @@ export class WsTransport implements Transport {
 
   private toText(data: unknown): string | undefined {
     if (typeof data === 'string') return data;
-    if (data instanceof ArrayBuffer) return this.decoder.decode(new Uint8Array(data));
-    if (ArrayBuffer.isView(data)) {
-      return this.decoder.decode(data as ArrayBufferView as Uint8Array);
-    }
+    // Buffer check comes BEFORE the generic view check: Buffer IS a
+    // Uint8Array, and its own utf-8 decoding needs no TextDecoder (which
+    // Hermes lacks).
     if (typeof Buffer !== 'undefined' && Buffer.isBuffer(data)) {
       return data.toString('utf-8');
+    }
+    if (typeof TextDecoder === 'undefined') return undefined;
+    if (data instanceof ArrayBuffer) {
+      this.decoder ??= new TextDecoder();
+      return this.decoder.decode(new Uint8Array(data));
+    }
+    if (ArrayBuffer.isView(data)) {
+      this.decoder ??= new TextDecoder();
+      return this.decoder.decode(data as ArrayBufferView as Uint8Array);
     }
     return undefined;
   }
