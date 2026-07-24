@@ -211,6 +211,73 @@ describe('WsTransport', () => {
     await expect(transport.connect()).rejects.toBeInstanceOf(TransportError);
   });
 
+  it('works without a global TextDecoder (Hermes): construct + text frames flow, binary surfaces an error', async () => {
+    // Stock React Native Hermes has no TextDecoder. Constructing the
+    // transport must not require one (the field initializer used to throw),
+    // text frames must flow, and a binary frame must surface as a transport
+    // error instead of being dropped silently.
+    const g = globalThis as { TextDecoder?: unknown };
+    const saved = g.TextDecoder;
+    g.TextDecoder = undefined;
+    try {
+      type Listener = (ev: unknown) => void;
+      class FakeWs {
+        static last: FakeWs;
+        readonly listeners = new Map<string, Listener[]>();
+        binaryType = '';
+        readyState = 0;
+        CLOSED = 3;
+        constructor(_url: string) {
+          FakeWs.last = this;
+        }
+        addEventListener(type: string, cb: Listener): void {
+          const arr = this.listeners.get(type) ?? [];
+          arr.push(cb);
+          this.listeners.set(type, arr);
+        }
+        removeEventListener(type: string, cb: Listener): void {
+          this.listeners.set(
+            type,
+            (this.listeners.get(type) ?? []).filter((l) => l !== cb),
+          );
+        }
+        dispatch(type: string, ev: unknown): void {
+          for (const cb of this.listeners.get(type) ?? []) cb(ev);
+        }
+        send(_data: string): void {}
+        close(): void {
+          this.readyState = this.CLOSED;
+          this.dispatch('close', { code: 1000 });
+        }
+      }
+
+      const transport = new WsTransport({
+        endpoint: { host: HOST, port: 1, protocol: 'ws' },
+        WebSocket: FakeWs as unknown as new (url: string) => WebSocket,
+      });
+      const events: TransportEvent[] = [];
+      transport.on((ev) => events.push(ev));
+
+      const pending = transport.connect();
+      FakeWs.last.dispatch('open', {});
+      await pending;
+
+      FakeWs.last.dispatch('message', { data: '{"id":1,"result":"ok"}\n' });
+      expect(events).toContainEqual({ type: 'data', text: '{"id":1,"result":"ok"}' });
+
+      FakeWs.last.dispatch('message', { data: new Uint8Array([0x7b, 0x7d, 0x0a]).buffer });
+      expect(
+        events.some(
+          (e) => e.type === 'error' && String(e.cause).includes('undecodable message data'),
+        ),
+      ).toBe(true);
+
+      await transport.close();
+    } finally {
+      g.TextDecoder = saved;
+    }
+  });
+
   it('builds the URL with optional path', async () => {
     let connectedPath: string | undefined;
     srv.server.on('connection', (_sock, req) => {
