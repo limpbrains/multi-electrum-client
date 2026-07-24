@@ -157,7 +157,9 @@ jobs:
           echo "HARNESS_IOS_VERSION=$RUNTIME" >> "$GITHUB_ENV"
           echo "Using $DEVICE on iOS $RUNTIME"
       - name: Build iOS app
-        run: cd test/rn/app && npx react-native build-ios --mode Debug --buildFolder ./ios/build
+        # NOTE: build-ios resolves --buildFolder relative to the ios/
+        # directory, so ./build lands at test/rn/app/ios/build.
+        run: cd test/rn/app && npx react-native build-ios --mode Debug --buildFolder ./build
       # NOTE: `app` is resolved relative to projectRoot by the action.
       - uses: callstackincubator/react-native-harness@v1.2.0
         with:
