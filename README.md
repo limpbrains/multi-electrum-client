@@ -20,6 +20,11 @@ whose value proposition is **resilience**, not raw speed:
 - One library instance manages multiple server connections; per-request routing.
 - Ban / rate-limit detection per server software (ElectrumX, Fulcrum, electrs).
 - Partial batch failures auto-redirect to another server, per item.
+- Retryable batch failures re-route as one re-batched wire call per fallback
+  server — a dead 300-item batch costs one extra round-trip, not 300 singles.
+- Opt-in hedged requests (`hedging: { afterMs }`) — a server that accepts a
+  request then hangs costs `afterMs` before the same call races on a second
+  server; first success wins. Idempotent methods only (never `broadcast`).
 - Subscriptions replay + catch-up diff on reconnect — handlers don't miss events.
 - Auto-reconnect on transport faults with exponential backoff + jitter.
 - `suspend()` / `resume()` for React Native background lifecycle.

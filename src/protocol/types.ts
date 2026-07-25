@@ -207,6 +207,16 @@ export interface CallOpts {
   autoBatch?: boolean;
   retry?: 'auto' | 'none' | { maxAttempts: number };
   /**
+   * Per-call hedging override. `false` suppresses a manager-enabled hedge
+   * for this call; `true` requests one explicitly. Requires
+   * `ManagerOptions.hedging` for the delay value — with no manager-level
+   * config there is nothing to arm, so `hedge: true` is a no-op. Methods
+   * with side effects (`blockchain.transaction.broadcast`) and
+   * session-bound methods (`*.subscribe` / `*.unsubscribe`) never hedge,
+   * regardless of this flag.
+   */
+  hedge?: boolean;
+  /**
    * Hint to bypass `policy.pick` and route to this exact client. Honored by
    * the manager when the client is connected, non-banned, and not in the
    * `excluded` set; otherwise the call falls through to the normal pick.
@@ -254,6 +264,19 @@ export interface ManagerOptions {
    * and admits ws/wss peers it doesn't already have. See `DiscoverOptions`.
    */
   discover?: DiscoverOptions;
+  /**
+   * Opt-in hedged requests for the single-call path. When a call hasn't
+   * settled within `afterMs`, the manager fires the same request on a
+   * second eligible client (policy pick with the first excluded) WITHOUT
+   * cancelling the first; the first success settles the caller and the
+   * loser's late reply is swallowed (still recorded in telemetry).
+   * Bounds a hung-but-accepting server to `afterMs` instead of the full
+   * `requestTimeoutMs`. Only idempotent methods hedge — broadcast and
+   * `*.subscribe` / `*.unsubscribe` are hard-excluded — and batches are
+   * never hedged. Absent = off (no behavior change); per-call override
+   * via `CallOpts.hedge`.
+   */
+  hedging?: { afterMs: number };
   /**
    * Issue `server.version(clientName, protocolVersion)` on every
    * connect to populate the client's `capabilities.serverSoftware`.

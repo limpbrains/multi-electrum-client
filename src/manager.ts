@@ -112,6 +112,29 @@ type AttemptOutcome =
   // stale id from a custom policy) → exclude + retry.
   | { kind: 'client-missing'; clientId: ClientId; error: Error };
 
+type AttemptFailure = Extract<AttemptOutcome, { kind: 'error' }>;
+
+/** Result of resolving a routing decision to a live client (see `pickFor`). */
+type PickResult =
+  | { kind: 'picked'; clientId: ClientId; client: ElectrumClient }
+  | Extract<AttemptOutcome, { kind: 'no-pick' | 'client-missing' }>;
+
+/**
+ * Outcome of one (possibly hedged) attempt cycle. `failures` carries one
+ * entry when only the primary dispatch ran, two when a hedge also
+ * dispatched and both failed — the retry loop excludes every listed client
+ * and advances the attempt counter per entry.
+ */
+type HedgedAttemptOutcome =
+  | Extract<AttemptOutcome, { kind: 'success' | 'no-pick' | 'client-missing' }>
+  | { kind: 'failures'; failures: AttemptFailure[] };
+
+/** A batch item that failed retryably, paired with its most recent error. */
+interface RetryEntry {
+  item: BatchItem;
+  error: Error;
+}
+
 /**
  * Trailing-args shape for `Manager.call`. Methods whose registry entry has an
  * empty params tuple (e.g. `server.ping`) accept `params` as optional;
@@ -132,6 +155,8 @@ export class ElectrumManager {
   private readonly policy: RoutingPolicy;
   private readonly classifier: ErrorClassifier;
   private readonly autoBatchEnabled: boolean;
+  /** Hedged-request config; `undefined` = hedging off (see ManagerOptions.hedging). */
+  private readonly hedging: { afterMs: number } | undefined;
   private readonly cooldownMs: number;
   private readonly requestTimeoutMs: number | undefined;
   private readonly transportFactory: (endpoint: Endpoint) => Transport;
@@ -225,6 +250,7 @@ export class ElectrumManager {
     this.policy = opts.policy;
     this.classifier = opts.classifier ?? defaultClassifier;
     this.autoBatchEnabled = opts.autoBatch ?? true;
+    this.hedging = opts.hedging;
     this.cooldownMs = opts.cooldownMs ?? 60_000;
     this.requestTimeoutMs = opts.requestTimeoutMs;
     this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
@@ -1105,7 +1131,14 @@ export class ElectrumManager {
     let missCount = 0;
     const missCap = this.clients.size + 4;
     while (attempt < maxAttempts) {
-      const outcome = await this.attemptOnce(method, params, excluded, attempt, opts);
+      const hedgeAfterMs = this.hedgeDelayFor(method, opts);
+      let outcome: HedgedAttemptOutcome;
+      if (hedgeAfterMs !== null) {
+        outcome = await this.attemptHedged(method, params, excluded, attempt, hedgeAfterMs, opts);
+      } else {
+        const o = await this.attemptOnce(method, params, excluded, attempt, opts);
+        outcome = o.kind === 'error' ? { kind: 'failures', failures: [o] } : o;
+      }
       if (outcome.kind === 'success') return outcome.value;
       if (outcome.kind === 'no-pick') throw lastErr ?? outcome.error;
       if (outcome.kind === 'client-missing') {
@@ -1121,13 +1154,112 @@ export class ElectrumManager {
         // Don't bump `attempt`: missing-client doesn't count as a real try.
         continue;
       }
-      // 'error'
-      lastErr = outcome.error;
-      excluded.add(outcome.clientId);
-      attempt++;
-      if (!isRetryable(outcome.errorKind)) throw outcome.error;
+      // 'failures': one entry on the plain path, two when a hedge also
+      // dispatched and both failed. Counting choice: every dispatched wire
+      // request consumes one unit of the pool-size attempt budget — each
+      // burned a distinct client and joins `excluded` — so a both-failed
+      // hedge advances `attempt` by 2 and the loop still cannot outlive
+      // the pool. A non-retryable failure on either branch aborts (first
+      // one in settle order wins, matching the single path's throw).
+      let fatal: Error | undefined;
+      for (const f of outcome.failures) {
+        lastErr = f.error;
+        excluded.add(f.clientId);
+        attempt++;
+        if (fatal === undefined && !isRetryable(f.errorKind)) fatal = f.error;
+      }
+      if (fatal !== undefined) throw fatal;
     }
     throw lastErr ?? new NoClientAvailableError('exhausted retry budget');
+  }
+
+  /**
+   * Resolve the hedge delay for one single-path call, or `null` when
+   * hedging must not run. Precedence: methods that are unsafe to duplicate
+   * are hard-excluded regardless of any override; pinned calls
+   * (`preferClient`) never hedge — a duplicate on a different server would
+   * contradict the pin; then the per-call `hedge` override; then the
+   * manager default (config present = on). Without `ManagerOptions.hedging`
+   * there is no delay value to arm, so even `hedge: true` is a no-op.
+   */
+  private hedgeDelayFor(method: string, opts?: CallOpts): number | null {
+    if (!this.hedging) return null;
+    if (!isHedgeableMethod(method)) return null;
+    if (opts?.preferClient !== undefined) return null;
+    if (opts?.hedge === false) return null;
+    return this.hedging.afterMs;
+  }
+
+  /**
+   * One hedged pick-and-call cycle. Dispatch on the policy's pick; if the
+   * call hasn't settled within `afterMs`, dispatch the SAME request on a
+   * second client (primary excluded) WITHOUT cancelling the first. First
+   * success wins; the losing branch settles later, is swallowed here, and
+   * still records telemetry / onOutcome inside `executeOn`. When no second
+   * client is eligible (no-pick, or a stale id) we just keep waiting on the
+   * primary. At most one hedge per attempt. The hedge's pick sees
+   * `attempt + 1` — from the policy's viewpoint it is the next try.
+   */
+  private async attemptHedged(
+    method: string,
+    params: readonly unknown[],
+    excluded: ReadonlySet<ClientId>,
+    attempt: number,
+    afterMs: number,
+    opts?: CallOpts,
+  ): Promise<HedgedAttemptOutcome> {
+    const picked = this.pickFor(method, params, excluded, attempt, opts);
+    if (picked.kind !== 'picked') return picked;
+    const primary = this.executeOn(picked.clientId, picked.client, method, params);
+
+    // The timer is cleared on every path where it hasn't fired — a settled
+    // race would otherwise leak the handle (and a pending timer across
+    // stop()/suspend() would fire against a torn-down pool).
+    let timerId: ReturnType<typeof setTimeout> | undefined;
+    const timer = new Promise<'hedge-now'>((resolve) => {
+      timerId = setTimeout(() => resolve('hedge-now'), afterMs);
+    });
+    const first = await Promise.race([primary, timer]);
+    if (first !== 'hedge-now') {
+      clearTimeout(timerId);
+      return first.kind === 'success' ? first : { kind: 'failures', failures: [first] };
+    }
+
+    // Primary still pending past afterMs — try to pick a second client.
+    const hedgeExcluded = new Set(excluded);
+    hedgeExcluded.add(picked.clientId);
+    const hedgePick = this.pickFor(method, params, hedgeExcluded, attempt + 1, opts);
+    if (hedgePick.kind !== 'picked') {
+      // No usable second client right now: wait out the primary rather
+      // than failing a call that may yet succeed.
+      const outcome = await primary;
+      return outcome.kind === 'success' ? outcome : { kind: 'failures', failures: [outcome] };
+    }
+    const hedge = this.executeOn(hedgePick.clientId, hedgePick.client, method, params);
+
+    // First success settles the caller immediately; otherwise wait for BOTH
+    // failures so the retry loop can exclude both clients in one go.
+    // `executeOn` never rejects, so the losing branch cannot surface as an
+    // unhandled rejection.
+    return new Promise<HedgedAttemptOutcome>((resolve) => {
+      const failures: AttemptFailure[] = [];
+      let done = false;
+      const onSettle = (o: Extract<AttemptOutcome, { kind: 'success' | 'error' }>): void => {
+        if (done) return;
+        if (o.kind === 'success') {
+          done = true;
+          resolve(o);
+          return;
+        }
+        failures.push(o);
+        if (failures.length === 2) {
+          done = true;
+          resolve({ kind: 'failures', failures });
+        }
+      };
+      void primary.then(onSettle);
+      void hedge.then(onSettle);
+    });
   }
 
   /**
@@ -1325,6 +1457,23 @@ export class ElectrumManager {
     attempt: number,
     opts?: CallOpts,
   ): Promise<AttemptOutcome> {
+    const picked = this.pickFor(method, params, excluded, attempt, opts);
+    if (picked.kind !== 'picked') return picked;
+    return this.executeOn(picked.clientId, picked.client, method, params);
+  }
+
+  /**
+   * Routing decision resolved to a live client. Shared by the single path
+   * (`attemptOnce`), the hedge path (primary and hedge picks), and the
+   * batch-retry re-pick (`redispatchGroup`).
+   */
+  private pickFor(
+    method: string,
+    params: readonly unknown[],
+    excluded: ReadonlySet<ClientId>,
+    attempt: number,
+    opts?: CallOpts,
+  ): PickResult {
     const candidates = this.buildCandidates();
     const now = Date.now();
 
@@ -1366,6 +1515,22 @@ export class ElectrumManager {
         error: new NoClientAvailableError(`client ${clientId} no longer in pool`),
       };
     }
+    return { kind: 'picked', clientId, client };
+  }
+
+  /**
+   * Fire one wire call on a known client and record the outcome. Telemetry
+   * / onOutcome / ban bookkeeping happens at settle time — for a hedged
+   * loser that is AFTER the caller has already been resolved, which is
+   * exactly what we want: the slow server's latency (or late error) still
+   * feeds the policy.
+   */
+  private async executeOn(
+    clientId: ClientId,
+    client: ElectrumClient,
+    method: string,
+    params: readonly unknown[],
+  ): Promise<Extract<AttemptOutcome, { kind: 'success' | 'error' }>> {
     const start = Date.now();
     try {
       const value = await client.call(method, params);
@@ -1444,22 +1609,26 @@ export class ElectrumManager {
     try {
       results = await client.batchCall(grp.map((i) => ({ method: i.method, params: i.params })));
     } catch (e) {
-      // Whole-batch transport failure. Treat every item as failed and retry.
+      // Whole-batch transport failure. Every item failed on this client;
+      // the retryable ones re-route together as one group.
       const elapsed = Date.now() - start;
       const kind = this.classifyFor(clientId, '<batch>', e, elapsed);
       this.recordError(clientId, '<batch>', kind, elapsed);
+      const retryable: RetryEntry[] = [];
       for (const item of grp) {
         item.excluded.add(clientId);
         if (isRetryable(kind)) {
-          this.maybeRetry(item, e as Error);
+          retryable.push({ item, error: e as Error });
         } else {
           item.def.reject(e);
         }
       }
+      this.retryGroup(retryable);
       return;
     }
 
     const elapsed = Date.now() - start;
+    const retryable: RetryEntry[] = [];
     for (let i = 0; i < grp.length; i++) {
       const item = grp[i]!;
       const r = results[i]!;
@@ -1471,36 +1640,107 @@ export class ElectrumManager {
         this.recordError(clientId, item.method, kind, elapsed);
         item.excluded.add(clientId);
         if (isRetryable(kind)) {
-          this.maybeRetry(item, r.error);
+          retryable.push({ item, error: r.error });
         } else {
           item.def.reject(r.error);
         }
       }
     }
+    // Covers the Fulcrum whole-batch `id: null` rejection too: batchCall
+    // maps it onto every item as a per-item RpcError, the classifier calls
+    // it rate-limit, and the entire group re-routes here in one piece.
+    this.retryGroup(retryable);
   }
 
-  private maybeRetry(item: BatchItem, lastError: Error): void {
-    item.attempt++;
-    if (item.attempt >= this.maxAttemptsFor(item.opts)) {
-      item.def.reject(lastError);
+  /**
+   * Re-route the retryable survivors of a failed batch dispatch. The failed
+   * dispatch already consumed one attempt per item (same accounting as the
+   * single path); items whose budget is spent reject with their own last
+   * error. Survivors retry as ONE wire batch — the measured alternative
+   * (per-item single-shot retries) degrades a dead ~300-item batch into
+   * hundreds of sequential wire calls. A lone survivor takes the single-call
+   * path instead: batch framing buys nothing for one item and the single
+   * path carries hedging.
+   */
+  private retryGroup(entries: RetryEntry[]): void {
+    const live: RetryEntry[] = [];
+    for (const e of entries) {
+      e.item.attempt++;
+      if (e.item.attempt >= this.maxAttemptsFor(e.item.opts)) {
+        e.item.def.reject(e.error);
+      } else {
+        live.push(e);
+      }
+    }
+    if (live.length === 0) return;
+    if (live.length === 1) {
+      // Seed `runAttempts` with the previous error so a final
+      // NoClientAvailableError surfaces the actual cause.
+      const { item, error } = live[0]!;
+      void this.runAttempts(
+        item.method,
+        item.params,
+        item.excluded,
+        this.maxAttemptsFor(item.opts),
+        item.attempt,
+        item.opts,
+        error,
+      ).then(
+        (v) => item.def.resolve(v),
+        (e) => item.def.reject(e),
+      );
       return;
     }
-    // Retries take the direct (single-shot) path. Re-batching them across the
-    // next microtask boundary buys little and complicates ordering guarantees.
-    // Seed `runAttempts` with the original error so a final
-    // NoClientAvailableError surfaces the actual cause.
-    this.runAttempts(
-      item.method,
-      item.params,
-      item.excluded,
-      this.maxAttemptsFor(item.opts),
-      item.attempt,
-      item.opts,
-      lastError,
-    ).then(
-      (v) => item.def.resolve(v),
-      (e) => item.def.reject(e),
-    );
+    void this.redispatchGroup(live).catch((e) => this.emit('error', e));
+  }
+
+  /**
+   * Route a retry group ONCE via the policy and dispatch it as a single
+   * wire batch. Promise-per-item mapping survives because `dispatchGroup`
+   * pairs results to items by array index (ids are allocated per wire
+   * batch inside the client); further failures loop back through
+   * `retryGroup` until success, a fatal per-item error, budget exhaustion,
+   * or no eligible client — in that last case each item rejects with its
+   * own last error, the group analogue of `runAttempts`' `throw lastErr`.
+   *
+   * The pick uses the FIRST item's method/params as the representative
+   * request, the union of the items' exclusion sets, and their highest
+   * attempt count. Items batched together were routed together, so their
+   * exclusion histories only diverge when per-item budgets differ; the
+   * union guarantees no item lands back on a client that already failed it.
+   */
+  private async redispatchGroup(entries: RetryEntry[]): Promise<void> {
+    const excluded = new Set<ClientId>();
+    let attempt = 0;
+    for (const e of entries) {
+      for (const id of e.item.excluded) excluded.add(id);
+      attempt = Math.max(attempt, e.item.attempt);
+    }
+    // Same stale-id recovery bound as runAttempts.
+    let missCount = 0;
+    const missCap = this.clients.size + 4;
+    for (;;) {
+      const rep = entries[0]!.item;
+      const picked = this.pickFor(rep.method, rep.params, excluded, attempt, rep.opts);
+      if (picked.kind === 'no-pick') {
+        for (const e of entries) e.item.def.reject(e.error);
+        return;
+      }
+      if (picked.kind === 'client-missing') {
+        excluded.add(picked.clientId);
+        for (const e of entries) e.item.excluded.add(picked.clientId);
+        if (++missCount > missCap) {
+          for (const e of entries) e.item.def.reject(e.error);
+          return;
+        }
+        continue;
+      }
+      await this.dispatchGroup(
+        picked.clientId,
+        entries.map((e) => e.item),
+      );
+      return;
+    }
   }
 
   private buildCandidates(): ClientView[] {
@@ -1618,6 +1858,16 @@ function isRetryable(kind: ErrorKind): boolean {
   // Server-availability-class errors get a re-pick. Caller-owned errors
   // (rpc-error, protocol) are bubbled — the request itself is wrong.
   return kind === 'transport' || kind === 'timeout' || kind === 'rate-limit';
+}
+
+function isHedgeableMethod(method: string): boolean {
+  // Hedging duplicates a request on a second server, so it is only safe
+  // for idempotent reads. Broadcast is a state-changing submit; subscribe /
+  // unsubscribe are session-bound (a duplicate would leave a stray
+  // subscription on a server the registry doesn't track).
+  if (method === 'blockchain.transaction.broadcast') return false;
+  if (method.endsWith('.subscribe') || method.endsWith('.unsubscribe')) return false;
+  return true;
 }
 
 function sleep(ms: number): Promise<void> {
