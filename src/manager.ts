@@ -209,12 +209,14 @@ export class ElectrumManager {
    */
   private poolBaselineReady = false;
   /**
-   * >0 while an intentional pool mutation (removeServer) is mid-flight.
-   * The client's own `disconnected` transition fires before the entry
-   * leaves the pool; without suppression a healthy 2-server pool would
-   * emit a false online→degraded→online staircase on removal.
+   * Clients whose removeServer() is mid-flight. Their `disconnected`
+   * transition fires before the entry leaves the pool; counting them
+   * would emit a false online→degraded→online staircase on removal of a
+   * healthy server. They are excluded from the pool-state computation
+   * (not globally suppressed — an unrelated outage during the removal
+   * window must still emit immediately).
    */
-  private poolStateSuppressed = 0;
+  private readonly removingServers = new Set<ClientId>();
   /** Timer armed for the earliest future `bannedUntil` (see `armBanExpiryTimer`). */
   private banExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -661,17 +663,17 @@ export class ElectrumManager {
     // entirely (the latter would surface as a misleading "client disappeared"
     // error). Only after the socket is closed do we drop the entry.
     //
-    // Pool-state is suppressed for the duration: the interim
-    // "disconnected but still pooled" snapshot would read as degraded
-    // even though this removal is intentional. One recompute fires after
-    // the entry is gone.
-    this.poolStateSuppressed++;
+    // The departing client is excluded from pool-state for the duration:
+    // its interim "disconnected but still pooled" snapshot would read as
+    // degraded even though this removal is intentional. Other clients
+    // keep counting — an unrelated outage mid-removal emits immediately.
+    this.removingServers.add(id);
     try {
       await c.disconnect();
     } catch (e) {
       this.emit('error', e);
     } finally {
-      this.poolStateSuppressed--;
+      this.removingServers.delete(id);
     }
     this.clients.delete(id);
     this.meta.delete(id);
@@ -1171,19 +1173,24 @@ export class ElectrumManager {
    * `unsubscribe` at the bound server (a fall-through to a different
    * server would no-op or surface a misleading rpc-error).
    */
-  /** Count connected / usable clients and derive the aggregate status. */
+  /**
+   * Count connected / usable clients and derive the aggregate status.
+   * Clients mid-removeServer are excluded entirely (see `removingServers`).
+   */
   private computePoolState(): PoolState {
     const now = Date.now();
+    let total = 0;
     let connected = 0;
     let usable = 0;
     for (const [id, client] of this.clients) {
+      if (this.removingServers.has(id)) continue;
+      total++;
       if (client.getState() !== 'connected') continue;
       connected++;
       const meta = this.meta.get(id);
       if (meta?.bannedUntil !== undefined && meta.bannedUntil > now) continue;
       usable++;
     }
-    const total = this.clients.size;
     const status: PoolStatus =
       total === 0 || usable === 0 ? 'offline' : usable === total ? 'online' : 'degraded';
     return { status, usable, connected, total };
@@ -1197,7 +1204,6 @@ export class ElectrumManager {
    */
   private maybeEmitPoolState(): void {
     if (this.lifecycle !== 'running' || !this.poolBaselineReady) return;
-    if (this.poolStateSuppressed > 0) return;
     this.armBanExpiryTimer();
     const state = this.computePoolState();
     if (state.status === this.lastPoolStatus) return;
