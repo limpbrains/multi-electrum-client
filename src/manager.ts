@@ -62,10 +62,44 @@ interface BatchItem {
   excluded: Set<ClientId>;
 }
 
+/** Aggregate connectivity of the whole pool. */
+export type PoolStatus = 'online' | 'degraded' | 'offline';
+
+/**
+ * Snapshot of pool connectivity, emitted as the `pool-state` event and
+ * returned by `manager.poolState`.
+ *
+ *  - `offline`  — no usable client (pool empty, everything disconnected
+ *                 or banned). UIs typically show a "no connection" banner.
+ *  - `degraded` — at least one usable client, but not all of them.
+ *  - `online`   — every pooled client is connected and unbanned.
+ */
+export interface PoolState {
+  status: PoolStatus;
+  /** Clients that are `connected` and not under a ban — actually routable. */
+  usable: number;
+  /** Clients in `connected` state, including banned ones. */
+  connected: number;
+  /** Pool size. */
+  total: number;
+}
+
 export interface ManagerEvents {
   'client-state': { clientId: ClientId; state: ConnectionState };
   'client-banned': { clientId: ClientId; until: number; reason: ErrorKind };
   'subscription-restored': { method: string; params: readonly unknown[]; drift: boolean };
+  /**
+   * Fired when the pool's aggregate `status` changes (`online` /
+   * `degraded` / `offline`), including by a ban expiring — the manager
+   * arms an internal timer for the earliest `bannedUntil`, so the
+   * offline→online transition fires without any traffic.
+   *
+   * Guarantees: exactly one baseline event after `await start()` (even
+   * when every initial connect failed) and one after `resume()`.
+   * Suppressed while suspending / suspended / resuming — a deliberate
+   * pause is not an outage; read `manager.state` for lifecycle.
+   */
+  'pool-state': PoolState;
   error: unknown;
 }
 
@@ -162,6 +196,20 @@ export class ElectrumManager {
   }> = [];
   // Standard typed-event-emitter pattern: store opaquely, cast at the API edge.
   private readonly listeners = new Map<keyof ManagerEvents, Set<(p: unknown) => void>>();
+  /**
+   * Last emitted pool status. `null` = no baseline yet — the next
+   * `maybeEmitPoolState` emits unconditionally. Reset by `resume()` so
+   * the post-resume snapshot always fires, and by `stop()`.
+   */
+  private lastPoolStatus: PoolStatus | null = null;
+  /**
+   * Pool-state events are gated until `start()`'s initial connect wave
+   * settles — otherwise a 3-server start would emit a noisy
+   * offline→degraded→online staircase before `start()` even returns.
+   */
+  private poolBaselineReady = false;
+  /** Timer armed for the earliest future `bannedUntil` (see `armBanExpiryTimer`). */
+  private banExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: ManagerOptions & { transportFactory?: (e: Endpoint) => Transport }) {
     this.network = opts.network;
@@ -214,6 +262,11 @@ export class ElectrumManager {
     return this.lifecycle;
   }
 
+  /** Current aggregate pool connectivity. Always freshly computed. */
+  get poolState(): PoolState {
+    return this.computePoolState();
+  }
+
   /**
    * Connect every server in parallel. Errors do not throw; they fire
    * `error` events. Only valid from `created` (fresh manager). `stop()`
@@ -242,6 +295,12 @@ export class ElectrumManager {
       }
     });
     await Promise.all(tasks);
+    // Initial connect wave settled — release the pool-state gate and
+    // emit the baseline snapshot. `lastPoolStatus` is null here, so this
+    // fires even when every connect failed (all-offline start is exactly
+    // the case a UI most wants to hear about).
+    this.poolBaselineReady = true;
+    this.maybeEmitPoolState();
     // If a cache is configured we need a tip to gate finalized writes.
     await this.installTipSubscription();
   }
@@ -311,6 +370,13 @@ export class ElectrumManager {
     // Auto-reconnect off — clear timers + intent flags so a `disconnected`
     // event triggered by our own `c.disconnect()` below doesn't reschedule.
     this.reconnect.clear();
+    // Pool-state machinery off — no post-stop emits, no dangling timer.
+    if (this.banExpiryTimer !== null) {
+      clearTimeout(this.banExpiryTimer);
+      this.banExpiryTimer = null;
+    }
+    this.poolBaselineReady = false;
+    this.lastPoolStatus = null;
     if (this.tipUnsub) {
       try {
         await this.tipUnsub();
@@ -534,6 +600,10 @@ export class ElectrumManager {
     // microtask-scheduled caller can sneak in.
     const queued = this.suspendQueue.splice(0);
     this.lifecycle = 'running';
+    // Fresh baseline after the pause: reset so the post-resume snapshot
+    // always emits, even if the status happens to match the pre-suspend one.
+    this.lastPoolStatus = null;
+    this.maybeEmitPoolState();
     for (const item of queued) {
       this.call(item.method, item.params, item.opts).then(
         (v) => item.def.resolve(v),
@@ -564,6 +634,9 @@ export class ElectrumManager {
     if (this.lifecycle === 'created') return;
     if (this.lifecycle === 'suspending' || this.lifecycle === 'suspended') return;
     client.connect().catch((e) => this.emit('error', e));
+    // Pool grew: `online` may drop to `degraded` until the new client
+    // connects (its own state transitions re-emit as they land).
+    this.maybeEmitPoolState();
   }
 
   async removeServer(id: ClientId): Promise<void> {
@@ -583,6 +656,7 @@ export class ElectrumManager {
     }
     this.clients.delete(id);
     this.meta.delete(id);
+    this.maybeEmitPoolState();
   }
 
   /**
@@ -971,6 +1045,7 @@ export class ElectrumManager {
         // / stopped the manager.
         this.reconnect.schedule(spec.id);
       }
+      this.maybeEmitPoolState();
     });
     this.clients.set(spec.id, client);
     this.reconnect.register(spec.id);
@@ -1077,6 +1152,71 @@ export class ElectrumManager {
    * `unsubscribe` at the bound server (a fall-through to a different
    * server would no-op or surface a misleading rpc-error).
    */
+  /** Count connected / usable clients and derive the aggregate status. */
+  private computePoolState(): PoolState {
+    const now = Date.now();
+    let connected = 0;
+    let usable = 0;
+    for (const [id, client] of this.clients) {
+      if (client.getState() !== 'connected') continue;
+      connected++;
+      const meta = this.meta.get(id);
+      if (meta?.bannedUntil !== undefined && meta.bannedUntil > now) continue;
+      usable++;
+    }
+    const total = this.clients.size;
+    const status: PoolStatus =
+      total === 0 || usable === 0 ? 'offline' : usable === total ? 'online' : 'degraded';
+    return { status, usable, connected, total };
+  }
+
+  /**
+   * Recompute pool state and emit `pool-state` if the aggregate status
+   * changed. Gated to `running` + post-baseline (see the field docs).
+   * Also (re-)arms the ban-expiry timer so a ban lapsing flips the
+   * status without any traffic.
+   */
+  private maybeEmitPoolState(): void {
+    if (this.lifecycle !== 'running' || !this.poolBaselineReady) return;
+    this.armBanExpiryTimer();
+    const state = this.computePoolState();
+    if (state.status === this.lastPoolStatus) return;
+    this.lastPoolStatus = state.status;
+    this.emit('pool-state', state);
+  }
+
+  /**
+   * One timer for the earliest future `bannedUntil`. Bans are lifted
+   * lazily (a timestamp comparison at pick time) — without this, a pool
+   * that went `offline` because every client was banned would never
+   * emit the recovery transition until the next call or socket event.
+   */
+  private armBanExpiryTimer(): void {
+    if (this.banExpiryTimer !== null) {
+      clearTimeout(this.banExpiryTimer);
+      this.banExpiryTimer = null;
+    }
+    const now = Date.now();
+    let earliest = Infinity;
+    for (const m of this.meta.values()) {
+      if (m.bannedUntil !== undefined && m.bannedUntil > now && m.bannedUntil < earliest) {
+        earliest = m.bannedUntil;
+      }
+    }
+    if (earliest === Infinity) return;
+    const t = setTimeout(
+      () => {
+        this.banExpiryTimer = null;
+        this.maybeEmitPoolState();
+      },
+      earliest - now + 1,
+    );
+    if (typeof t === 'object' && t !== null && 'unref' in t) {
+      (t as { unref: () => void }).unref();
+    }
+    this.banExpiryTimer = t;
+  }
+
   private isClientUsable(id: ClientId): boolean {
     const client = this.clients.get(id);
     if (!client || client.getState() !== 'connected') return false;
@@ -1408,6 +1548,9 @@ export class ElectrumManager {
           until: m.bannedUntil,
           reason: kind,
         });
+        // A ban shrinks the usable pool — maybe to zero. Also arms the
+        // ban-expiry timer for the recovery transition.
+        this.maybeEmitPoolState();
       }
     }
     this.invokeOnOutcome({ kind: 'error', clientId: id, method, error: kind, latencyMs });
