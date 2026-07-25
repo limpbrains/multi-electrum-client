@@ -86,6 +86,15 @@ export class ElectrumClient {
   private readonly transport: Transport;
   private readonly requestTimeoutMs: number;
   private readonly inFlight = new Map<JsonRpcId, InFlight>();
+  /**
+   * Id-sets of wire batches currently awaiting responses, in send order.
+   * Some servers (Fulcrum: `"Batch limit exceeded"`, code 4) reject an
+   * oversized batch with a SINGLE error object whose `id` is `null`
+   * instead of a response array — per the JSON-RPC 2.0 spec for an
+   * invalid batch. Without this bookkeeping that reply matches no
+   * in-flight id and every item would hang until its timeout.
+   */
+  private readonly openBatches: JsonRpcId[][] = [];
   private nextId = 1;
   private state: ConnectionState = 'disconnected';
   private connectedAt: number | undefined;
@@ -197,7 +206,16 @@ export class ElectrumClient {
       throw e;
     }
 
-    return Promise.all(promises);
+    // Track the batch so a batch-level `id: null` error reply can be
+    // mapped back to these items (see `dispatch`). Entry is dropped once
+    // every item has settled, however it settled.
+    this.openBatches.push(ids);
+    const settled = Promise.all(promises);
+    void settled.then(() => {
+      const i = this.openBatches.indexOf(ids);
+      if (i >= 0) this.openBatches.splice(i, 1);
+    });
+    return settled;
   }
 
   /** Set the listener for server-initiated notifications (one per client). */
@@ -304,6 +322,16 @@ export class ElectrumClient {
       this.notifListener?.(msg);
       return;
     }
+    if (msg.id === null && 'error' in msg) {
+      // Batch-level rejection (e.g. Fulcrum's "Batch limit exceeded"):
+      // the server answered a whole batch with one id-less error object.
+      // Batches are answered in send order on a single connection, so
+      // map it onto the oldest open batch. With no open batch there is
+      // nothing to attribute it to — drop it (a lone id-less error can
+      // also be a reply to garbage we never sent).
+      this.failOldestOpenBatch(msg.error);
+      return;
+    }
     const inflight = this.inFlight.get(msg.id);
     if (!inflight) return; // unknown id (late response after timeout)
     this.inFlight.delete(msg.id);
@@ -317,6 +345,27 @@ export class ElectrumClient {
       );
     } else {
       inflight.def.resolve(msg.result);
+    }
+  }
+
+  /**
+   * Reject every item of the oldest open batch with the given wire error.
+   * Items already settled (timeout raced us) are skipped naturally — their
+   * ids are gone from `inFlight`.
+   */
+  private failOldestOpenBatch(e: { code: number; message: string; data?: unknown }): void {
+    const ids = this.openBatches.shift();
+    if (!ids) return;
+    const rpcError =
+      e.data !== undefined
+        ? new RpcError(e.message, e.code, e.data)
+        : new RpcError(e.message, e.code);
+    for (const id of ids) {
+      const inflight = this.inFlight.get(id);
+      if (!inflight) continue;
+      this.inFlight.delete(id);
+      clearTimeout(inflight.timer);
+      inflight.def.reject(rpcError);
     }
   }
 
