@@ -208,6 +208,13 @@ export class ElectrumManager {
    * offline→degraded→online staircase before `start()` even returns.
    */
   private poolBaselineReady = false;
+  /**
+   * >0 while an intentional pool mutation (removeServer) is mid-flight.
+   * The client's own `disconnected` transition fires before the entry
+   * leaves the pool; without suppression a healthy 2-server pool would
+   * emit a false online→degraded→online staircase on removal.
+   */
+  private poolStateSuppressed = 0;
   /** Timer armed for the earliest future `bannedUntil` (see `armBanExpiryTimer`). */
   private banExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -602,6 +609,10 @@ export class ElectrumManager {
     this.lifecycle = 'running';
     // Fresh baseline after the pause: reset so the post-resume snapshot
     // always emits, even if the status happens to match the pre-suspend one.
+    // `poolBaselineReady` is normally set by start(), but a manager
+    // suspended straight from `created` reaches running through here
+    // without ever starting — resume owns the baseline in that path.
+    this.poolBaselineReady = true;
     this.lastPoolStatus = null;
     this.maybeEmitPoolState();
     for (const item of queued) {
@@ -649,10 +660,18 @@ export class ElectrumManager {
     // its 'disconnected' state via the candidate snapshot rather than missing
     // entirely (the latter would surface as a misleading "client disappeared"
     // error). Only after the socket is closed do we drop the entry.
+    //
+    // Pool-state is suppressed for the duration: the interim
+    // "disconnected but still pooled" snapshot would read as degraded
+    // even though this removal is intentional. One recompute fires after
+    // the entry is gone.
+    this.poolStateSuppressed++;
     try {
       await c.disconnect();
     } catch (e) {
       this.emit('error', e);
+    } finally {
+      this.poolStateSuppressed--;
     }
     this.clients.delete(id);
     this.meta.delete(id);
@@ -1178,6 +1197,7 @@ export class ElectrumManager {
    */
   private maybeEmitPoolState(): void {
     if (this.lifecycle !== 'running' || !this.poolBaselineReady) return;
+    if (this.poolStateSuppressed > 0) return;
     this.armBanExpiryTimer();
     const state = this.computePoolState();
     if (state.status === this.lastPoolStatus) return;
@@ -1204,13 +1224,14 @@ export class ElectrumManager {
       }
     }
     if (earliest === Infinity) return;
-    const t = setTimeout(
-      () => {
-        this.banExpiryTimer = null;
-        this.maybeEmitPoolState();
-      },
-      earliest - now + 1,
-    );
+    // setTimeout clamps delays above 2^31−1 ms (~24.8 days) to ~1ms,
+    // which would spin fire→rearm for the whole cooldown. Cap the delay;
+    // a capped timer just wakes up, recomputes, and re-arms the rest.
+    const delay = Math.min(earliest - now + 1, 2 ** 31 - 1);
+    const t = setTimeout(() => {
+      this.banExpiryTimer = null;
+      this.maybeEmitPoolState();
+    }, delay);
     if (typeof t === 'object' && t !== null && 'unref' in t) {
       (t as { unref: () => void }).unref();
     }
