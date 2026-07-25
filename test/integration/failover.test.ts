@@ -58,14 +58,25 @@ describe('integration: failover under toxiproxy faults', () => {
         expect(await manager.server.ping()).toBeNull();
       }
 
-      // After this much traffic the proxy view should be either
-      // 'disconnected' (close observed) or 'banned' (cooldown after error)
-      // and `direct` should still be 'connected'.
+      // Every ping above resolved, so retries routed around the dead
+      // lane. Assert the ROUTING outcome, not the raw socket state: on
+      // Android-emulator NAT (10.0.2.2) the RST from toxiproxy's
+      // disable may never reach the app, leaving the proxy socket
+      // half-open in 'connected' while its calls time out. On hosts
+      // that do see the RST the state flips to 'disconnected'/'banned'.
       const views = manager.getClientViews();
       const proxy = views.find((v) => v.id === 'proxy');
       const direct = views.find((v) => v.id === 'direct');
       expect(direct?.state).toBe('connected');
-      expect(proxy?.state).not.toBe('connected');
+      // 5 pings total, at most the pre-fault one can have succeeded on
+      // `proxy` — everything else landed on `direct`.
+      expect(direct?.telemetry.success.count ?? 0).toBeGreaterThanOrEqual(4);
+      const proxyDead =
+        proxy?.state !== 'connected' ||
+        (proxy.telemetry.errors.consecutive >= 1 &&
+          (proxy.telemetry.errors.lastKind === 'timeout' ||
+            proxy.telemetry.errors.lastKind === 'transport'));
+      expect(proxyDead).toBe(true);
     } finally {
       await manager.stop();
     }
