@@ -157,6 +157,75 @@ describe('ElectrumManager — pool-state events', () => {
     await manager.stop();
   });
 
+  it('emits a baseline on resume() even when the manager was suspended before start()', async () => {
+    const { manager, events } = build();
+    // Legal path: suspend straight from `created`, then resume — the
+    // manager reaches `running` without start() ever being called, so
+    // resume owns the baseline.
+    const suspendP = manager.suspend();
+    await flush();
+    await suspendP;
+    const resumeP = manager.resume();
+    await flush();
+    await resumeP;
+    expect(events.map((e) => e.status)).toEqual(['online']);
+    await manager.stop();
+  });
+
+  it('removing a healthy server from a healthy pool emits nothing (no false degraded)', async () => {
+    const { manager, events } = build();
+    const startP = manager.start();
+    await flush();
+    await startP;
+    events.length = 0;
+
+    // The client's own `disconnected` transition fires while it is
+    // still pooled — suppression must swallow the interim degraded
+    // snapshot; online→online after removal means zero events.
+    await manager.removeServer('b');
+    await flush();
+    expect(events).toEqual([]);
+    expect(manager.poolState).toEqual({ status: 'online', usable: 1, connected: 1, total: 1 });
+    await manager.stop();
+  });
+
+  it('survives cooldowns longer than the setTimeout clamp (2^31−1 ms)', async () => {
+    const THIRTY_DAYS = 30 * 24 * 3600 * 1000; // > 2^31−1 ≈ 24.8 days
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [SERVERS[0]!],
+      policy: roundRobin(),
+      transportFactory: h.factory,
+      autoBatch: false,
+      cooldownMs: THIRTY_DAYS,
+    });
+    const events: PoolState[] = [];
+    manager.on('pool-state', (s) => events.push(s));
+    const startP = manager.start();
+    await flush();
+    await startP;
+    events.length = 0;
+
+    const p = manager.call('server.ping', []).catch(() => undefined);
+    await flush();
+    h.reply('a', (req: { id: number }) => ({
+      id: req.id,
+      error: { code: -32603, message: 'excessive resource usage' },
+    }));
+    await flush();
+    await p;
+    expect(events.map((e) => e.status)).toEqual(['offline']);
+
+    // Without the delay cap this would spin fire→rearm ~1ms steps for
+    // the whole advance and hang the test. With the cap: one capped
+    // wake-up (~24.8d), one re-arm for the remainder, then recovery.
+    await vi.advanceTimersByTimeAsync(THIRTY_DAYS + 1000);
+    await flush();
+    expect(events.map((e) => e.status)).toEqual(['offline', 'online']);
+    await manager.stop();
+  });
+
   it('poolState getter reflects state without any subscription', async () => {
     const { h, manager } = build();
     expect(manager.poolState).toEqual({ status: 'offline', usable: 0, connected: 0, total: 2 });
