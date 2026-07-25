@@ -355,6 +355,40 @@ describe('ElectrumManager — auto-batch coalescing', () => {
 
     await manager.stop();
   });
+
+  it('reroutes a whole batch rejected with an id:null error (Fulcrum batch limit)', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a', 'b']),
+      transportFactory: h.factory,
+      autoBatch: true,
+    });
+    await manager.start();
+
+    const promises = Array.from({ length: 4 }, () => manager.call('server.ping', []));
+    await delay(0);
+
+    // a rejects the entire batch Fulcrum-style: single error, id null.
+    const aT = h.transports.get('a')!;
+    expect(JSON.parse(aT.sent[0]!)).toHaveLength(4);
+    aT.pushFromServer(
+      '{"jsonrpc":"2.0","id":null,"error":{"code":4,"message":"Batch limit exceeded"}}',
+    );
+    await delay(0);
+
+    // Classifier maps "batch limit exceeded" → rate-limit: `a` gets a
+    // cooldown ban and every item retries on `b`.
+    h.reply('b', (req: { id: number }) => ({ id: req.id, result: 'ok-b' }));
+    expect(await Promise.all(promises)).toEqual(['ok-b', 'ok-b', 'ok-b', 'ok-b']);
+
+    const a = manager.getClientViews().find((v) => v.id === 'a')!;
+    expect(a.state).toBe('banned');
+    expect(a.telemetry.errors.lastKind).toBe('rate-limit');
+
+    await manager.stop();
+  });
 });
 
 describe('ElectrumManager — pool mutation', () => {

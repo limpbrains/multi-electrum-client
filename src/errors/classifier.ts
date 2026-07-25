@@ -56,7 +56,16 @@ const ELECTRUMX_RATE_LIMIT_SUBSTRINGS = [
  * Source: https://github.com/cculianu/Fulcrum — `src/Servers.cpp`
  * (`impl_generic_subscribe` / `impl_generic_handle_subs_limitreached_exc`).
  */
-const FULCRUM_RATE_LIMIT_SUBSTRINGS = ['subscription limit reached', 'banned'];
+const FULCRUM_RATE_LIMIT_SUBSTRINGS = [
+  'subscription limit reached',
+  'banned',
+  // Whole-batch rejection (RPC code 4, `id: null` reply) when a wire
+  // batch exceeds Fulcrum's item cap (345 items at v1.11 defaults,
+  // measured empirically). Classified as rate-limit so the affected
+  // items re-route to another server instead of surfacing a terminal
+  // rpc-error.
+  'batch limit exceeded',
+];
 
 /**
  * electrs has the loosest rate-limit signaling — typically just closes the
@@ -88,6 +97,7 @@ const GENERIC_RATE_LIMIT_SUBSTRINGS = [
   'excessive resource', // ElectrumX / aiorpcx
   'excessive request',
   'subscription limit reached', // Fulcrum
+  'batch limit exceeded', // Fulcrum whole-batch rejection (id: null reply)
   'is banned', // generic "client is banned" / "your IP is banned"
   'have been banned', // "you have been banned"
   'client banned', // Fulcrum-style "client banned for Xs"
