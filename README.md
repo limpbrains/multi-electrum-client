@@ -157,10 +157,25 @@ manager.on('client-state', ({ clientId, state }) => {
 manager.on('client-banned', ({ clientId, until, reason }) => { /* observability */ });
 manager.on('subscription-restored', ({ method, params, drift }) => { /* observability */ });
 manager.on('error', (err) => { /* recoverable transport / classifier failures */ });
+
+// Aggregate connectivity — drive an "offline" banner from one event:
+manager.on('pool-state', ({ status, usable, total }) => {
+  // status: 'online' (all usable) | 'degraded' (some) | 'offline' (none)
+  banner.hidden = status !== 'offline';
+});
+console.log(manager.poolState); // same snapshot on demand
 ```
 
 The `error` event is observability-only — promises still reject. Use it for
 metrics and debug logging, not control flow.
+
+`pool-state` fires on aggregate *status* changes only (including a ban
+expiring — the manager arms an internal timer, so offline→online lands
+without any traffic). Exactly one baseline event fires after `await
+start()` — even when every initial connect failed — and one after
+`resume()`. While suspending / suspended the event is intentionally
+silent: a deliberate pause is not an outage; read `manager.state` for
+lifecycle.
 
 ## Roadmap
 

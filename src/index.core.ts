@@ -88,7 +88,7 @@ export {
 } from './transport/factory.js';
 
 // Manager + RoutingPolicy built-ins (M2) + subscriptions (M4):
-export { ElectrumManager, type ManagerEvents } from './manager.js';
+export { ElectrumManager, type ManagerEvents, type PoolState, type PoolStatus } from './manager.js';
 export type { SubscriptionHandler, Unsubscribe } from './subscriptions/types.js';
 
 // Lifecycle (M5):
