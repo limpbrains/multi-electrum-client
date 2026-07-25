@@ -189,6 +189,46 @@ describe('ElectrumManager — pool-state events', () => {
     await manager.stop();
   });
 
+  it('an unrelated outage during a slow removeServer() still emits immediately', async () => {
+    const { h, manager, events } = build([
+      SERVERS[0]!,
+      SERVERS[1]!,
+      { id: 'c', host: 'c', port: 50001, protocol: 'ws' },
+    ]);
+    manager.on('error', () => {});
+    const startP = manager.start();
+    await flush();
+    await startP;
+    events.length = 0;
+
+    // Make b's transport close hang: removeServer('b') stays in flight.
+    const bT = h.transports.get('b')!;
+    let releaseClose!: () => void;
+    bT.close = () =>
+      new Promise<void>((r) => {
+        releaseClose = r;
+      });
+    const removeP = manager.removeServer('b');
+    await flush();
+    expect(events).toEqual([]); // removal itself is silent (online→online)
+
+    // While removal is pending, an UNRELATED server dies — must emit
+    // right away, not after the slow close resolves.
+    h.transports.get('a')!.pushClose(1006);
+    await flush();
+    expect(events.map((e) => e.status)).toEqual(['degraded']);
+    // b is excluded from the counts while mid-removal.
+    expect(events[0]).toMatchObject({ usable: 1, connected: 1, total: 2 });
+
+    releaseClose();
+    await removeP;
+    await flush();
+    // Post-removal recompute: same degraded status, no duplicate event.
+    expect(events.map((e) => e.status)).toEqual(['degraded']);
+    expect(manager.poolState).toMatchObject({ status: 'degraded', total: 2 });
+    await manager.stop();
+  });
+
   it('survives cooldowns longer than the setTimeout clamp (2^31−1 ms)', async () => {
     const THIRTY_DAYS = 30 * 24 * 3600 * 1000; // > 2^31−1 ≈ 24.8 days
     const h = buildHarness();
