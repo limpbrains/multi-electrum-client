@@ -152,6 +152,15 @@ interface GroupBatchError {
   clientId: ClientId;
   error: Error;
   errorKind: ErrorKind;
+  /**
+   * Present when the "failure" is the disguised form — a results array in
+   * which every item failed retryably (see `asBatchLevelFailure`).
+   * Index-aligned with the group's items, it lets the settle/retry paths
+   * seed each item with its OWN error instead of the representative one.
+   * Absent for a true outer rejection, which legitimately has one shared
+   * cause for the whole batch.
+   */
+  entries?: readonly GroupEntryOutcome[];
 }
 
 type GroupEntryOutcome =
@@ -161,9 +170,15 @@ type GroupEntryOutcome =
 /**
  * Outcome of one (possibly hedged) group dispatch cycle. `both-failed`
  * carries the two whole-batch failures in settle order — the group
- * analogue of the single path's two-entry `failures`.
+ * analogue of the single path's two-entry `failures`. `hedge-settled`
+ * means `sendGroupHedged` already settled or re-routed every item itself
+ * (the mixed-winner deferral path — see `settleHedgedResults`); the caller
+ * has nothing left to do.
  */
-type GroupDispatchOutcome = GroupSendOutcome | { kind: 'both-failed'; failures: GroupBatchError[] };
+type GroupDispatchOutcome =
+  | GroupSendOutcome
+  | { kind: 'both-failed'; failures: GroupBatchError[] }
+  | { kind: 'hedge-settled' };
 
 /**
  * Trailing-args shape for `Manager.call`. Methods whose registry entry has an
@@ -1666,6 +1681,10 @@ export class ElectrumManager {
         ? await this.sendGroup(clientId, client, grp)
         : await this.sendGroupHedged(clientId, client, grp, hedgeAfterMs);
 
+    if (outcome.kind === 'hedge-settled') {
+      // sendGroupHedged already settled / re-routed every item per item.
+      return;
+    }
     if (outcome.kind === 'results') {
       this.settleGroupResults(grp, outcome.clientId, outcome.entries);
     } else if (outcome.kind === 'batch-error') {
@@ -1735,16 +1754,31 @@ export class ElectrumManager {
 
   /**
    * Group-level hedge: race the primary send against the `afterMs` timer;
-   * on fire, dispatch the SAME wire batch on a second policy-picked client
-   * (union of item exclusions + the primary excluded, `attempt + 1`, the
-   * first item as the representative request) WITHOUT cancelling the
-   * first. The first settlement that is a REAL server answer wins and
-   * drives per-item settling — a batch-level failure on one branch (outer
-   * rejection, or a results array where every item failed retryably; see
-   * `asBatchLevelFailure`) just waits for the other. When no second
-   * client is eligible we wait
-   * out the primary, and the timer is cleared on every path where it
-   * hasn't fired (same hygiene as the single-path hedge).
+   * on fire, dispatch the SAME wire batch on a second client WITHOUT
+   * cancelling the first. The second client is routed PER ITEM (see
+   * `pickHedgeClient`): the hedge only fires when every item's re-pick
+   * agrees on one client — diverging picks (request-dependent policies)
+   * or an unroutable item skip the hedge and wait out the primary.
+   *
+   * Race semantics — the first branch that produces a REAL server answer
+   * (≥1 success or ≥1 non-retryable entry; see `asBatchLevelFailure`)
+   * wins and drives per-item settling:
+   *
+   *  - The winner's successes resolve immediately (the latency win) and
+   *    its non-retryable failures reject immediately.
+   *  - Items the winner failed RETRYABLY are NOT retried while the
+   *    sibling dispatch still holds them in flight — an immediate re-pick
+   *    could select the sibling's client (it is not in those items'
+   *    excluded sets), exceed the per-item dispatch budget, and discard a
+   *    late sibling success. They defer to the sibling via
+   *    `settleHedgedResults`, which owns the per-item accounting.
+   *  - A batch-level failure on one branch waits for the other; when both
+   *    fail at batch level, `both-failed` carries the two failures (with
+   *    per-item entries when a failure was a disguised results array, so
+   *    downstream settling keeps each item's own error).
+   *
+   * The timer is cleared on every path where it hasn't fired (same
+   * hygiene as the single-path hedge).
    */
   private async sendGroupHedged(
     primaryId: ClientId,
@@ -1765,37 +1799,34 @@ export class ElectrumManager {
     }
 
     // Primary still pending past afterMs — try to pick a second client.
-    const hedgeExcluded = new Set<ClientId>();
-    let attempt = 0;
-    for (const item of grp) {
-      for (const id of item.excluded) hedgeExcluded.add(id);
-      attempt = Math.max(attempt, item.attempt);
-    }
-    hedgeExcluded.add(primaryId);
-    const rep = grp[0]!;
-    const hedgePick = this.pickFor(rep.method, rep.params, hedgeExcluded, attempt + 1, rep.opts);
-    if (hedgePick.kind !== 'picked') {
-      // No usable second client right now (no-pick or a stale id): wait out
-      // the primary rather than failing a batch that may yet succeed.
+    const hedgePick = this.pickHedgeClient(grp, primaryId);
+    if (hedgePick === null) {
+      // No usable second client right now (no-pick, a stale id, or
+      // per-item picks diverged): wait out the primary rather than
+      // failing a batch that may yet succeed.
       return primary;
     }
     const hedge = this.sendGroup(hedgePick.clientId, hedgePick.client, grp);
 
-    // The first REAL server answer settles the group immediately; a
-    // batch-level failure (outer rejection, or the disguised form — see
-    // `asBatchLevelFailure`) waits for the sibling so the retry path can
-    // exclude both clients in one go. `sendGroup` never rejects, so the
-    // losing branch cannot surface as an unhandled rejection; its outcome
-    // is awaited only for the telemetry recorded inside `sendGroup`.
-    return new Promise<GroupDispatchOutcome>((resolve) => {
+    // The first REAL server answer wins the race; a batch-level failure
+    // (outer rejection, or the disguised form — see `asBatchLevelFailure`)
+    // waits for the sibling so the retry path can exclude both clients in
+    // one go. `sendGroup` never rejects, so the losing branch cannot
+    // surface as an unhandled rejection; a loser's outcome feeds the
+    // telemetry recorded inside `sendGroup` and, for deferred items, the
+    // per-item accounting in `settleHedgedResults`.
+    const race = await new Promise<
+      | { kind: 'winner'; outcome: GroupSendOutcome; sibling: Promise<GroupSendOutcome> }
+      | { kind: 'both-failed'; failures: GroupBatchError[] }
+    >((resolve) => {
       const failures: GroupBatchError[] = [];
       let done = false;
-      const onSettle = (o: GroupSendOutcome): void => {
+      const onSettle = (o: GroupSendOutcome, sibling: Promise<GroupSendOutcome>): void => {
         if (done) return;
         const failure = asBatchLevelFailure(o);
         if (failure === null) {
           done = true;
-          resolve(o);
+          resolve({ kind: 'winner', outcome: o, sibling });
           return;
         }
         failures.push(failure);
@@ -1804,9 +1835,125 @@ export class ElectrumManager {
           resolve({ kind: 'both-failed', failures });
         }
       };
-      void primary.then(onSettle);
-      void hedge.then(onSettle);
+      void primary.then((o) => onSettle(o, hedge));
+      void hedge.then((o) => onSettle(o, primary));
     });
+    if (race.kind === 'both-failed') return race;
+    if (race.outcome.kind !== 'results') {
+      // Unreachable: a batch-error outcome is always a batch-level failure
+      // and cannot win the race. Kept for type narrowing.
+      return race.outcome;
+    }
+    await this.settleHedgedResults(grp, race.outcome, race.sibling);
+    return { kind: 'hedge-settled' };
+  }
+
+  /**
+   * Pick the second client for a group hedge. Routing is PER ITEM (the
+   * same `routeItems` pass as the initial flush and the retry re-pick),
+   * run against probe copies whose excluded set gains the primary and
+   * whose attempt is advanced by one — the real items stay untouched in
+   * case the hedge is skipped. The hedge dispatches only when every item
+   * routes to the SAME live client. Diverging picks — which only arise
+   * under request-dependent policies such as `withSticky`, where grp[0]'s
+   * key must not decide for the other items — or any unroutable item skip
+   * the hedge instead: splitting one wire batch across several hedge
+   * targets would multiply the race bookkeeping for marginal gain.
+   *
+   * Policy-state note (verified against `withSticky` in
+   * `policy/builtins.ts`): `withSticky.pick` treats a pick whose pinned
+   * client is healthy but excluded — exactly this probe, where the
+   * primary holds the pin — as a temporary detour and does NOT move the
+   * pin, so probing for a hedge that ends up skipped cannot corrupt
+   * sticky assignments. A custom policy that records state on every
+   * `pick` will observe the probe's picks; that is unavoidable with
+   * opaque policies and matches the pre-existing representative pick.
+   */
+  private pickHedgeClient(
+    grp: readonly BatchItem[],
+    primaryId: ClientId,
+  ): { clientId: ClientId; client: ElectrumClient } | null {
+    const probes: BatchItem[] = grp.map((item) => ({
+      ...item,
+      attempt: item.attempt + 1,
+      excluded: new Set([...item.excluded, primaryId]),
+    }));
+    const { groups, unroutable } = this.routeItems(probes);
+    if (unroutable.length > 0 || groups.size !== 1) return null;
+    const clientId = groups.keys().next().value as ClientId;
+    const picked = this.clients.get(clientId);
+    if (!picked) return null;
+    return { clientId, client: picked };
+  }
+
+  /**
+   * Per-item settling of a hedged race whose winner produced a genuine
+   * results array while a sibling dispatch of the SAME items is (or was)
+   * also in flight. Successes and non-retryable failures settle from the
+   * winner immediately; an item settles exactly once, so sibling results
+   * for already-settled items stay telemetry-only (recorded inside
+   * `sendGroup`).
+   *
+   * Items the winner failed retryably wait for the sibling, then per item:
+   *
+   *  - sibling success → resolve with the sibling's value (a late but
+   *    valid answer);
+   *  - sibling non-retryable entry → reject with it (a genuine
+   *    caller-owned server answer);
+   *  - otherwise (sibling retryable entry or whole-batch failure) → retry
+   *    with BOTH clients in the item's excluded set and the attempt
+   *    advanced by 2: two wire dispatches burned two distinct clients,
+   *    the same counting rule as `both-failed` (+1 here, +1 in
+   *    `retryGroup`), so an item's total dispatches never exceed
+   *    `maxAttemptsFor`. Retry seeds prefer the freshest per-item cause —
+   *    the sibling's own entry when it produced a results array, the
+   *    item's winner-side error when the sibling failed with one shared
+   *    transport cause.
+   */
+  private async settleHedgedResults(
+    grp: readonly BatchItem[],
+    winner: Extract<GroupSendOutcome, { kind: 'results' }>,
+    sibling: Promise<GroupSendOutcome>,
+  ): Promise<void> {
+    const deferred: Array<{ item: BatchItem; index: number; error: Error }> = [];
+    for (let i = 0; i < grp.length; i++) {
+      const item = grp[i]!;
+      const e = winner.entries[i]!;
+      if (e.ok) {
+        item.def.resolve(e.value);
+        continue;
+      }
+      item.excluded.add(winner.clientId);
+      if (isRetryable(e.errorKind)) {
+        deferred.push({ item, index: i, error: e.error });
+      } else {
+        item.def.reject(e.error);
+      }
+    }
+    if (deferred.length === 0) return; // sibling stays telemetry-only
+
+    const sib = await sibling; // sendGroup never rejects
+    const retryable: RetryEntry[] = [];
+    for (const d of deferred) {
+      const { item } = d;
+      let error = d.error;
+      if (sib.kind === 'results') {
+        const se = sib.entries[d.index]!;
+        if (se.ok) {
+          item.def.resolve(se.value);
+          continue;
+        }
+        if (!isRetryable(se.errorKind)) {
+          item.def.reject(se.error);
+          continue;
+        }
+        error = se.error;
+      }
+      item.excluded.add(sib.clientId);
+      item.attempt++; // first of the two burned dispatches; retryGroup adds the second
+      retryable.push({ item, error });
+    }
+    this.retryGroup(retryable);
   }
 
   /** Per-item settling of a results-array outcome from `clientId`. */
@@ -1843,12 +1990,14 @@ export class ElectrumManager {
    */
   private settleGroupBatchError(grp: readonly BatchItem[], o: GroupBatchError): void {
     const retryable: RetryEntry[] = [];
-    for (const item of grp) {
+    for (let i = 0; i < grp.length; i++) {
+      const item = grp[i]!;
+      const f = groupItemFailure(o, i);
       item.excluded.add(o.clientId);
-      if (isRetryable(o.errorKind)) {
-        retryable.push({ item, error: o.error });
+      if (isRetryable(f.errorKind)) {
+        retryable.push({ item, error: f.error });
       } else {
-        item.def.reject(o.error);
+        item.def.reject(f.error);
       }
     }
     this.retryGroup(retryable);
@@ -1862,19 +2011,23 @@ export class ElectrumManager {
    * single-path hedge (+1 here, +1 in `retryGroup`). A non-retryable
    * failure on either branch rejects the items with it (first in settle
    * order, matching the single path's `fatal` throw); otherwise the normal
-   * retryGroup flow continues seeded with the last-settled failure.
+   * retryGroup flow continues seeded per item from the last-settled
+   * failure — that failure's own per-item entry when it was the disguised
+   * results form, the shared transport cause otherwise (see
+   * `groupItemFailure`).
    */
   private settleGroupBothFailed(grp: readonly BatchItem[], failures: GroupBatchError[]): void {
     const fatal = failures.find((f) => !isRetryable(f.errorKind));
     const last = failures[failures.length - 1]!;
     const retryable: RetryEntry[] = [];
-    for (const item of grp) {
+    for (let i = 0; i < grp.length; i++) {
+      const item = grp[i]!;
       for (const f of failures) item.excluded.add(f.clientId);
       item.attempt++;
       if (fatal) {
         item.def.reject(fatal.error);
       } else {
-        retryable.push({ item, error: last.error });
+        retryable.push({ item, error: groupItemFailure(last, i).error });
       }
     }
     this.retryGroup(retryable);
@@ -2109,7 +2262,9 @@ function isRetryable(kind: ErrorKind): boolean {
  * batch-level failure when EVERY item failed with a retryable kind; any
  * success or any non-retryable (caller-owned) error is a genuine server
  * response and wins the race. The synthesized failure carries the last
- * entry's error as the representative cause.
+ * entry's error as the representative cause AND the full per-item
+ * `entries`, so downstream settling (`groupItemFailure`) can reject or
+ * re-seed each item with its own error rather than the representative.
  */
 function asBatchLevelFailure(o: GroupSendOutcome): GroupBatchError | null {
   if (o.kind === 'batch-error') return o;
@@ -2124,7 +2279,22 @@ function asBatchLevelFailure(o: GroupSendOutcome): GroupBatchError | null {
     clientId: o.clientId,
     error: worst!.error,
     errorKind: worst!.errorKind,
+    entries: o.entries,
   };
+}
+
+/**
+ * Per-item view of a batch-level failure: the item's own entry when the
+ * failure is the disguised results form (its `entries` are index-aligned
+ * with the group), the shared whole-batch cause otherwise.
+ */
+function groupItemFailure(
+  f: GroupBatchError,
+  index: number,
+): { error: Error; errorKind: ErrorKind } {
+  const e = f.entries?.[index];
+  if (e !== undefined && !e.ok) return { error: e.error, errorKind: e.errorKind };
+  return { error: f.error, errorKind: f.errorKind };
 }
 
 /**

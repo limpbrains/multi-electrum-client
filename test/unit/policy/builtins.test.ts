@@ -248,6 +248,27 @@ describe('withSticky', () => {
     expect(next).not.toBe(initial);
   });
 
+  it('keeps the pin when the pinned client is merely excluded for one pick (retry/hedge detour)', () => {
+    const inner = roundRobin();
+    const policy = withSticky(inner, 'scripthash');
+    const cs = [view('a'), view('b')];
+    const req = (excluded: ReadonlySet<string> = new Set()): PickContext =>
+      ctx(cs, {
+        request: { method: 'blockchain.scripthash.get_balance', params: ['HASH'] },
+        excluded,
+      });
+
+    const first = policy.pick(req())!;
+    // Exclusion-only detour (the shape of a hedge probe or a retry re-pick
+    // around a still-healthy pinned client): route elsewhere for THIS pick...
+    const detour = policy.pick(req(new Set([first])))!;
+    expect(detour).not.toBe(first);
+    expect(detour).not.toBeNull();
+    // ...but do NOT move the pin — the next unconstrained pick must return
+    // the original client, not the detour target.
+    expect(policy.pick(req())).toBe(first);
+  });
+
   it('passes through unrelated methods to inner without pinning', () => {
     const inner = roundRobin();
     const policy = withSticky(inner, 'scripthash');

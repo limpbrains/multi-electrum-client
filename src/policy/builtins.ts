@@ -115,6 +115,17 @@ export type StickyKeyFn = (req: {
  *
  * Pass `'scripthash'` for the common case (extracts the first param of any
  * `blockchain.scripthash.*` method) or a custom function for everything else.
+ *
+ * Pin lifecycle: a pin moves only when the pinned client is genuinely
+ * unusable (removed from the pool, not connected, or banned) — the fresh
+ * pick then becomes the new pin. A pick whose pinned client is merely in
+ * `excluded` (a retry re-pick or a hedge probe routing AROUND a
+ * still-healthy server for one call) routes elsewhere for that pick
+ * WITHOUT re-pinning: the pin describes where the key's server-side
+ * session lives, and a temporary detour must not re-home it. In
+ * particular the manager's group-hedge probe picks with the primary
+ * excluded and may then skip the hedge entirely — re-pinning there would
+ * silently glue the key to a server that never saw the request.
  */
 export function withSticky(inner: RoutingPolicy, key: 'scripthash' | StickyKeyFn): RoutingPolicy {
   const keyFn: StickyKeyFn = key === 'scripthash' ? scripthashKey : key;
@@ -127,7 +138,13 @@ export function withSticky(inner: RoutingPolicy, key: 'scripthash' | StickyKeyFn
         if (pinned !== undefined) {
           const cv = ctx.candidates.find((c) => c.id === pinned);
           if (cv && isUsable(cv, ctx.excluded, ctx.now)) return cv.id;
-          // Pinned client is unusable; drop the pin and re-pick below.
+          if (cv && ctx.excluded.has(pinned) && isUsable(cv, NO_EXCLUSIONS, ctx.now)) {
+            // Healthy but excluded for THIS pick only: temporary detour,
+            // keep the pin (see doc comment above).
+            return inner.pick(ctx);
+          }
+          // Pinned client is genuinely unusable; drop the pin and re-pin
+          // to the fresh pick below.
           pins.delete(k);
         }
       }
@@ -147,6 +164,9 @@ function scripthashKey(req: { method: string; params: readonly unknown[] }): str
   const first = req.params[0];
   return typeof first === 'string' ? first : undefined;
 }
+
+/** Shared empty set for "is this client usable ignoring exclusions" checks. */
+const NO_EXCLUSIONS: ReadonlySet<ClientId> = new Set();
 
 function isUsable(c: ClientView, excluded: ReadonlySet<ClientId>, now: number): boolean {
   if (excluded.has(c.id)) return false;

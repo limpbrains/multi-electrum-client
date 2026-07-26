@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ElectrumManager } from '../../../src/manager.js';
 import { failover } from '../../../src/policy/builtins.js';
+import type { RoutingPolicy } from '../../../src/policy/types.js';
 import type { ServerSpec } from '../../../src/protocol/types.js';
 import { buildHarness } from '../../helpers/managerHarness.js';
 
@@ -497,6 +498,270 @@ describe('ElectrumManager — hedged requests', () => {
     h.reply<WireReq>('b', (req) => ({ id: req.id, result: { genesis: 'x' } }));
     expect(await p).toEqual({ genesis: 'x' });
     h.reply<WireReq>('a', (req) => ({ id: req.id, result: { genesis: 'x' } }));
+
+    await manager.stop();
+  });
+
+  // --- R1: per-item accounting across both hedge branches ------------------
+
+  it('mixed winner defers retryable items to the in-flight sibling: a late sibling success resolves them with no extra dispatch', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      hedging: { afterMs: 15 },
+    });
+    await manager.start();
+
+    const p0 = manager.call('blockchain.transaction.get', ['tx0']);
+    const p1 = manager.call('blockchain.transaction.get', ['tx1']);
+    await delay(0);
+    const aT = h.transports.get('a')!;
+    const bT = h.transports.get('b')!;
+    const cT = h.transports.get('c')!;
+    expect(aT.sent).toHaveLength(1);
+
+    // Hedge fires on b: the same 2-item wire batch.
+    await delay(50);
+    expect(bT.sent).toHaveLength(1);
+
+    // Primary answers MIXED: tx0 succeeds, tx1 fails retryably. The winner's
+    // success must settle immediately (the latency win)...
+    h.reply<WireReq>('a', (req) =>
+      (req.params as unknown[])[0] === 'tx0'
+        ? { id: req.id, result: 'a-tx0' }
+        : { id: req.id, error: { code: -32603, message: 'excessive resource usage' } },
+    );
+    expect(await p0).toBe('a-tx0');
+
+    // ...but tx1 must NOT be retried anywhere while b still holds it in
+    // flight: no duplicate dispatch on b, nothing on c.
+    await delay(20);
+    expect(bT.sent).toHaveLength(1);
+    expect(cT.sent).toHaveLength(0);
+
+    // The sibling answers late with a SUCCESS for tx1 — a valid answer that
+    // must resolve the caller instead of being discarded.
+    h.reply<WireReq>('b', (req) => ({
+      id: req.id,
+      result: `b-${(req.params as unknown[])[0] as string}`,
+    }));
+    expect(await p1).toBe('b-tx1');
+    await delay(20);
+    // No third-server dispatch for tx1, ever.
+    expect(cT.sent).toHaveLength(0);
+
+    await manager.stop();
+  });
+
+  it('mixed winner + sibling failure: the retry excludes BOTH hedge clients and never exceeds the attempt budget', async () => {
+    const h = buildHarness();
+    // Pool of four so an accounting bug has somewhere visible to overflow
+    // into: budget 3 = a (primary) + b (hedge) + c (retry); d must stay
+    // silent. If the sibling dispatch weren't counted (or b not excluded),
+    // tx1 would get a fourth wire dispatch.
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS4,
+      policy: failover(['a', 'b', 'c', 'd']),
+      transportFactory: h.factory,
+      hedging: { afterMs: 15 },
+    });
+    await manager.start();
+
+    const p0 = manager.call('blockchain.transaction.get', ['tx0'], { retry: { maxAttempts: 3 } });
+    const p1 = manager.call('blockchain.transaction.get', ['tx1'], { retry: { maxAttempts: 3 } });
+    // Attach the rejection expectation before driving the wire.
+    const p1Rejected = expect(p1).rejects.toMatchObject({
+      message: expect.stringContaining('(from-c)') as string,
+    });
+    await delay(0);
+    const aT = h.transports.get('a')!;
+    const bT = h.transports.get('b')!;
+    const cT = h.transports.get('c')!;
+    const dT = h.transports.get('d')!;
+    expect(aT.sent).toHaveLength(1);
+
+    await delay(50);
+    expect(bT.sent).toHaveLength(1);
+
+    // Primary answers MIXED: tx0 ok, tx1 retryable.
+    h.reply<WireReq>('a', (req) =>
+      (req.params as unknown[])[0] === 'tx0'
+        ? { id: req.id, result: 'a-tx0' }
+        : { id: req.id, error: { code: -32603, message: 'excessive resource usage (from-a)' } },
+    );
+    expect(await p0).toBe('a-tx0');
+
+    // Deferred: nothing new dispatched while the sibling is in flight.
+    await delay(20);
+    expect(bT.sent).toHaveLength(1);
+    expect(cT.sent).toHaveLength(0);
+
+    // Sibling also fails tx1 retryably → NOW the retry may fire, on c, with
+    // both a and b excluded.
+    h.reply<WireReq>('b', (req) =>
+      (req.params as unknown[])[0] === 'tx0'
+        ? { id: req.id, result: 'b-tx0' } // swallowed: tx0 already settled
+        : { id: req.id, error: { code: -32603, message: 'excessive resource usage (from-b)' } },
+    );
+    await delay(20);
+    expect(cT.sent).toHaveLength(1);
+    // The retry re-pick must NOT have selected the sibling client again.
+    expect(bT.sent).toHaveLength(0);
+    expect(aT.sent).toHaveLength(0);
+
+    // c fails too: budget (3) is spent after a + b (2) and c (1) — tx1
+    // rejects with c's OWN error and d is never contacted.
+    h.reply<WireReq>('c', (req) => ({
+      id: req.id,
+      error: { code: -32603, message: 'excessive resource usage (from-c)' },
+    }));
+    await p1Rejected;
+    await delay(20);
+    expect(dT.sent).toHaveLength(0);
+
+    await manager.stop();
+  });
+
+  // --- R2: per-item error preservation on all-retryable results arrays -----
+
+  it("both branches all-retryable: each item rejects with ITS OWN error at budget exhaustion, not the last item's", async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS, // pool of 2 → default budget 2 = primary + hedge
+      policy: failover(['a', 'b']),
+      transportFactory: h.factory,
+      hedging: { afterMs: 15 },
+    });
+    await manager.start();
+
+    const p0 = manager.call('blockchain.transaction.get', ['tx0']);
+    const p1 = manager.call('blockchain.transaction.get', ['tx1']);
+    const settledP = Promise.allSettled([p0, p1]);
+    await delay(0);
+    expect(h.transports.get('a')!.sent).toHaveLength(1);
+
+    await delay(50);
+    expect(h.transports.get('b')!.sent).toHaveLength(1);
+
+    // Every item fails retryably on BOTH branches, each with a distinct
+    // per-item error. Budget (2) is spent by the two dispatches.
+    h.reply<WireReq>('a', (req) => ({
+      id: req.id,
+      error: {
+        code: -32603,
+        message: `excessive resource usage (${(req.params as unknown[])[0] as string}-a)`,
+      },
+    }));
+    await delay(10);
+    h.reply<WireReq>('b', (req) => ({
+      id: req.id,
+      error: {
+        code: -32603,
+        message: `excessive resource usage (${(req.params as unknown[])[0] as string}-b)`,
+      },
+    }));
+
+    const settled = await settledP;
+    const reasons = settled.map((r) => {
+      expect(r.status).toBe('rejected');
+      return ((r as PromiseRejectedResult).reason as Error).message;
+    });
+    // Each item carries its own cause (from the last-settled branch, b) —
+    // not a collapsed copy of the last item's error.
+    expect(reasons[0]).toContain('tx0-b');
+    expect(reasons[1]).toContain('tx1-b');
+
+    await manager.stop();
+  });
+
+  // --- R3: per-item hedge routing under request-dependent policies ----------
+
+  /**
+   * Sticky-style policy: routing depends on the request's stickyKey, so
+   * per-item hedge picks can diverge once the primary is excluded.
+   * Preference orders diverge after 'a': k1 → b, k2 → c.
+   */
+  const stickyStylePolicy = (): RoutingPolicy => ({
+    pick(ctx) {
+      const order = ctx.stickyKey === 'k2' ? ['a', 'c', 'b'] : ['a', 'b', 'c'];
+      for (const id of order) {
+        const c = ctx.candidates.find((v) => v.id === id);
+        if (c && c.state === 'connected' && !ctx.excluded.has(id)) return id;
+      }
+      return null;
+    },
+  });
+
+  it('skips the group hedge when per-item picks diverge under a sticky policy, waiting out the primary', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: stickyStylePolicy(),
+      transportFactory: h.factory,
+      hedging: { afterMs: 15 },
+    });
+    await manager.start();
+
+    const p1 = manager.call('blockchain.transaction.get', ['tx-k1'], { stickyKey: 'k1' });
+    const p2 = manager.call('blockchain.transaction.get', ['tx-k2'], { stickyKey: 'k2' });
+    await delay(0);
+    const aT = h.transports.get('a')!;
+    expect(aT.sent).toHaveLength(1);
+    expect(JSON.parse(aT.sent[0]!)).toHaveLength(2);
+
+    // Past afterMs the hedge probe runs: k1 → b, k2 → c. Divergent picks
+    // must NOT dispatch a hedge anywhere (splitting the batch would
+    // multiply the race bookkeeping; grp[0]'s key must not decide for k2).
+    await delay(50);
+    expect(h.transports.get('b')!.sent).toHaveLength(0);
+    expect(h.transports.get('c')!.sent).toHaveLength(0);
+
+    // The primary is waited out and still wins.
+    h.reply<WireReq>('a', (req) => ({
+      id: req.id,
+      result: `a-${(req.params as unknown[])[0] as string}`,
+    }));
+    expect(await p1).toBe('a-tx-k1');
+    expect(await p2).toBe('a-tx-k2');
+
+    await manager.stop();
+  });
+
+  it('dispatches the group hedge when per-item sticky picks converge on the same client', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: stickyStylePolicy(),
+      transportFactory: h.factory,
+      hedging: { afterMs: 15 },
+    });
+    await manager.start();
+
+    // Same key on both items → per-item hedge picks agree on b.
+    const p1 = manager.call('blockchain.transaction.get', ['tx0'], { stickyKey: 'k1' });
+    const p2 = manager.call('blockchain.transaction.get', ['tx1'], { stickyKey: 'k1' });
+    await delay(0);
+    expect(h.transports.get('a')!.sent).toHaveLength(1);
+
+    await delay(50);
+    const bT = h.transports.get('b')!;
+    expect(bT.sent).toHaveLength(1);
+    expect(JSON.parse(bT.sent[0]!)).toHaveLength(2);
+    expect(h.transports.get('c')!.sent).toHaveLength(0);
+
+    h.reply<WireReq>('b', (req) => ({
+      id: req.id,
+      result: `b-${(req.params as unknown[])[0] as string}`,
+    }));
+    expect(await p1).toBe('b-tx0');
+    expect(await p2).toBe('b-tx1');
 
     await manager.stop();
   });
