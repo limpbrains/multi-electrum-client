@@ -23,8 +23,10 @@ whose value proposition is **resilience**, not raw speed:
 - Retryable batch failures re-route as one re-batched wire call per fallback
   server — a dead 300-item batch costs one extra round-trip, not 300 singles.
 - Opt-in hedged requests (`hedging: { afterMs }`) — a server that accepts a
-  request then hangs costs `afterMs` before the same call races on a second
-  server; first success wins. Idempotent methods only (never `broadcast`).
+  request then hangs costs `afterMs` before the same call (or the whole
+  coalesced wire batch) races on a second server; first answer wins. Only an
+  allowlist of known-idempotent reads hedges by default (never `broadcast`);
+  vendor methods opt in per call with `hedge: true`.
 - Subscriptions replay + catch-up diff on reconnect — handlers don't miss events.
 - Auto-reconnect on transport faults with exponential backoff + jitter.
 - `suspend()` / `resume()` for React Native background lifecycle.

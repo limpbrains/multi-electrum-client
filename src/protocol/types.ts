@@ -208,12 +208,16 @@ export interface CallOpts {
   retry?: 'auto' | 'none' | { maxAttempts: number };
   /**
    * Per-call hedging override. `false` suppresses a manager-enabled hedge
-   * for this call; `true` requests one explicitly. Requires
-   * `ManagerOptions.hedging` for the delay value — with no manager-level
-   * config there is nothing to arm, so `hedge: true` is a no-op. Methods
-   * with side effects (`blockchain.transaction.broadcast`) and
-   * session-bound methods (`*.subscribe` / `*.unsubscribe`) never hedge,
-   * regardless of this flag.
+   * for this call. By default only methods on the manager's explicit
+   * allowlist of known-idempotent reads hedge; `hedge: true` is the
+   * escape hatch that allows hedging a method OUTSIDE that allowlist
+   * (e.g. a vendor-specific read) — by setting it the caller asserts the
+   * method is idempotent. Requires `ManagerOptions.hedging` for the delay
+   * value — with no manager-level config there is nothing to arm, so
+   * `hedge: true` is a no-op. Methods with side effects
+   * (`blockchain.transaction.broadcast`) and session-bound methods
+   * (`*.subscribe` / `*.unsubscribe`) NEVER hedge — `hedge: true` does
+   * not override that.
    */
   hedge?: boolean;
   /**
@@ -265,16 +269,25 @@ export interface ManagerOptions {
    */
   discover?: DiscoverOptions;
   /**
-   * Opt-in hedged requests for the single-call path. When a call hasn't
-   * settled within `afterMs`, the manager fires the same request on a
-   * second eligible client (policy pick with the first excluded) WITHOUT
-   * cancelling the first; the first success settles the caller and the
-   * loser's late reply is swallowed (still recorded in telemetry).
-   * Bounds a hung-but-accepting server to `afterMs` instead of the full
-   * `requestTimeoutMs`. Only idempotent methods hedge — broadcast and
-   * `*.subscribe` / `*.unsubscribe` are hard-excluded — and batches are
-   * never hedged. Absent = off (no behavior change); per-call override
-   * via `CallOpts.hedge`.
+   * Opt-in hedged requests. When a call (or a coalesced auto-batch group)
+   * hasn't settled within `afterMs`, the manager fires the same request —
+   * or the same wire batch — on a second eligible client (policy pick
+   * with the first excluded) WITHOUT cancelling the first; the first real
+   * answer settles the caller(s) and the loser's late reply is swallowed
+   * (still recorded in telemetry). Bounds a hung-but-accepting server to
+   * `afterMs` instead of the full `requestTimeoutMs`.
+   *
+   * Only methods on the built-in allowlist of known-idempotent reads
+   * hedge by default (the typed registry minus broadcast / subscribe /
+   * unsubscribe, plus `server.features`,
+   * `blockchain.scripthash.get_mempool` and `blockchain.relayfee`);
+   * unknown/vendor methods require an explicit per-call
+   * `CallOpts.hedge: true`. Broadcast and `*.subscribe` /
+   * `*.unsubscribe` are hard-excluded regardless. A coalesced batch
+   * group hedges as a whole only when EVERY item in it is hedge-eligible
+   * and has budget for a second dispatch; mixed groups are not hedged.
+   * Absent = off (no behavior change); per-call override via
+   * `CallOpts.hedge`.
    */
   hedging?: { afterMs: number };
   /**

@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ElectrumManager } from '../../../src/manager.js';
 import { failover } from '../../../src/policy/builtins.js';
+import type { RoutingPolicy } from '../../../src/policy/types.js';
 import type { ServerSpec } from '../../../src/protocol/types.js';
 import { buildHarness } from '../../helpers/managerHarness.js';
 
@@ -159,6 +160,106 @@ describe('ElectrumManager — re-batched retries', () => {
       expect(err.name).toBe('TransportError');
       expect(err.message).toContain('cut-b');
     }
+
+    await manager.stop();
+  });
+
+  it('re-picks retry routing PER ITEM: items with different sticky keys land on their own targets', async () => {
+    const h = buildHarness();
+    // Deterministic sticky-style policy: routing depends on the request's
+    // stickyKey, so a group-level representative pick would send BOTH items
+    // to the first item's target. Preference orders diverge after 'a' dies.
+    const policy: RoutingPolicy = {
+      pick(ctx) {
+        const order = ctx.stickyKey === 'k2' ? ['a', 'c', 'b'] : ['a', 'b', 'c'];
+        for (const id of order) {
+          const c = ctx.candidates.find((v) => v.id === id);
+          if (c && c.state === 'connected' && !ctx.excluded.has(id)) return id;
+        }
+        return null;
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy,
+      transportFactory: h.factory,
+      autoBatch: true,
+    });
+    await manager.start();
+
+    const p1 = manager.call('blockchain.transaction.get', ['tx-k1'], { stickyKey: 'k1' });
+    const p2 = manager.call('blockchain.transaction.get', ['tx-k2'], { stickyKey: 'k2' });
+    await delay(0);
+
+    // Both stickies prefer 'a' initially → one coalesced batch of 2.
+    const aT = h.transports.get('a')!;
+    expect(aT.sent).toHaveLength(1);
+    expect(JSON.parse(aT.sent[0]!)).toHaveLength(2);
+
+    aT.pushClose(1006, 'cut-a');
+    await delay(0);
+
+    // The retry must route per item: k1 → b, k2 → c. A representative-based
+    // group pick would put both on b and leave c untouched.
+    const bT = h.transports.get('b')!;
+    const cT = h.transports.get('c')!;
+    expect(bT.sent).toHaveLength(1);
+    expect(cT.sent).toHaveLength(1);
+    const wireB = JSON.parse(bT.sent[0]!) as WireReq[];
+    const wireC = JSON.parse(cT.sent[0]!) as WireReq[];
+    expect(wireB.map((r) => r.params[0])).toEqual(['tx-k1']);
+    expect(wireC.map((r) => r.params[0])).toEqual(['tx-k2']);
+
+    h.reply<WireReq>('b', (req) => ({ id: req.id, result: `b-${req.params[0]}` }));
+    h.reply<WireReq>('c', (req) => ({ id: req.id, result: `c-${req.params[0]}` }));
+    expect(await p1).toBe('b-tx-k1');
+    expect(await p2).toBe('c-tx-k2');
+
+    await manager.stop();
+  });
+
+  it('rejects every pending item (instead of hanging) when the redispatch path throws unexpectedly', async () => {
+    const h = buildHarness();
+    const boom = new Error('boom-policy');
+    // First flush routes normally; the retry re-pick (attempt > 0) throws —
+    // the shape of a buggy user policy blowing up inside redispatch.
+    const policy: RoutingPolicy = {
+      pick(ctx) {
+        if (ctx.attempt > 0) throw boom;
+        const c = ctx.candidates.find((v) => v.state === 'connected' && !ctx.excluded.has(v.id));
+        return c ? c.id : null;
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy,
+      transportFactory: h.factory,
+      autoBatch: true,
+    });
+    await manager.start();
+    const errors: unknown[] = [];
+    manager.on('error', (e) => errors.push(e));
+
+    const promises = Array.from({ length: 3 }, (_, i) =>
+      manager.call('blockchain.transaction.get', [`tx${i}`]),
+    );
+    const settledP = Promise.allSettled(promises);
+    await delay(0);
+
+    const aT = h.transports.get('a')!;
+    expect(aT.sent).toHaveLength(1);
+    aT.pushClose(1006, 'cut-a');
+
+    // Every item's promise must reject with the thrown error — not time out.
+    const settled = await settledP;
+    for (const r of settled) {
+      expect(r.status).toBe('rejected');
+      expect((r as PromiseRejectedResult).reason).toBe(boom);
+    }
+    // The failure is still surfaced for observability.
+    expect(errors).toContain(boom);
 
     await manager.stop();
   });
