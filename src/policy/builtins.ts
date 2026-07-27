@@ -141,9 +141,12 @@ export function withSticky(inner: RoutingPolicy, key: 'scripthash' | StickyKeyFn
         if (pinned !== undefined) {
           const cv = ctx.candidates.find((c) => c.id === pinned);
           if (cv && isUsable(cv, ctx.excluded, ctx.now)) return cv.id;
-          if (ctx.probe && cv && ctx.excluded.has(pinned) && isUsable(cv, NO_EXCLUSIONS, ctx.now)) {
-            // Hedge probe around a healthy pinned client: temporary detour,
-            // keep the pin (see doc comment above).
+          if (ctx.probe) {
+            // Probe picks are side-effect-free WHATEVER state the pinned
+            // client is in — excluded, banned, disconnected, or gone. A
+            // possibly-discarded hedge probe must not delete the pin; if
+            // the client is genuinely unusable the next REAL pick will
+            // drop and re-home it.
             return inner.pick(ctx);
           }
           // Pinned client is unusable, or a real failover retry excluded
@@ -168,9 +171,6 @@ function scripthashKey(req: { method: string; params: readonly unknown[] }): str
   const first = req.params[0];
   return typeof first === 'string' ? first : undefined;
 }
-
-/** Shared empty set for "is this client usable ignoring exclusions" checks. */
-const NO_EXCLUSIONS: ReadonlySet<ClientId> = new Set();
 
 function isUsable(c: ClientView, excluded: ReadonlySet<ClientId>, now: number): boolean {
   if (excluded.has(c.id)) return false;

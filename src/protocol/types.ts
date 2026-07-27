@@ -216,8 +216,8 @@ export interface CallOpts {
    * value — with no manager-level config there is nothing to arm, so
    * `hedge: true` is a no-op. Methods with side effects
    * (`blockchain.transaction.broadcast`) and session-bound methods
-   * (`*.subscribe` / `*.unsubscribe`) NEVER hedge — `hedge: true` does
-   * not override that.
+   * (`server.version` — session negotiation, `*.subscribe` /
+   * `*.unsubscribe`) NEVER hedge — `hedge: true` does not override that.
    */
   hedge?: boolean;
   /**
@@ -282,8 +282,9 @@ export interface ManagerOptions {
    * unsubscribe, plus `server.features`,
    * `blockchain.scripthash.get_mempool` and `blockchain.relayfee`);
    * unknown/vendor methods require an explicit per-call
-   * `CallOpts.hedge: true`. Broadcast and `*.subscribe` /
-   * `*.unsubscribe` are hard-excluded regardless. A coalesced batch
+   * `CallOpts.hedge: true`. Broadcast, `server.version` (session
+   * negotiation) and `*.subscribe` / `*.unsubscribe` are hard-excluded
+   * regardless. A coalesced batch
    * group hedges as a whole only when EVERY item in it is hedge-eligible
    * and has budget for a second dispatch; mixed groups are not hedged.
    * Absent = off (no behavior change); per-call override via

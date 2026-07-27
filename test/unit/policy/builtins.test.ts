@@ -289,6 +289,28 @@ describe('withSticky', () => {
     expect(policy.pick(req())).toBe(failedOver);
   });
 
+  it('keeps the pin when a PROBE pick finds the pinned client unusable', () => {
+    const inner = roundRobin();
+    const policy = withSticky(inner, 'scripthash');
+    const req = (cs: ClientView[], probe = false): PickContext =>
+      ctx(cs, {
+        request: { method: 'blockchain.scripthash.get_balance', params: ['HASH'] },
+        ...(probe ? { probe } : {}),
+      });
+
+    const healthy = [view('a'), view('b')];
+    const first = policy.pick(req(healthy))!;
+    // Pinned client goes down; a probe pick must route elsewhere WITHOUT
+    // deleting the pin — a discarded probe is not allowed to re-home the
+    // key's session.
+    const degraded = [view(first, { state: 'disconnected' }), view(first === 'a' ? 'b' : 'a')];
+    const probed = policy.pick(req(degraded, true));
+    expect(probed).not.toBe(first);
+    expect(probed).not.toBeNull();
+    // Client recovers before any REAL pick happened: the pin is intact.
+    expect(policy.pick(req(healthy))).toBe(first);
+  });
+
   it('probe picks never create a pin', () => {
     const inner = roundRobin();
     const policy = withSticky(inner, 'scripthash');
