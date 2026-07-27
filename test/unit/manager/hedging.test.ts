@@ -107,6 +107,10 @@ describe('ElectrumManager — hedged requests', () => {
     const pSub = manager.call('blockchain.scripthash.subscribe', ['ab'.repeat(32)], {
       hedge: true,
     });
+    // server.version is session negotiation — a second call on the same
+    // session is rejected by ElectrumX and another server's answer doesn't
+    // describe this session. Hard-excluded like broadcast/subscribe.
+    const pVersion = manager.call('server.version', ['test', '1.4'], { hedge: true });
     await delay(50);
     // Well past afterMs and still nothing on b — hard exclusion beats overrides.
     expect(h.transports.get('b')!.sent).toHaveLength(0);
@@ -116,6 +120,8 @@ describe('ElectrumManager — hedged requests', () => {
     }));
     expect(await pBroadcast).toBe('txid');
     expect(await pSub).toBeNull();
+    // Answered by MockTransport's handshake auto-reply — never left for b.
+    expect(await pVersion).toEqual(['MockServer 0.0.0', '1.4']);
 
     await manager.stop();
   });

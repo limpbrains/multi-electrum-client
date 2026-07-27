@@ -8,6 +8,15 @@ export interface PickContext {
   candidates: readonly ClientView[];
   stickyKey?: string;
   now: number;
+  /**
+   * `true` when the manager asks speculatively — a hedge pick whose result
+   * may never be dispatched (group probes can be discarded on divergence)
+   * or is a duplicate of a still-live primary. Stateful policies should
+   * make probe picks side-effect-free: don't advance rotation cursors,
+   * don't move sticky pins. Failover retries after a REAL failure arrive
+   * without this flag and may re-home state. Absent = normal pick.
+   */
+  probe?: boolean;
 }
 
 export type Outcome =

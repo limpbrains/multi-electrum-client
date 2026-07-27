@@ -1280,7 +1280,9 @@ export class ElectrumManager {
     // Primary still pending past afterMs — try to pick a second client.
     const hedgeExcluded = new Set(excluded);
     hedgeExcluded.add(picked.clientId);
-    const hedgePick = this.pickFor(method, params, hedgeExcluded, attempt + 1, opts);
+    // Probe semantics: a hedge is speculative (the primary may still win),
+    // so the pick must not move policy state — see PickContext.probe.
+    const hedgePick = this.pickFor(method, params, hedgeExcluded, attempt + 1, opts, true);
     if (hedgePick.kind !== 'picked') {
       // No usable second client right now: wait out the primary rather
       // than failing a call that may yet succeed.
@@ -1525,6 +1527,7 @@ export class ElectrumManager {
     excluded: ReadonlySet<ClientId>,
     attempt: number,
     opts?: CallOpts,
+    probe = false,
   ): PickResult {
     const candidates = this.buildCandidates();
     const now = Date.now();
@@ -1550,6 +1553,7 @@ export class ElectrumManager {
         candidates,
         now,
         ...(opts?.stickyKey !== undefined ? { stickyKey: opts.stickyKey } : {}),
+        ...(probe ? { probe } : {}),
       };
       clientId = this.policy.pick(ctx);
     }
@@ -1606,7 +1610,10 @@ export class ElectrumManager {
    * items with different sticky keys to the representative's target and
    * let their pins go stale.
    */
-  private routeItems(items: readonly BatchItem[]): {
+  private routeItems(
+    items: readonly BatchItem[],
+    probe = false,
+  ): {
     groups: Map<ClientId, BatchItem[]>;
     unroutable: BatchItem[];
   } {
@@ -1622,6 +1629,7 @@ export class ElectrumManager {
         candidates,
         now,
         ...(item.opts?.stickyKey !== undefined ? { stickyKey: item.opts.stickyKey } : {}),
+        ...(probe ? { probe } : {}),
       };
       const clientId = this.policy.pick(ctx);
       if (clientId === null) {
@@ -1878,7 +1886,7 @@ export class ElectrumManager {
       attempt: item.attempt + 1,
       excluded: new Set([...item.excluded, primaryId]),
     }));
-    const { groups, unroutable } = this.routeItems(probes);
+    const { groups, unroutable } = this.routeItems(probes, /* probe */ true);
     if (unroutable.length > 0 || groups.size !== 1) return null;
     const clientId = groups.keys().next().value as ClientId;
     const picked = this.clients.get(clientId);
@@ -2321,6 +2329,10 @@ function groupItemFailure(
  */
 function isHedgeUnsafeMethod(method: string): boolean {
   if (method === 'blockchain.transaction.broadcast') return true;
+  // Session negotiation: ElectrumX rejects a second call on the same
+  // session ("server.version already sent"), and another server's answer
+  // does not describe this session anyway.
+  if (method === 'server.version') return true;
   if (method.endsWith('.subscribe') || method.endsWith('.unsubscribe')) return true;
   return false;
 }

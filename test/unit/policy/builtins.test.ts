@@ -248,7 +248,29 @@ describe('withSticky', () => {
     expect(next).not.toBe(initial);
   });
 
-  it('keeps the pin when the pinned client is merely excluded for one pick (retry/hedge detour)', () => {
+  it('keeps the pin on a PROBE pick that excludes the healthy pinned client (hedge detour)', () => {
+    const inner = roundRobin();
+    const policy = withSticky(inner, 'scripthash');
+    const cs = [view('a'), view('b')];
+    const req = (excluded: ReadonlySet<string> = new Set(), probe = false): PickContext =>
+      ctx(cs, {
+        request: { method: 'blockchain.scripthash.get_balance', params: ['HASH'] },
+        excluded,
+        ...(probe ? { probe } : {}),
+      });
+
+    const first = policy.pick(req())!;
+    // Probe detour (a hedge pick that may never dispatch): route elsewhere
+    // for THIS pick...
+    const detour = policy.pick(req(new Set([first]), true))!;
+    expect(detour).not.toBe(first);
+    expect(detour).not.toBeNull();
+    // ...but do NOT move the pin — the next unconstrained pick must return
+    // the original client, not the detour target.
+    expect(policy.pick(req())).toBe(first);
+  });
+
+  it('re-pins on a REAL failover retry: an excluded pinned client loses the pin', () => {
     const inner = roundRobin();
     const policy = withSticky(inner, 'scripthash');
     const cs = [view('a'), view('b')];
@@ -259,14 +281,41 @@ describe('withSticky', () => {
       });
 
     const first = policy.pick(req())!;
-    // Exclusion-only detour (the shape of a hedge probe or a retry re-pick
-    // around a still-healthy pinned client): route elsewhere for THIS pick...
-    const detour = policy.pick(req(new Set([first])))!;
-    expect(detour).not.toBe(first);
-    expect(detour).not.toBeNull();
-    // ...but do NOT move the pin — the next unconstrained pick must return
-    // the original client, not the detour target.
-    expect(policy.pick(req())).toBe(first);
+    // Non-probe pick excluding the pin = the pinned server just failed this
+    // key's request (e.g. a timeout). The pin must follow the failover —
+    // otherwise every future call walks back into the same timeout.
+    const failedOver = policy.pick(req(new Set([first])))!;
+    expect(failedOver).not.toBe(first);
+    expect(policy.pick(req())).toBe(failedOver);
+  });
+
+  it('probe picks never create a pin', () => {
+    const inner = roundRobin();
+    const policy = withSticky(inner, 'scripthash');
+    const cs = [view('a'), view('b')];
+    const req = (probe: boolean): PickContext =>
+      ctx(cs, {
+        request: { method: 'blockchain.scripthash.get_balance', params: ['HASH'] },
+        ...(probe ? { probe } : {}),
+      });
+
+    const probed = policy.pick(req(true))!;
+    expect(probed).not.toBeNull();
+    // Inner roundRobin ignores the probe for cursor purposes too, so an
+    // unpinned real pick lands on the same first candidate — and only NOW
+    // does the pin get created.
+    const real = policy.pick(req(false))!;
+    expect(policy.pick(req(false))).toBe(real);
+  });
+
+  it('roundRobin does not advance its cursor on probe picks', () => {
+    const policy = roundRobin();
+    const cs = [view('a'), view('b'), view('c')];
+    const probeCtx = ctx(cs, { probe: true });
+    expect(policy.pick(probeCtx)).toBe('a');
+    expect(policy.pick(probeCtx)).toBe('a'); // cursor frozen
+    expect(policy.pick(ctx(cs))).toBe('a'); // first real pick
+    expect(policy.pick(ctx(cs))).toBe('b'); // now it rotates
   });
 
   it('passes through unrelated methods to inner without pinning', () => {

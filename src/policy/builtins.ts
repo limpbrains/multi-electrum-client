@@ -13,11 +13,13 @@ import type { RoutingPolicy } from './types.js';
 export function roundRobin(): RoutingPolicy {
   let cursor = 0;
   return {
-    pick({ candidates, excluded, now }) {
+    pick({ candidates, excluded, now, probe }) {
       const eligible = candidates.filter((c) => isUsable(c, excluded, now));
       if (eligible.length === 0) return null;
       const picked = eligible[cursor % eligible.length]!;
-      cursor++;
+      // Probe picks are side-effect-free: a discarded hedge probe must not
+      // shift future routing (see PickContext.probe).
+      if (!probe) cursor++;
       return picked.id;
     },
   };
@@ -67,7 +69,7 @@ export function preferFastest(opts: PreferFastestOpts = {}): RoutingPolicy {
   const tiebreak = opts.tiebreak ?? 'leastInFlight';
   let cursor = 0;
   return {
-    pick({ candidates, excluded, now }) {
+    pick({ candidates, excluded, now, probe }) {
       const eligible = candidates.filter((c) => isUsable(c, excluded, now));
       if (eligible.length === 0) return null;
 
@@ -89,7 +91,8 @@ export function preferFastest(opts: PreferFastestOpts = {}): RoutingPolicy {
       if (tied.length === 1) return tied[0]!.id;
       if (tiebreak === 'rr') {
         const picked = tied[cursor % tied.length]!;
-        cursor++;
+        // Same probe rule as roundRobin: no cursor movement on probes.
+        if (!probe) cursor++;
         return picked.id;
       }
       // leastInFlight
@@ -116,16 +119,16 @@ export type StickyKeyFn = (req: {
  * Pass `'scripthash'` for the common case (extracts the first param of any
  * `blockchain.scripthash.*` method) or a custom function for everything else.
  *
- * Pin lifecycle: a pin moves only when the pinned client is genuinely
- * unusable (removed from the pool, not connected, or banned) — the fresh
- * pick then becomes the new pin. A pick whose pinned client is merely in
- * `excluded` (a retry re-pick or a hedge probe routing AROUND a
- * still-healthy server for one call) routes elsewhere for that pick
- * WITHOUT re-pinning: the pin describes where the key's server-side
- * session lives, and a temporary detour must not re-home it. In
- * particular the manager's group-hedge probe picks with the primary
- * excluded and may then skip the hedge entirely — re-pinning there would
- * silently glue the key to a server that never saw the request.
+ * Pin lifecycle. A pin moves in two cases: the pinned client is genuinely
+ * unusable (removed from the pool, not connected, or banned), or a REAL
+ * failover retry excludes it — the pinned server just failed this key's
+ * request, and keeping the pin would send every future call back into the
+ * same timeout. In both cases the fresh pick becomes the new pin. Probe
+ * picks (`ctx.probe` — the manager's hedge picks, which may be discarded
+ * on divergence or lose the race to a live primary) route elsewhere for
+ * that pick WITHOUT touching the pin, and never create one: re-pinning
+ * there would silently glue the key to a server that may never have seen
+ * the request.
  */
 export function withSticky(inner: RoutingPolicy, key: 'scripthash' | StickyKeyFn): RoutingPolicy {
   const keyFn: StickyKeyFn = key === 'scripthash' ? scripthashKey : key;
@@ -138,18 +141,19 @@ export function withSticky(inner: RoutingPolicy, key: 'scripthash' | StickyKeyFn
         if (pinned !== undefined) {
           const cv = ctx.candidates.find((c) => c.id === pinned);
           if (cv && isUsable(cv, ctx.excluded, ctx.now)) return cv.id;
-          if (cv && ctx.excluded.has(pinned) && isUsable(cv, NO_EXCLUSIONS, ctx.now)) {
-            // Healthy but excluded for THIS pick only: temporary detour,
+          if (ctx.probe && cv && ctx.excluded.has(pinned) && isUsable(cv, NO_EXCLUSIONS, ctx.now)) {
+            // Hedge probe around a healthy pinned client: temporary detour,
             // keep the pin (see doc comment above).
             return inner.pick(ctx);
           }
-          // Pinned client is genuinely unusable; drop the pin and re-pin
-          // to the fresh pick below.
+          // Pinned client is unusable, or a real failover retry excluded
+          // it after a failure: drop the pin and re-pin to the fresh pick.
           pins.delete(k);
         }
       }
       const next = inner.pick(ctx);
-      if (next !== null && k !== undefined) pins.set(k, next);
+      // Probe picks never create or move pins.
+      if (next !== null && k !== undefined && !ctx.probe) pins.set(k, next);
       return next;
     },
   };
