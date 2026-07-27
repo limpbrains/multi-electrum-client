@@ -2222,11 +2222,29 @@ export class ElectrumManager {
     durationMs: number,
   ): ErrorKind {
     const sw = this.meta.get(clientId)?.capabilities.serverSoftware;
-    return this.classifier.classify(e, {
+    const ctx = {
       method,
       durationMs,
       ...(sw !== undefined ? { serverSoftware: sw } : {}),
-    });
+    };
+    // A throwing custom classifier must never escape: `executeOn` and
+    // `sendGroup` are relied on to never reject (hedge races have no
+    // rejection handlers, batch flush would strand its callers). Degrade
+    // to the built-in classifier so retry/ban semantics stay sane, and
+    // surface the bug via the 'error' event.
+    try {
+      return this.classifier.classify(e, ctx);
+    } catch (classifierErr) {
+      this.emit('error', classifierErr);
+      if (this.classifier !== defaultClassifier) {
+        try {
+          return defaultClassifier.classify(e, ctx);
+        } catch {
+          // fall through
+        }
+      }
+      return 'rpc-error';
+    }
   }
 
   private recordSuccess(id: ClientId, method: string, latencyMs: number): void {

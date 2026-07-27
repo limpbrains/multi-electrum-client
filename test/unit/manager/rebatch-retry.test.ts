@@ -302,4 +302,44 @@ describe('ElectrumManager — re-batched retries', () => {
 
     await manager.stop();
   });
+
+  it('a throwing custom classifier settles auto-batched items via fallback classification', async () => {
+    const h = buildHarness();
+    const throwingClassifier = {
+      classify(): never {
+        throw new Error('classifier exploded');
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      classifier: throwingClassifier,
+    });
+    const errors: unknown[] = [];
+    manager.on('error', (e) => errors.push(e));
+    await manager.start();
+
+    const p0 = manager.call('blockchain.transaction.get', ['tx0']);
+    const p1 = manager.call('blockchain.transaction.get', ['tx1']);
+    await delay(0);
+
+    // Both items fail with a rate-limit-shaped error; the custom classifier
+    // explodes on every classification. sendGroup must keep its
+    // never-rejects contract: fallback classification (built-in default →
+    // retryable) re-routes the batch to b instead of stranding the callers.
+    h.reply<WireReq>('a', (req) => ({
+      id: req.id,
+      error: { code: -32603, message: 'excessive resource usage' },
+    }));
+    await delay(10);
+    expect(errors.some((e) => (e as Error).message === 'classifier exploded')).toBe(true);
+
+    h.reply<WireReq>('b', (req) => ({ id: req.id, result: `b-${req.params[0]}` }));
+    expect(await p0).toBe('b-tx0');
+    expect(await p1).toBe('b-tx1');
+
+    await manager.stop();
+  });
 });

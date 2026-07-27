@@ -944,6 +944,43 @@ describe('ElectrumManager — hedged requests', () => {
     await manager.stop();
   });
 
+  it('a throwing custom classifier settles the hedged race instead of hanging it', async () => {
+    const h = buildHarness();
+    const throwingClassifier = {
+      classify(): never {
+        throw new Error('classifier exploded');
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a', 'b']),
+      transportFactory: h.factory,
+      autoBatch: false,
+      classifier: throwingClassifier,
+      hedging: { afterMs: 10 },
+    });
+    const errors: unknown[] = [];
+    manager.on('error', (e) => errors.push(e));
+    await manager.start();
+
+    const p = manager.call('blockchain.transaction.get', ['tx1']);
+    await delay(40); // hedge fired on b
+    expect(h.transports.get('b')!.sent).toHaveLength(1);
+
+    // Primary fails; the classifier throws during classification. The
+    // branch must settle as a failure outcome (fallback classification),
+    // leaving the race to the still-live hedge.
+    h.reply<WireReq>('a', (req) => ({ id: req.id, error: { code: 2, message: 'no such tx' } }));
+    await delay(10);
+    expect(errors.some((e) => (e as Error).message === 'classifier exploded')).toBe(true);
+
+    h.reply<WireReq>('b', (req) => ({ id: req.id, result: 'b-tx1' }));
+    expect(await p).toBe('b-tx1');
+
+    await manager.stop();
+  });
+
   it('a policy that throws at flush time rejects the items instead of stranding them', async () => {
     const h = buildHarness();
     const throwing: RoutingPolicy = {
