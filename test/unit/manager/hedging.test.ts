@@ -876,6 +876,98 @@ describe('ElectrumManager — hedged requests', () => {
     await manager.stop();
   });
 
+  it('a policy that throws on the hedge probe degrades to no-hedge: primary still settles the batch', async () => {
+    const h = buildHarness();
+    const inner = failover(['a', 'b']);
+    const throwing: RoutingPolicy = {
+      pick(ctx) {
+        if (ctx.probe) throw new Error('policy exploded on probe');
+        return inner.pick(ctx);
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: throwing,
+      transportFactory: h.factory,
+      hedging: { afterMs: 10 },
+    });
+    const errors: unknown[] = [];
+    manager.on('error', (e) => errors.push(e));
+    await manager.start();
+
+    const p0 = manager.call('blockchain.transaction.get', ['tx0']);
+    const p1 = manager.call('blockchain.transaction.get', ['tx1']);
+    await delay(40); // hedge timer fires, probe throws
+    expect(errors.some((e) => (e as Error).message === 'policy exploded on probe')).toBe(true);
+    expect(h.transports.get('b')!.sent).toHaveLength(0);
+
+    // The primary is still live and must settle the callers.
+    h.reply<WireReq>('a', (req) => ({
+      id: req.id,
+      result: `a-${(req.params as unknown[])[0] as string}`,
+    }));
+    expect(await p0).toBe('a-tx0');
+    expect(await p1).toBe('a-tx1');
+
+    await manager.stop();
+  });
+
+  it('a policy that throws on the single-path hedge probe degrades to no-hedge', async () => {
+    const h = buildHarness();
+    const inner = failover(['a', 'b']);
+    const throwing: RoutingPolicy = {
+      pick(ctx) {
+        if (ctx.probe) throw new Error('policy exploded on probe');
+        return inner.pick(ctx);
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: throwing,
+      transportFactory: h.factory,
+      autoBatch: false,
+      hedging: { afterMs: 10 },
+    });
+    const errors: unknown[] = [];
+    manager.on('error', (e) => errors.push(e));
+    await manager.start();
+
+    const p = manager.call('blockchain.transaction.get', ['tx1']);
+    await delay(40);
+    expect(errors).toHaveLength(1);
+    expect(h.transports.get('b')!.sent).toHaveLength(0);
+    h.reply<WireReq>('a', (req) => ({ id: req.id, result: 'a-tx1' }));
+    expect(await p).toBe('a-tx1');
+
+    await manager.stop();
+  });
+
+  it('a policy that throws at flush time rejects the items instead of stranding them', async () => {
+    const h = buildHarness();
+    const throwing: RoutingPolicy = {
+      pick() {
+        throw new Error('policy exploded on flush');
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: throwing,
+      transportFactory: h.factory,
+    });
+    const errors: unknown[] = [];
+    manager.on('error', (e) => errors.push(e));
+    await manager.start();
+
+    const p = manager.call('blockchain.transaction.get', ['tx1']);
+    await expect(p).rejects.toThrow('policy exploded on flush');
+    expect(errors).toHaveLength(1);
+
+    await manager.stop();
+  });
+
   it('non-retryable sibling batch-error rejects deferred items instead of retrying them', async () => {
     const h = buildHarness();
     const manager = new ElectrumManager({

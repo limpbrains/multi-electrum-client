@@ -1281,8 +1281,16 @@ export class ElectrumManager {
     const hedgeExcluded = new Set(excluded);
     hedgeExcluded.add(picked.clientId);
     // Probe semantics: a hedge is speculative (the primary may still win),
-    // so the pick must not move policy state — see PickContext.probe.
-    const hedgePick = this.pickFor(method, params, hedgeExcluded, attempt + 1, opts, true);
+    // so the pick must not move policy state — see PickContext.probe. A
+    // throwing custom policy degrades to no-hedge: the primary is live
+    // and the caller must not lose it to a probe failure.
+    let hedgePick: PickResult;
+    try {
+      hedgePick = this.pickFor(method, params, hedgeExcluded, attempt + 1, opts, true);
+    } catch (e) {
+      this.emit('error', e);
+      hedgePick = { kind: 'no-pick', error: e as Error };
+    }
     if (hedgePick.kind !== 'picked') {
       // No usable second client right now: wait out the primary rather
       // than failing a call that may yet succeed.
@@ -1644,7 +1652,18 @@ export class ElectrumManager {
   }
 
   private async flushBatch(items: BatchItem[]): Promise<void> {
-    const { groups, unroutable } = this.routeItems(items);
+    // A throwing custom policy must reject the items, not strand them:
+    // the flush runs fire-and-forget, so an escaped throw would only
+    // reach the 'error' event while every caller hangs forever.
+    let routed: ReturnType<ElectrumManager['routeItems']>;
+    try {
+      routed = this.routeItems(items);
+    } catch (e) {
+      this.emit('error', e);
+      for (const item of items) item.def.reject(e);
+      return;
+    }
+    const { groups, unroutable } = routed;
 
     for (const item of unroutable) {
       item.def.reject(new NoClientAvailableError(`no eligible client for ${item.method}`));
@@ -1807,7 +1826,15 @@ export class ElectrumManager {
     }
 
     // Primary still pending past afterMs — try to pick a second client.
-    const hedgePick = this.pickHedgeClient(grp, primaryId);
+    // A throwing custom policy must not strand the group: the primary is
+    // still live, so a failed probe degrades to no-hedge.
+    let hedgePick: { clientId: ClientId; client: ElectrumClient } | null;
+    try {
+      hedgePick = this.pickHedgeClient(grp, primaryId);
+    } catch (e) {
+      this.emit('error', e);
+      hedgePick = null;
+    }
     if (hedgePick === null) {
       // No usable second client right now (no-pick, a stale id, or
       // per-item picks diverged): wait out the primary rather than
