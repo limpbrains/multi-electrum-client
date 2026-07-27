@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { describe, expect, it } from 'vitest';
 
+import { RpcError } from '../../../src/errors/types.js';
 import { ElectrumManager } from '../../../src/manager.js';
 import { failover } from '../../../src/policy/builtins.js';
 import type { RoutingPolicy } from '../../../src/policy/types.js';
@@ -785,5 +786,129 @@ describe('ElectrumManager — hedged requests', () => {
 
     await manager.stop();
     await rejected;
+  });
+
+  it('winner non-retryable failure defers to the sibling: a late sibling success still wins', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      hedging: { afterMs: 15 },
+    });
+    await manager.start();
+
+    const p0 = manager.call('blockchain.transaction.get', ['tx0']);
+    const p1 = manager.call('blockchain.transaction.get', ['tx1']);
+    await delay(0);
+    const bT = h.transports.get('b')!;
+    const cT = h.transports.get('c')!;
+    await delay(50); // hedge fires on b
+    expect(bT.sent).toHaveLength(1);
+
+    // Winner answers MIXED with a NON-retryable failure for tx1. Unlike the
+    // pre-fix behavior, tx1 must NOT reject yet — the sibling holds a live
+    // dispatch that can still produce a valid answer (a non-retryable error
+    // can be server-specific).
+    h.reply<WireReq>('a', (req) =>
+      (req.params as unknown[])[0] === 'tx0'
+        ? { id: req.id, result: 'a-tx0' }
+        : { id: req.id, error: { code: 2, message: 'no such tx' } },
+    );
+    expect(await p0).toBe('a-tx0');
+
+    h.reply<WireReq>('b', (req) => ({
+      id: req.id,
+      result: `b-${(req.params as unknown[])[0] as string}`,
+    }));
+    expect(await p1).toBe('b-tx1');
+    await delay(20);
+    expect(cT.sent).toHaveLength(0); // never retried anywhere
+
+    await manager.stop();
+  });
+
+  it('winner non-retryable failure rejects with the WINNER error when the sibling also fails, without retrying', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      hedging: { afterMs: 15 },
+    });
+    await manager.start();
+
+    const p0 = manager.call('blockchain.transaction.get', ['tx0']);
+    const p1 = manager.call('blockchain.transaction.get', ['tx1']);
+    const rejected = expect(p1).rejects.toMatchObject({ code: 2, message: 'no such tx' });
+    await delay(0);
+    const bT = h.transports.get('b')!;
+    const cT = h.transports.get('c')!;
+    await delay(50); // hedge fires on b
+
+    h.reply<WireReq>('a', (req) =>
+      (req.params as unknown[])[0] === 'tx0'
+        ? { id: req.id, result: 'a-tx0' }
+        : { id: req.id, error: { code: 2, message: 'no such tx' } },
+    );
+    expect(await p0).toBe('a-tx0');
+
+    // Sibling fails tx1 retryably — the winner's non-retryable answer must
+    // dominate: reject with it, no third-server retry.
+    h.reply<WireReq>('b', (req) => ({
+      id: req.id,
+      error: { code: -32603, message: 'excessive resource usage' },
+    }));
+    await rejected;
+    await delay(20);
+    // reply() drained b's queue; the point is no retry landed anywhere.
+    expect(bT.sent).toHaveLength(0);
+    expect(cT.sent).toHaveLength(0);
+
+    await manager.stop();
+  });
+
+  it('non-retryable sibling batch-error rejects deferred items instead of retrying them', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      hedging: { afterMs: 15 },
+    });
+    await manager.start();
+
+    const p0 = manager.call('blockchain.transaction.get', ['tx0']);
+    const p1 = manager.call('blockchain.transaction.get', ['tx1']);
+    const rejected = expect(p1).rejects.toMatchObject({
+      name: 'RpcError',
+      message: 'verbose transactions are currently unsupported',
+    });
+    await delay(0);
+    const bT = h.transports.get('b')!;
+    const cT = h.transports.get('c')!;
+    // The hedge dispatch on b fails AT SEND TIME with a non-retryable
+    // cause — the only way batchCall rejects as a whole.
+    bT.nextSendError = new RpcError('verbose transactions are currently unsupported', 1);
+    await delay(50); // hedge fires on b and dies at send
+
+    // Winner answers mixed: tx1's retryable failure defers to the sibling,
+    // which already failed fatally at batch level → reject with the
+    // sibling's cause, never retry on c.
+    h.reply<WireReq>('a', (req) =>
+      (req.params as unknown[])[0] === 'tx0'
+        ? { id: req.id, result: 'a-tx0' }
+        : { id: req.id, error: { code: -32603, message: 'excessive resource usage' } },
+    );
+    expect(await p0).toBe('a-tx0');
+    await rejected;
+    await delay(20);
+    expect(bT.sent).toHaveLength(0); // send died before enqueueing
+    expect(cT.sent).toHaveLength(0);
+
+    await manager.stop();
   });
 });

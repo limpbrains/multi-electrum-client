@@ -1889,33 +1889,37 @@ export class ElectrumManager {
   /**
    * Per-item settling of a hedged race whose winner produced a genuine
    * results array while a sibling dispatch of the SAME items is (or was)
-   * also in flight. Successes and non-retryable failures settle from the
-   * winner immediately; an item settles exactly once, so sibling results
-   * for already-settled items stay telemetry-only (recorded inside
-   * `sendGroup`).
+   * also in flight. Successes settle from the winner immediately; an item
+   * settles exactly once, so sibling results for already-settled items
+   * stay telemetry-only (recorded inside `sendGroup`).
    *
-   * Items the winner failed retryably wait for the sibling, then per item:
+   * EVERY winner-side failure — retryable or not — waits for the sibling,
+   * matching the single-path hedge where any late success wins. A
+   * non-retryable answer can be server-specific (one lane's verbose-decode
+   * failure is another lane's valid reply), and the sibling is already in
+   * flight, so deferring costs nothing. Then per item:
    *
    *  - sibling success → resolve with the sibling's value (a late but
    *    valid answer);
-   *  - sibling non-retryable entry → reject with it (a genuine
-   *    caller-owned server answer);
-   *  - otherwise (sibling retryable entry or whole-batch failure) → retry
-   *    with BOTH clients in the item's excluded set and the attempt
-   *    advanced by 2: two wire dispatches burned two distinct clients,
-   *    the same counting rule as `both-failed` (+1 here, +1 in
-   *    `retryGroup`), so an item's total dispatches never exceed
-   *    `maxAttemptsFor`. Retry seeds prefer the freshest per-item cause —
-   *    the sibling's own entry when it produced a results array, the
-   *    item's winner-side error when the sibling failed with one shared
-   *    transport cause.
+   *  - winner failed non-retryably → reject with the winner's error (its
+   *    first genuine caller-owned answer), never retry;
+   *  - sibling non-retryable (entry, or whole-batch failure kind) →
+   *    reject with the sibling's per-item cause, never retry;
+   *  - otherwise (both sides retryable) → retry with BOTH clients in the
+   *    item's excluded set and the attempt advanced by 2: two wire
+   *    dispatches burned two distinct clients, the same counting rule as
+   *    `both-failed` (+1 here, +1 in `retryGroup`), so an item's total
+   *    dispatches never exceed `maxAttemptsFor`. Retry seeds prefer the
+   *    freshest per-item cause — the sibling's own entry when it produced
+   *    a results array, the item's winner-side error when the sibling
+   *    failed with one shared transport cause.
    */
   private async settleHedgedResults(
     grp: readonly BatchItem[],
     winner: Extract<GroupSendOutcome, { kind: 'results' }>,
     sibling: Promise<GroupSendOutcome>,
   ): Promise<void> {
-    const deferred: Array<{ item: BatchItem; index: number; error: Error }> = [];
+    const deferred: Array<{ item: BatchItem; index: number; error: Error; fatal: boolean }> = [];
     for (let i = 0; i < grp.length; i++) {
       const item = grp[i]!;
       const e = winner.entries[i]!;
@@ -1924,34 +1928,46 @@ export class ElectrumManager {
         continue;
       }
       item.excluded.add(winner.clientId);
-      if (isRetryable(e.errorKind)) {
-        deferred.push({ item, index: i, error: e.error });
-      } else {
-        item.def.reject(e.error);
-      }
+      deferred.push({ item, index: i, error: e.error, fatal: !isRetryable(e.errorKind) });
     }
     if (deferred.length === 0) return; // sibling stays telemetry-only
 
     const sib = await sibling; // sendGroup never rejects
+    const sibBatchFatal = sib.kind === 'batch-error' && !isRetryable(sib.errorKind);
     const retryable: RetryEntry[] = [];
     for (const d of deferred) {
       const { item } = d;
-      let error = d.error;
       if (sib.kind === 'results') {
         const se = sib.entries[d.index]!;
         if (se.ok) {
           item.def.resolve(se.value);
           continue;
         }
+        if (d.fatal) {
+          item.def.reject(d.error);
+          continue;
+        }
         if (!isRetryable(se.errorKind)) {
           item.def.reject(se.error);
           continue;
         }
-        error = se.error;
+        item.excluded.add(sib.clientId);
+        item.attempt++; // first of the two burned dispatches; retryGroup adds the second
+        retryable.push({ item, error: se.error });
+        continue;
+      }
+      // Sibling failed at batch level (one shared transport-ish cause).
+      if (d.fatal) {
+        item.def.reject(d.error);
+        continue;
+      }
+      if (sibBatchFatal) {
+        item.def.reject(groupItemFailure(sib, d.index).error);
+        continue;
       }
       item.excluded.add(sib.clientId);
       item.attempt++; // first of the two burned dispatches; retryGroup adds the second
-      retryable.push({ item, error });
+      retryable.push({ item, error: d.error });
     }
     this.retryGroup(retryable);
   }
