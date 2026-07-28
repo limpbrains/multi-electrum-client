@@ -295,10 +295,21 @@ export class ElectrumManager {
     this.policy = opts.policy;
     this.classifier = opts.classifier ?? defaultClassifier;
     this.autoBatchEnabled = opts.autoBatch ?? true;
-    if (opts.hedging !== undefined && !(opts.hedging.afterMs > 0)) {
+    if (
+      opts.hedging !== undefined &&
+      !(
+        Number.isFinite(opts.hedging.afterMs) &&
+        opts.hedging.afterMs > 0 &&
+        opts.hedging.afterMs <= 2_147_483_647
+      )
+    ) {
       // 0 / negative / NaN would arm an immediate hedge and silently
-      // double every eligible request — always a config mistake.
-      throw new RangeError(`hedging.afterMs must be a positive number, got ${opts.hedging.afterMs}`);
+      // double every eligible request; Infinity and values past the
+      // 32-bit timer limit overflow setTimeout into ~1ms — the same
+      // immediate hedge wearing a bigger number. Always a config mistake.
+      throw new RangeError(
+        `hedging.afterMs must be a positive number <= 2147483647, got ${opts.hedging.afterMs}`,
+      );
     }
     this.hedging = opts.hedging;
     this.cooldownMs = opts.cooldownMs ?? 60_000;
@@ -1296,11 +1307,12 @@ export class ElectrumManager {
       this.emit('error', e);
       hedgePick = { kind: 'no-pick', error: e as Error };
     }
-    if (hedgePick.kind !== 'picked' || hedgePick.clientId === picked.clientId) {
+    if (hedgePick.kind !== 'picked' || hedgeExcluded.has(hedgePick.clientId)) {
       // No usable second client right now — or a policy that ignored
-      // `excluded` picked the primary back (a duplicate on the same
-      // server buys nothing): wait out the primary rather than failing
-      // a call that may yet succeed.
+      // `excluded` picked the primary back or reused a client that
+      // already failed this call (either way the "hedge" buys no
+      // diversity): wait out the primary rather than failing a call
+      // that may yet succeed.
       const outcome = await primary;
       return outcome.kind === 'success' ? outcome : { kind: 'failures', failures: [outcome] };
     }
@@ -1923,10 +1935,11 @@ export class ElectrumManager {
     const { groups, unroutable } = this.routeItems(probes, /* probe */ true);
     if (unroutable.length > 0 || groups.size !== 1) return null;
     const clientId = groups.keys().next().value as ClientId;
-    // A policy that ignores `excluded` can pick the primary back — a
-    // "hedge" onto the same server buys zero diversity for a full
-    // attempt unit. Treat as no-hedge.
-    if (clientId === primaryId) return null;
+    // A policy that ignores `excluded` can pick the primary back or a
+    // client some item already failed on — either way the "hedge" buys
+    // no diversity for a full attempt unit. Every probe's exclusion set
+    // (item exclusions ∪ primary) must clear the target.
+    if (probes.some((p) => p.excluded.has(clientId))) return null;
     const picked = this.clients.get(clientId);
     if (!picked) return null;
     return { clientId, client: picked };

@@ -1004,8 +1004,44 @@ describe('ElectrumManager — hedged requests', () => {
     await manager.stop();
   });
 
+  it('never hedges onto a client this call already failed on, even if the policy re-picks it', async () => {
+    const h = buildHarness();
+    // Broken policy: probes always answer 'a' (already failed for this
+    // call), real picks follow a→b failover order.
+    const inner = failover(['a', 'b']);
+    const brokenProbes: RoutingPolicy = {
+      pick(ctx) {
+        if (ctx.probe) return 'a';
+        return inner.pick(ctx);
+      },
+    };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: brokenProbes,
+      transportFactory: h.factory,
+      autoBatch: false,
+      hedging: { afterMs: 10 },
+    });
+    await manager.start();
+
+    const aT = h.transports.get('a')!;
+    const p = manager.call('blockchain.transaction.get', ['tx1'], { retry: 'auto' });
+    await delay(0);
+    expect(aT.sent).toHaveLength(1);
+    // Connection to a cut mid-flight (retryable) → retry excludes a, lands on b.
+    aT.pushClose(1006, 'cut-a');
+    await delay(40); // hedge timer fired on the b attempt; probe re-picked a
+    expect(aT.sent).toHaveLength(1); // no hedge dispatch back onto the failed client
+    expect(h.transports.get('b')!.sent).toHaveLength(1);
+    h.reply<WireReq>('b', (req) => ({ id: req.id, result: 'b-tx1' }));
+    expect(await p).toBe('b-tx1');
+
+    await manager.stop();
+  });
+
   it('rejects non-positive hedging.afterMs at construction', () => {
-    for (const afterMs of [0, -5, Number.NaN]) {
+    for (const afterMs of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
       expect(
         () =>
           new ElectrumManager({
