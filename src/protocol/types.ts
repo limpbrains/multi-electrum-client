@@ -287,6 +287,11 @@ export interface ManagerOptions {
    * regardless. A coalesced batch
    * group hedges as a whole only when EVERY item in it is hedge-eligible
    * and has budget for a second dispatch; mixed groups are not hedged.
+   * Tradeoff: an item the winning branch failed retryably waits for the
+   * sibling dispatch (up to `requestTimeoutMs`) before retrying
+   * elsewhere, where an unhedged call would retry immediately — the
+   * price of never racing a duplicate onto a third server. `afterMs`
+   * must be a positive number (the constructor throws otherwise).
    * Absent = off (no behavior change); per-call override via
    * `CallOpts.hedge`.
    */

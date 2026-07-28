@@ -981,6 +981,43 @@ describe('ElectrumManager — hedged requests', () => {
     await manager.stop();
   });
 
+  it('a policy that ignores excluded and re-picks the primary produces no hedge', async () => {
+    const h = buildHarness();
+    // Deliberately broken policy: always 'a', excluded or not.
+    const alwaysA: RoutingPolicy = { pick: () => 'a' };
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: alwaysA,
+      transportFactory: h.factory,
+      hedging: { afterMs: 10 },
+    });
+    await manager.start();
+
+    const p = manager.call('blockchain.transaction.get', ['tx1']);
+    await delay(40); // hedge timer fired; pick-of-primary must degrade to no-hedge
+    expect(h.transports.get('a')!.sent).toHaveLength(1); // no duplicate on the same server
+    expect(h.transports.get('b')!.sent).toHaveLength(0);
+    h.reply<WireReq>('a', (req) => ({ id: req.id, result: 'a-tx1' }));
+    expect(await p).toBe('a-tx1');
+
+    await manager.stop();
+  });
+
+  it('rejects non-positive hedging.afterMs at construction', () => {
+    for (const afterMs of [0, -5, Number.NaN]) {
+      expect(
+        () =>
+          new ElectrumManager({
+            network: 'regtest',
+            servers: SERVERS,
+            policy: failover(['a', 'b']),
+            hedging: { afterMs },
+          }),
+      ).toThrow(RangeError);
+    }
+  });
+
   it('a policy that throws at flush time rejects the items instead of stranding them', async () => {
     const h = buildHarness();
     const throwing: RoutingPolicy = {
