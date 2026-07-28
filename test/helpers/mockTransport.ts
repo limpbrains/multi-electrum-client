@@ -12,6 +12,9 @@ export class MockTransport implements Transport {
   connectCalls = 0;
   /** Override next `connect()` to throw — simulate failed reconnect. */
   nextConnectError: Error | null = null;
+  /** Override next non-handshake `send()` to throw — simulate a send-time
+   *  wire failure (the only way `batchCall` rejects as a whole). */
+  nextSendError: Error | null = null;
   /**
    * Auto-reply to `server.version` requests with a synthetic version
    * tuple instead of enqueueing them in `sent[]`. Default true so
@@ -56,6 +59,11 @@ export class MockTransport implements Transport {
       } catch {
         // Fall through and treat as a normal send.
       }
+    }
+    if (this.nextSendError) {
+      const e = this.nextSendError;
+      this.nextSendError = null;
+      throw e;
     }
     this.sent.push(text);
   }

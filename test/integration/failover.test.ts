@@ -64,21 +64,36 @@ describe('integration: failover under toxiproxy faults', () => {
       // disable may never reach the app, leaving the proxy socket
       // half-open in 'connected' while its calls time out. On hosts
       // that do see the RST the state flips to 'disconnected'/'banned'.
-      const views = manager.getClientViews();
-      const proxy = views.find((v) => v.id === 'proxy');
-      const direct = views.find((v) => v.id === 'direct');
+      //
+      // The dead-lane check must POLL, not snapshot: the same NAT
+      // phantom-accepts reconnects to the closed host port (the guest-side
+      // handshake completes before the host connect is attempted), so at
+      // any single instant the proxy client can look freshly 'connected'
+      // with clean telemetry until the next call lands on it and times
+      // out. Keep driving traffic until the manager has evidence.
+      const proxyLooksDead = (): boolean => {
+        const proxy = manager.getClientViews().find((v) => v.id === 'proxy');
+        return (
+          proxy?.state !== 'connected' ||
+          (proxy.telemetry.errors.consecutive >= 1 &&
+            (proxy.telemetry.errors.lastKind === 'timeout' ||
+              proxy.telemetry.errors.lastKind === 'transport'))
+        );
+      };
+      const deadline = Date.now() + 20_000;
+      while (!proxyLooksDead() && Date.now() < deadline) {
+        expect(await manager.server.ping()).toBeNull();
+      }
+      expect(proxyLooksDead()).toBe(true);
+
+      const direct = manager.getClientViews().find((v) => v.id === 'direct');
       expect(direct?.state).toBe('connected');
-      // 5 pings total, at most the pre-fault one can have succeeded on
-      // `proxy` — everything else landed on `direct`.
+      // 5 fixed pings, at most the pre-fault one can have succeeded on
+      // `proxy` — everything else (plus any polling pings) landed on
+      // `direct`.
       expect(direct?.telemetry.success.count ?? 0).toBeGreaterThanOrEqual(4);
-      const proxyDead =
-        proxy?.state !== 'connected' ||
-        (proxy.telemetry.errors.consecutive >= 1 &&
-          (proxy.telemetry.errors.lastKind === 'timeout' ||
-            proxy.telemetry.errors.lastKind === 'transport'));
-      expect(proxyDead).toBe(true);
     } finally {
       await manager.stop();
     }
-  }, 30_000);
+  }, 60_000);
 });
