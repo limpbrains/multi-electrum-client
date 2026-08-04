@@ -210,6 +210,25 @@ describe('ElectrumClient', () => {
     expect(await p).toBe(null);
   });
 
+  it('a serialization failure leaves no in-flight entry behind', async () => {
+    const transport = new MockTransport();
+    const client = new ElectrumClient({ id: 'a', endpoint: transport.endpoint, transport });
+    await client.connect();
+
+    // Circular params make JSON.stringify (encodeRequest) throw AFTER the
+    // in-flight entry is registered. The entry must be unwound — a leaked
+    // entry would fire its timeout against a promise nobody holds.
+    const circular: Record<string, unknown> = {};
+    circular['self'] = circular;
+    await expect(client.call('server.ping', [circular])).rejects.toThrow();
+    expect(client.inFlightCount).toBe(0);
+
+    await expect(
+      client.batchCall([{ method: 'server.ping', params: [circular] }]),
+    ).rejects.toThrow();
+    expect(client.inFlightCount).toBe(0);
+  });
+
   it('disconnect closes transport and rejects pending', async () => {
     const transport = new MockTransport();
     const client = new ElectrumClient({ id: 'a', endpoint: transport.endpoint, transport });

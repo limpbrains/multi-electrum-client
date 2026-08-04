@@ -1418,11 +1418,11 @@ export class ElectrumManager {
    * currently banned. Gates the registry's pinned wire `unsubscribe`, the
    * `preferClient` pin, and first-connected binding.
    */
-  private isClientUsable(id: ClientId): boolean {
+  private isClientUsable(id: ClientId, now = Date.now()): boolean {
     const client = this.clients.get(id);
     if (!client || client.getState() !== 'connected') return false;
     const meta = this.meta.get(id);
-    if (meta?.bannedUntil !== undefined && meta.bannedUntil > Date.now()) return false;
+    if (meta?.bannedUntil !== undefined && meta.bannedUntil > now) return false;
     return true;
   }
 
@@ -1543,7 +1543,13 @@ export class ElectrumManager {
     // otherwise.
     const preferred = opts?.preferClient;
     let clientId: ClientId | null = null;
-    if (preferred !== undefined && !excluded.has(preferred) && this.isClientUsable(preferred)) {
+    if (
+      preferred !== undefined &&
+      !excluded.has(preferred) &&
+      // Same timestamp as the candidate snapshot — a ban expiring between
+      // the two reads must not make the pin and the snapshot disagree.
+      this.isClientUsable(preferred, now)
+    ) {
       clientId = preferred;
     }
     if (clientId === null) {

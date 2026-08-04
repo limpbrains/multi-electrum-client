@@ -128,12 +128,9 @@ export class PeerDiscoveryRunner {
   private readonly deps: PeerDiscoveryDeps;
   private readonly timers = new Map<ClientId, ReturnType<typeof setTimeout>>();
 
-  private readonly intervalMs: number;
-
   constructor(options: DiscoverOptions, deps: PeerDiscoveryDeps) {
     this.options = options;
     this.deps = deps;
-    this.intervalMs = options.intervalMs ?? DEFAULT_DISCOVER_INTERVAL_MS;
   }
 
   /**
@@ -186,7 +183,7 @@ export class PeerDiscoveryRunner {
       }
     }
 
-    const interval = this.intervalMs;
+    const interval = this.options.intervalMs ?? DEFAULT_DISCOVER_INTERVAL_MS;
     if (interval <= 0) return;
     if (this.deps.isStopped()) return;
     // The probe `await`s above may have outlasted the client itself
