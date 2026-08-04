@@ -12,9 +12,7 @@ Manager already exposes `client-state` / `client-banned` / `subscription-restore
 / `error` events. Add a thinner UI-friendly stream for status widgets:
 
 - ~~**`status`**~~ — ✅ shipped as the `pool-state` event +
-  `manager.poolState` getter (`online` / `degraded` / `offline` with
-  `{usable, connected, total}` counts, ban-expiry timer, start/resume
-  baseline guarantees). See CHANGELOG.
+  `manager.poolState` getter; see CHANGELOG.
 - **`message`** — fires once per inbound wire message (request response or
   notification). No payload, just a heartbeat — UIs can bind it to a
   blink/pulse animation. Must NOT include the message body; payloads can be

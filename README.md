@@ -1,17 +1,14 @@
 # multi-electrum-client
 
-Multi-server Electrum (Bitcoin) client for TypeScript with ban-aware routing,
-partial-batch redirect, opt-in request hedging, subscription restore,
-pool-state connectivity events, and lifecycle support for Node, React
-Native, browser, and Bun.
+Resilient multi-server Electrum (Bitcoin) client for TypeScript — ban-aware
+routing, failover, and lifecycle support for Node, React Native, browser,
+and Bun. Feature rundown in [Why](#why) below.
 
-> **Status:** pre-release. Unit + integration suites green (Docker
-> Compose stack covers cross-impl parity, failover under toxiproxy fault
-> injection, partial-batch retry, whole-batch limit rejection,
-> subscription catch-up, auto-reconnect, ban detection, and pool-state
-> connectivity). Both suites also run on-device in a real React Native
-> runtime — iOS simulator and Android emulator CI jobs — see
-> [CHANGELOG](CHANGELOG.md). No `0.1.0` tag yet. Full design at
+> **Status:** pre-release. Unit + integration suites green against the
+> Docker Compose stack with toxiproxy fault injection — the full
+> coverage list lives in the [CHANGELOG](CHANGELOG.md). Both suites also
+> run on-device in a real React Native runtime (iOS simulator and
+> Android emulator CI jobs). No `0.1.0` tag yet. Full design at
 > [`docs/specs/2026-05-08-multi-electrum-client-design.md`](docs/specs/2026-05-08-multi-electrum-client-design.md).
 
 ## Why
