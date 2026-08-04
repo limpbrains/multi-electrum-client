@@ -48,17 +48,20 @@ type CacheExtractor = (params: readonly unknown[]) => CacheableSpec | null;
 
 const heightToHex = (h: number): string => h.toString(16);
 
+const isValidHeight = (h: unknown): h is number =>
+  typeof h === 'number' && Number.isInteger(h) && h >= 0;
+
 const CACHEABLE: Record<string, CacheExtractor> = {
   'blockchain.block.header': (params) => {
     const height = params[0];
-    if (typeof height !== 'number' || !Number.isInteger(height) || height < 0) return null;
+    if (!isValidHeight(height)) return null;
     return { bucket: 'hdr', id: heightToHex(height), finalityHeight: height };
   },
   'blockchain.transaction.get_merkle': (params) => {
     const txid = params[0];
     const height = params[1];
     if (typeof txid !== 'string' || txid.length === 0) return null;
-    if (typeof height !== 'number' || !Number.isInteger(height) || height < 0) return null;
+    if (!isValidHeight(height)) return null;
     return {
       bucket: 'mrk',
       id: `${txid}:${heightToHex(height)}`,

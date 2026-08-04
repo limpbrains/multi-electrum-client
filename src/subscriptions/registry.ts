@@ -184,24 +184,13 @@ export class SubscriptionRegistry {
     const existing = this.subs.get(key);
 
     if (existing) {
-      existing.handlers.add(h);
-      // New handler joining a live subscription gets the most recently seen
-      // status synchronously, so it doesn't have to wait for the next event.
-      if (existing.hasStatus) {
-        this.invokeHandler(h, existing.lastKnownStatus);
-      }
-      return this.makeUnsub(key, h);
+      return this.attach(existing, h);
     }
 
     // Coalesce concurrent first-subscribes onto one wire call.
     const inflight = this.pending.get(key);
     if (inflight) {
-      const record = await inflight.promise;
-      record.handlers.add(h);
-      if (record.hasStatus) {
-        this.invokeHandler(h, record.lastKnownStatus);
-      }
-      return this.makeUnsub(key, h);
+      return this.attach(await inflight.promise, h);
     }
 
     const clientId = this.env.pickConnectedClient();
@@ -241,13 +230,25 @@ export class SubscriptionRegistry {
     } finally {
       this.pending.delete(key);
     }
-    this.invokeHandler(h, record.lastKnownStatus);
     // If we landed orphaned, kick off a rebind in the background so the
     // record doesn't sit dead until the next state transition.
     if (record.clientId === null) {
       void this.rebindOnce(record);
     }
-    return this.makeUnsub(key, h);
+    return this.attach(record, h);
+  }
+
+  /**
+   * Register a handler on a live record: add, replay the last-known
+   * status synchronously (a joiner must not wait for the next push), and
+   * hand back the unsubscriber. Every subscribe path funnels through here.
+   */
+  private attach(record: SubscriptionRecord, h: SubscriptionHandler): Unsubscribe {
+    record.handlers.add(h);
+    if (record.hasStatus) {
+      this.invokeHandler(h, record.lastKnownStatus);
+    }
+    return this.makeUnsub(record.key, h);
   }
 
   /**
@@ -263,6 +264,11 @@ export class SubscriptionRegistry {
     if (record.clientId !== clientId) return; // came from a stale client / orphaned
 
     if (record.hasStatus && statusEquals(record.lastKnownStatus, status)) return; // dedup
+    this.deliver(record, status);
+  }
+
+  /** Store the status, then fan out — stored-before-handlers is invariant. */
+  private deliver(record: SubscriptionRecord, status: unknown): void {
     record.lastKnownStatus = status;
     record.hasStatus = true;
     for (const h of record.handlers) this.invokeHandler(h, status);
@@ -409,9 +415,7 @@ export class SubscriptionRegistry {
     record.clientId = clientId;
     const drift = !record.hasStatus || !statusEquals(record.lastKnownStatus, status);
     if (drift) {
-      record.lastKnownStatus = status;
-      record.hasStatus = true;
-      for (const h of record.handlers) this.invokeHandler(h, status);
+      this.deliver(record, status);
     }
     this.env.emit('subscription-restored', {
       method: record.method,
@@ -441,6 +445,11 @@ function statusEquals(a: unknown, b: unknown): boolean {
   // through (callers see it once and can act). Worse than a deep compare,
   // strictly better than crashing the registry.
   if (a === b) return true;
+  // Two unequal strings can never be JSON-equal — skip the stringify on
+  // the dominant scripthash-status path. Deliberately string-only: a
+  // broader primitive fast path would flip the `0` vs `-0` result, and
+  // objects with `toJSON` could stringify-equal a string.
+  if (typeof a === 'string' && typeof b === 'string') return false;
   try {
     return JSON.stringify(a) === JSON.stringify(b);
   } catch {

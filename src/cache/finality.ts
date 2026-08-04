@@ -18,19 +18,11 @@
 // second `.catch` on top.
 
 import type { CacheStore } from './types.js';
-import { buildKey, cacheSpec, type CacheableSpec } from './keys.js';
+import { buildKey, type CacheableSpec } from './keys.js';
 import type { Network } from '../protocol/types.js';
 
-/**
- * Returns the cache spec for `(method, params)` if the method is on the
- * cacheable allow-list, else `null`. Caller must already have decided
- * to consult the cache (i.e. checked `bypassCache` and that a store is
- * wired up); this is a thin wrapper that exists only so manager doesn't
- * import `cacheSpec` from `./keys.js` directly.
- */
-export function findCacheSpec(method: string, params: readonly unknown[]): CacheableSpec | null {
-  return cacheSpec(method, params);
-}
+// Layering seam: manager imports the cache surface from this module only.
+export { cacheSpec as findCacheSpec } from './keys.js';
 
 /**
  * True iff `height` is at least `finalizedConfs` blocks behind the

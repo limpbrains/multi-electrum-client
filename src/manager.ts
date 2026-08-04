@@ -43,6 +43,7 @@ import type { Transport } from './transport/types.js';
 import { deferred, type Deferred } from './util/deferred.js';
 import { MicrotaskBatcher } from './util/microtask-batcher.js';
 import { ok, err, type Result } from './util/result.js';
+import { setUnrefTimeout } from './util/timers.js';
 import { TelemetryAccumulator } from './util/telemetry.js';
 
 export type { ManagerOptions, BatchRequest } from './protocol/types.js';
@@ -266,6 +267,8 @@ export class ElectrumManager {
   }> = [];
   // Standard typed-event-emitter pattern: store opaquely, cast at the API edge.
   private readonly listeners = new Map<keyof ManagerEvents, Set<(p: unknown) => void>>();
+  /** Hoisted so the per-call cache path doesn't allocate a closure per request. */
+  private readonly onCacheError = (e: unknown): void => this.emit('error', e);
   /**
    * Last emitted pool status. `null` = no baseline yet — the next
    * `maybeEmitPoolState` emits unconditionally. Reset by `resume()` so
@@ -383,14 +386,7 @@ export class ElectrumManager {
       );
     }
     this.lifecycle = 'running';
-    const tasks = [...this.clients.values()].map(async (c) => {
-      try {
-        await c.connect();
-      } catch (e) {
-        this.emit('error', e);
-      }
-    });
-    await Promise.all(tasks);
+    await this.forEachClientSafe((c) => c.connect());
     // Initial connect wave settled — release the pool-state gate and
     // emit the baseline snapshot. `lastPoolStatus` is null here, so this
     // fires even when every connect failed (all-offline start is exactly
@@ -423,6 +419,25 @@ export class ElectrumManager {
       );
     } catch (e) {
       this.emit('error', e);
+    }
+  }
+
+  /**
+   * Invoke and clear the internal tip subscription; the tip itself is
+   * cleared first (nothing reads it mid-teardown: `call()` throws in
+   * `stopped` and queues in `suspending`). Invoking — not just nulling —
+   * matters: the registry record would otherwise retain the old handler
+   * and each resume would stack another copy.
+   */
+  private async teardownTipSubscription(): Promise<void> {
+    this.tipHeight = undefined;
+    if (this.tipUnsub) {
+      try {
+        await this.tipUnsub();
+      } catch (e) {
+        this.emit('error', e);
+      }
+      this.tipUnsub = null;
     }
   }
 
@@ -467,31 +482,12 @@ export class ElectrumManager {
     // event triggered by our own `c.disconnect()` below doesn't reschedule.
     this.reconnect.clear();
     // Pool-state machinery off — no post-stop emits, no dangling timer.
-    if (this.banExpiryTimer !== null) {
-      clearTimeout(this.banExpiryTimer);
-      this.banExpiryTimer = null;
-    }
+    this.clearBanExpiryTimer();
     this.poolBaselineReady = false;
     this.lastPoolStatus = null;
-    if (this.tipUnsub) {
-      try {
-        await this.tipUnsub();
-      } catch (e) {
-        this.emit('error', e);
-      }
-      this.tipUnsub = null;
-    }
-    this.tipHeight = undefined;
+    await this.teardownTipSubscription();
     this.registry.clear();
-    await Promise.all(
-      [...this.clients.values()].map(async (c) => {
-        try {
-          await c.disconnect();
-        } catch (e) {
-          this.emit('error', e);
-        }
-      }),
-    );
+    await this.forEachClientSafe((c) => c.disconnect());
     // Drop event listeners after the last possible emit (`error` paths
     // above) so closures captured by user listeners don't keep the manager
     // / its dependencies pinned across a discarded reference.
@@ -521,9 +517,19 @@ export class ElectrumManager {
     // ours) and then re-evaluates lifecycle. The catch on the tail
     // assignment keeps it never-rejecting so subsequent appenders and
     // `stop()` can `await transitionTail` without seeing throws.
-    const task = this.transitionTail
-      .catch(() => undefined)
-      .then(() => this.doSuspendIfNeeded(opts));
+    return this.queueTransition(() => this.doSuspendIfNeeded(opts));
+  }
+
+  /**
+   * Append a task to the FIFO transition chain. The task waits for any
+   * prior transition (success or failure — outcomes are independent) and
+   * re-evaluates lifecycle itself. The catch on the tail assignment keeps
+   * the chain never-rejecting so appenders and `stop()` can await it
+   * without try/catch, while the returned (unwrapped) task still
+   * propagates its own rejection to the caller.
+   */
+  private queueTransition(run: () => Promise<void>): Promise<void> {
+    const task = this.transitionTail.catch(() => undefined).then(run);
     this.transitionTail = task.catch(() => undefined);
     return task;
   }
@@ -569,15 +575,7 @@ export class ElectrumManager {
         c.failInFlight(new SuspendedError('manager suspending'));
       }
     }
-    await Promise.all(
-      [...this.clients.values()].map(async (c) => {
-        try {
-          await c.disconnect();
-        } catch (e) {
-          this.emit('error', e);
-        }
-      }),
-    );
+    await this.forEachClientSafe((c) => c.disconnect());
     // Clear discover timers — they'd fire against dead sockets and route
     // via policy.pick to a different server. The next `resume()` re-arms
     // them on every `connected` transition. Caveat: a client that fails
@@ -600,15 +598,7 @@ export class ElectrumManager {
     // resume's subscribe call adds a *second* handler to the same record.
     // After N suspend/resume cycles a long-lived RN session would have N
     // copies of the tip-tracker handler all firing on every header push.
-    this.tipHeight = undefined;
-    if (this.tipUnsub) {
-      try {
-        await this.tipUnsub();
-      } catch (e) {
-        this.emit('error', e);
-      }
-      this.tipUnsub = null;
-    }
+    await this.teardownTipSubscription();
     // Note: registry / suspendQueue / cache state preserved.
     // Race: a concurrent `stop()` may have flipped lifecycle to 'stopped'
     // while we were awaiting the disconnect. Don't clobber that — the
@@ -628,9 +618,7 @@ export class ElectrumManager {
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot resume a stopped manager');
     }
-    const task = this.transitionTail.catch(() => undefined).then(() => this.doResumeIfNeeded());
-    this.transitionTail = task.catch(() => undefined);
-    return task;
+    return this.queueTransition(() => this.doResumeIfNeeded());
   }
 
   /**
@@ -656,37 +644,17 @@ export class ElectrumManager {
     // Reconnect: each client's `connected` transition fires
     // `onStateChange` which in turn calls `restoreOrphans()`. We don't
     // have to drive subscription replay manually.
-    await Promise.all(
-      [...this.clients.values()].map(async (c) => {
-        try {
-          await c.connect();
-        } catch (e) {
-          this.emit('error', e);
-        }
-      }),
-    );
+    await this.forEachClientSafe((c) => c.connect());
     // Race check: a concurrent `stop()` may have flipped lifecycle to
     // 'stopped' while we awaited reconnects. Bail before re-installing
     // the headers subscription / draining the queue (which would
     // dispatch through call() against soon-to-be-disconnected clients).
-    // Cast through LifecycleState because TS narrows `lifecycle` from the
-    // earlier `=== 'suspended'` check and doesn't know a concurrent stop()
-    // can mutate it across awaits.
-    if ((this.lifecycle as LifecycleState) === 'stopped') {
-      this.rejectSuspendQueue('manager stopped during resume');
-      return;
-    }
+    if (this.resumeAbortedByStop()) return;
     // Re-install the tip subscription if a cache was configured. `tipUnsub`
     // was cleared inside `suspend()`; it should always be `null` here.
     await this.installTipSubscription();
     // Re-check after the second await for the same race window.
-    // Cast through LifecycleState because TS narrows `lifecycle` from the
-    // earlier `=== 'suspended'` check and doesn't know a concurrent stop()
-    // can mutate it across awaits.
-    if ((this.lifecycle as LifecycleState) === 'stopped') {
-      this.rejectSuspendQueue('manager stopped during resume');
-      return;
-    }
+    if (this.resumeAbortedByStop()) return;
     // Drain order matters: splice the queue while we're still `resuming`
     // (so any call() that lands between this line and the lifecycle flip
     // joins the queue rather than dispatching ahead of the drained
@@ -710,6 +678,20 @@ export class ElectrumManager {
         (e) => item.def.reject(e),
       );
     }
+  }
+
+  /**
+   * True when a concurrent `stop()` flipped lifecycle to `stopped` while
+   * `runResume` was awaiting; rejects the suspend queue on the way out.
+   * The cast widens the TS-narrowed literal — TS doesn't know `stop()`
+   * can mutate `lifecycle` across awaits.
+   */
+  private resumeAbortedByStop(): boolean {
+    if ((this.lifecycle as LifecycleState) === 'stopped') {
+      this.rejectSuspendQueue('manager stopped during resume');
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -844,9 +826,8 @@ export class ElectrumManager {
     // call. `bypassCache` opts out of both the read and the write.
     const cache = this.cache;
     const spec = cache && !opts?.bypassCache ? findCacheSpec(method, params) : null;
-    const onCacheError = (e: unknown): void => this.emit('error', e);
     if (cache && spec) {
-      const hit = await readFromCache(cache, this.network, spec, onCacheError);
+      const hit = await readFromCache(cache, this.network, spec, this.onCacheError);
       if (hit !== MISS) return hit;
     }
 
@@ -855,7 +836,7 @@ export class ElectrumManager {
       // Fire-and-forget: a slow cache adapter must not block the
       // caller. `writeToCache` catches every failure internally and
       // routes through `onCacheError`, so no outer `.catch` is needed.
-      void writeToCache(cache, this.network, spec, value, onCacheError);
+      void writeToCache(cache, this.network, spec, value, this.onCacheError);
     }
     return value;
   }
@@ -886,14 +867,7 @@ export class ElectrumManager {
       });
       return def.promise;
     }
-    return this.runAttempts(
-      method,
-      params,
-      new Set<ClientId>(),
-      this.maxAttemptsFor(opts),
-      0,
-      opts,
-    );
+    return this.callDirect(method, params, opts);
   }
 
   /**
@@ -1280,16 +1254,8 @@ export class ElectrumManager {
     if (picked.kind !== 'picked') return picked;
     const primary = this.executeOn(picked.clientId, picked.client, method, params);
 
-    // The timer is cleared on every path where it hasn't fired — a settled
-    // race would otherwise leak the handle (and a pending timer across
-    // stop()/suspend() would fire against a torn-down pool).
-    let timerId: ReturnType<typeof setTimeout> | undefined;
-    const timer = new Promise<'hedge-now'>((resolve) => {
-      timerId = setTimeout(() => resolve('hedge-now'), afterMs);
-    });
-    const first = await Promise.race([primary, timer]);
+    const first = await raceHedgeTimer(primary, afterMs);
     if (first !== 'hedge-now') {
-      clearTimeout(timerId);
       return first.kind === 'success' ? first : { kind: 'failures', failures: [first] };
     }
 
@@ -1370,22 +1336,12 @@ export class ElectrumManager {
    * the routing policy (subs are pinned, not load-balanced).
    */
   private firstConnectedClient(): ClientId | null {
-    const now = Date.now();
-    for (const [id, client] of this.clients) {
-      if (client.getState() !== 'connected') continue;
-      const meta = this.meta.get(id);
-      if (meta?.bannedUntil !== undefined && meta.bannedUntil > now) continue;
-      return id;
+    for (const id of this.clients.keys()) {
+      if (this.isClientUsable(id)) return id;
     }
     return null;
   }
 
-  /**
-   * True iff the client is in the pool, in `connected` state, and not
-   * currently banned. Used by the subscription registry to gate a wire
-   * `unsubscribe` at the bound server (a fall-through to a different
-   * server would no-op or surface a misleading rpc-error).
-   */
   /**
    * Count connected / usable clients and derive the aggregate status.
    * Clients mid-removeServer are excluded entirely (see `removingServers`).
@@ -1431,10 +1387,7 @@ export class ElectrumManager {
    * emit the recovery transition until the next call or socket event.
    */
   private armBanExpiryTimer(): void {
-    if (this.banExpiryTimer !== null) {
-      clearTimeout(this.banExpiryTimer);
-      this.banExpiryTimer = null;
-    }
+    this.clearBanExpiryTimer();
     const now = Date.now();
     let earliest = Infinity;
     for (const m of this.meta.values()) {
@@ -1447,16 +1400,24 @@ export class ElectrumManager {
     // which would spin fire→rearm for the whole cooldown. Cap the delay;
     // a capped timer just wakes up, recomputes, and re-arms the rest.
     const delay = Math.min(earliest - now + 1, 2 ** 31 - 1);
-    const t = setTimeout(() => {
+    this.banExpiryTimer = setUnrefTimeout(() => {
       this.banExpiryTimer = null;
       this.maybeEmitPoolState();
     }, delay);
-    if (typeof t === 'object' && t !== null && 'unref' in t) {
-      (t as { unref: () => void }).unref();
-    }
-    this.banExpiryTimer = t;
   }
 
+  private clearBanExpiryTimer(): void {
+    if (this.banExpiryTimer !== null) {
+      clearTimeout(this.banExpiryTimer);
+      this.banExpiryTimer = null;
+    }
+  }
+
+  /**
+   * True iff the client is in the pool, in `connected` state, and not
+   * currently banned. Gates the registry's pinned wire `unsubscribe`, the
+   * `preferClient` pin, and first-connected binding.
+   */
   private isClientUsable(id: ClientId): boolean {
     const client = this.clients.get(id);
     if (!client || client.getState() !== 'connected') return false;
@@ -1505,6 +1466,22 @@ export class ElectrumManager {
   // `./reconnect.ts`; manager's onStateChange / lifecycle / removeServer
   // paths drive it through `register` / `schedule` / `resetAttempts` /
   // `cancelAllTimers` / `clear`.
+
+  /**
+   * Run `op` on every pooled client in parallel; per-client failures
+   * surface as `error` events instead of rejecting the whole wave.
+   */
+  private async forEachClientSafe(op: (c: ElectrumClient) => Promise<void>): Promise<void> {
+    await Promise.all(
+      [...this.clients.values()].map(async (c) => {
+        try {
+          await op(c);
+        } catch (e) {
+          this.emit('error', e);
+        }
+      }),
+    );
+  }
 
   /** Sum of in-flight requests across every connected client. */
   private totalInFlight(): number {
@@ -1556,8 +1533,8 @@ export class ElectrumManager {
     opts?: CallOpts,
     probe = false,
   ): PickResult {
-    const candidates = this.buildCandidates();
     const now = Date.now();
+    const candidates = this.buildCandidates(now);
 
     // `preferClient` lets the registry route an unsubscribe (or any other
     // pinned call) at the exact server we're targeting without consulting
@@ -1566,11 +1543,8 @@ export class ElectrumManager {
     // otherwise.
     const preferred = opts?.preferClient;
     let clientId: ClientId | null = null;
-    if (preferred !== undefined && !excluded.has(preferred)) {
-      const view = candidates.find((c) => c.id === preferred);
-      if (view && view.state === 'connected' && (view.bannedUntil ?? 0) <= now) {
-        clientId = preferred;
-      }
+    if (preferred !== undefined && !excluded.has(preferred) && this.isClientUsable(preferred)) {
+      clientId = preferred;
     }
     if (clientId === null) {
       const ctx: PickContext = {
@@ -1644,8 +1618,8 @@ export class ElectrumManager {
     groups: Map<ClientId, BatchItem[]>;
     unroutable: BatchItem[];
   } {
-    const candidates = this.buildCandidates();
     const now = Date.now();
+    const candidates = this.buildCandidates(now);
     const groups = new Map<ClientId, BatchItem[]>();
     const unroutable: BatchItem[] = [];
     for (const item of items) {
@@ -1694,6 +1668,26 @@ export class ElectrumManager {
   }
 
   /**
+   * Settle a batch item through the single-call retry path, resolving /
+   * rejecting its deferred with the outcome. `seed` carries the previous
+   * failure so a final NoClientAvailableError surfaces the actual cause.
+   */
+  private settleViaSingleCall(item: BatchItem, seed?: Error): void {
+    void this.runAttempts(
+      item.method,
+      item.params,
+      item.excluded,
+      this.maxAttemptsFor(item.opts),
+      item.attempt,
+      item.opts,
+      seed,
+    ).then(
+      (v) => item.def.resolve(v),
+      (e) => item.def.reject(e),
+    );
+  }
+
+  /**
    * Dispatch one already-routed group: send the wire batch (hedged at the
    * group level when armed and every item is eligible), then settle /
    * retry per item based on the outcome.
@@ -1706,17 +1700,7 @@ export class ElectrumManager {
       // burning a real attempt against the actual server.
       for (const item of grp) {
         item.excluded.add(clientId);
-        this.runAttempts(
-          item.method,
-          item.params,
-          item.excluded,
-          this.maxAttemptsFor(item.opts),
-          item.attempt,
-          item.opts,
-        ).then(
-          (v) => item.def.resolve(v),
-          (e) => item.def.reject(e),
-        );
+        this.settleViaSingleCall(item);
       }
       return;
     }
@@ -1834,13 +1818,8 @@ export class ElectrumManager {
   ): Promise<GroupDispatchOutcome> {
     const primary = this.sendGroup(primaryId, client, grp);
 
-    let timerId: ReturnType<typeof setTimeout> | undefined;
-    const timer = new Promise<'hedge-now'>((resolve) => {
-      timerId = setTimeout(() => resolve('hedge-now'), afterMs);
-    });
-    const first = await Promise.race([primary, timer]);
+    const first = await raceHedgeTimer(primary, afterMs);
     if (first !== 'hedge-now') {
-      clearTimeout(timerId);
       return first;
     }
 
@@ -1978,7 +1957,8 @@ export class ElectrumManager {
     winner: Extract<GroupSendOutcome, { kind: 'results' }>,
     sibling: Promise<GroupSendOutcome>,
   ): Promise<void> {
-    const deferred: Array<{ item: BatchItem; index: number; error: Error; fatal: boolean }> = [];
+    const pendingItems: Array<{ item: BatchItem; index: number; error: Error; fatal: boolean }> =
+      [];
     for (let i = 0; i < grp.length; i++) {
       const item = grp[i]!;
       const e = winner.entries[i]!;
@@ -1987,14 +1967,14 @@ export class ElectrumManager {
         continue;
       }
       item.excluded.add(winner.clientId);
-      deferred.push({ item, index: i, error: e.error, fatal: !isRetryable(e.errorKind) });
+      pendingItems.push({ item, index: i, error: e.error, fatal: !isRetryable(e.errorKind) });
     }
-    if (deferred.length === 0) return; // sibling stays telemetry-only
+    if (pendingItems.length === 0) return; // sibling stays telemetry-only
 
     const sib = await sibling; // sendGroup never rejects
     const sibBatchFatal = sib.kind === 'batch-error' && !isRetryable(sib.errorKind);
     const retryable: RetryEntry[] = [];
-    for (const d of deferred) {
+    for (const d of pendingItems) {
       const { item } = d;
       if (sib.kind === 'results') {
         const se = sib.entries[d.index]!;
@@ -2133,18 +2113,7 @@ export class ElectrumManager {
       // Seed `runAttempts` with the previous error so a final
       // NoClientAvailableError surfaces the actual cause.
       const { item, error } = live[0]!;
-      void this.runAttempts(
-        item.method,
-        item.params,
-        item.excluded,
-        this.maxAttemptsFor(item.opts),
-        item.attempt,
-        item.opts,
-        error,
-      ).then(
-        (v) => item.def.resolve(v),
-        (e) => item.def.reject(e),
-      );
+      this.settleViaSingleCall(item, error);
       return;
     }
     void this.redispatchGroup(live).catch((e) => {
@@ -2209,8 +2178,7 @@ export class ElectrumManager {
     await Promise.all(dispatches);
   }
 
-  private buildCandidates(): ClientView[] {
-    const now = Date.now();
+  private buildCandidates(now = Date.now()): ClientView[] {
     const out: ClientView[] = [];
     for (const [id, client] of this.clients) {
       const meta = this.meta.get(id);
@@ -2336,6 +2304,21 @@ export class ElectrumManager {
     if (r === 'auto') return Math.max(1, this.clients.size);
     return Math.max(1, r.maxAttempts);
   }
+}
+
+/**
+ * Race a primary dispatch against the hedge-arm timer. The timer is
+ * cleared whenever the primary settles first — a leaked handle would
+ * otherwise fire across stop()/suspend() against a torn-down pool.
+ */
+async function raceHedgeTimer<T>(primary: Promise<T>, afterMs: number): Promise<T | 'hedge-now'> {
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  const timer = new Promise<'hedge-now'>((resolve) => {
+    timerId = setTimeout(() => resolve('hedge-now'), afterMs);
+  });
+  const first = await Promise.race([primary, timer]);
+  if (first !== 'hedge-now') clearTimeout(timerId);
+  return first;
 }
 
 function isRetryable(kind: ErrorKind): boolean {

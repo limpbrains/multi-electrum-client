@@ -67,14 +67,7 @@ export class TlsTransport implements Transport {
       readyEvent: 'secureConnect',
       connect:
         opts.connect ??
-        ((host, port) => {
-          const socket = tlsConnect({
-            host,
-            port,
-            ...(tlsOptions ?? {}),
-          });
-          return socket as unknown as TcpSocketLike;
-        }),
+        ((host, port) => tlsConnect({ host, port, ...tlsOptions }) as unknown as TcpSocketLike),
       ...(opts.connectTimeoutMs !== undefined ? { connectTimeoutMs: opts.connectTimeoutMs } : {}),
     };
     this.inner = new TcpTransport(innerOpts);

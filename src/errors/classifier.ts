@@ -170,23 +170,16 @@ export const defaultClassifier: ErrorClassifier = {
     if (error instanceof TransportError) return 'transport';
     if (error instanceof ProtocolError) return 'protocol';
 
-    if (error instanceof RpcError) {
-      const msg = lowerMessage(error);
-      if (matchesAny(msg, rateLimitSubstrings(ctx.serverSoftware))) {
-        return 'rate-limit';
-      }
-      return 'rpc-error';
-    }
-
-    // Untyped error: fall back to message inspection. Rate-limit checks come
-    // before transport because some servers send a final RPC-shaped error
-    // ("excessive resource usage", "Subscription limit reached") immediately
-    // before slamming the socket closed; we want to ban-list them, not just
-    // retry on transport.
+    // Message inspection. Rate-limit wins over everything else (including
+    // RpcError's own kind) because some servers send a final RPC-shaped
+    // error ("excessive resource usage", "Subscription limit reached")
+    // immediately before slamming the socket closed; we want to ban-list
+    // them, not just retry on transport.
     const msg = lowerMessage(error);
     if (matchesAny(msg, rateLimitSubstrings(ctx.serverSoftware))) {
       return 'rate-limit';
     }
+    if (error instanceof RpcError) return 'rpc-error';
     if (matchesAny(msg, TRANSPORT_SUBSTRINGS)) return 'transport';
     return 'unknown';
   },

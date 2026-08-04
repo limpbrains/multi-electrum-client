@@ -118,6 +118,9 @@ export class TcpTransport implements Transport {
   }
 
   async connect(): Promise<void> {
+    // A connect always starts with an empty framer (the close handler
+    // resets it too, but state the invariant where it matters).
+    this.framer.reset();
     const socket = this.connectFn(this.endpoint.host, this.endpoint.port);
     socket.setEncoding('utf-8');
 
@@ -253,11 +256,9 @@ export class TcpTransport implements Transport {
         }
         settle();
       }, 500);
-      if (typeof socket.once === 'function') {
-        socket.once('close', settle);
-      } else {
-        socket.on('close', settle);
-      }
+      // `settle` is idempotent and a second close() returns early (socket
+      // already nulled), so a plain `on` cannot double-fire teardown.
+      socket.on('close', settle);
       try {
         socket.end();
       } catch {
