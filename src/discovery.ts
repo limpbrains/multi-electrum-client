@@ -5,6 +5,7 @@
 
 import type { ClientId, Protocol } from './client.js';
 import type { ServerSpec } from './protocol/types.js';
+import { setUnrefTimeout } from './util/timers.js';
 
 /**
  * Wire shape: `[host, ip, [feature, ...]]`. Some servers omit `ip` or pad
@@ -127,9 +128,12 @@ export class PeerDiscoveryRunner {
   private readonly deps: PeerDiscoveryDeps;
   private readonly timers = new Map<ClientId, ReturnType<typeof setTimeout>>();
 
+  private readonly intervalMs: number;
+
   constructor(options: DiscoverOptions, deps: PeerDiscoveryDeps) {
     this.options = options;
     this.deps = deps;
+    this.intervalMs = options.intervalMs ?? DEFAULT_DISCOVER_INTERVAL_MS;
   }
 
   /**
@@ -158,7 +162,7 @@ export class PeerDiscoveryRunner {
       // callback racing the pool (e.g. calling `addServer` on this
       // same id from inside its own handler).
       if (this.deps.hasClient(cand.id)) continue;
-      let admit: boolean;
+      let admit = true;
       if (this.options.onDiscover) {
         try {
           admit = await this.options.onDiscover(cand);
@@ -166,8 +170,6 @@ export class PeerDiscoveryRunner {
           this.deps.onError(e);
           continue;
         }
-      } else {
-        admit = true;
       }
       if (!admit) continue;
       // Post-await re-check: lifecycle and pool may have changed while
@@ -184,7 +186,7 @@ export class PeerDiscoveryRunner {
       }
     }
 
-    const interval = this.options.intervalMs ?? DEFAULT_DISCOVER_INTERVAL_MS;
+    const interval = this.intervalMs;
     if (interval <= 0) return;
     if (this.deps.isStopped()) return;
     // The probe `await`s above may have outlasted the client itself
@@ -194,13 +196,10 @@ export class PeerDiscoveryRunner {
     if (!this.deps.hasClient(clientId)) return;
     const prev = this.timers.get(clientId);
     if (prev !== undefined) clearTimeout(prev);
-    const t = setTimeout(() => {
+    const t = setUnrefTimeout(() => {
       this.timers.delete(clientId);
       this.runFor(clientId).catch((e) => this.deps.onError(e));
     }, interval);
-    if (typeof t === 'object' && t !== null && 'unref' in t) {
-      (t as { unref: () => void }).unref();
-    }
     this.timers.set(clientId, t);
   }
 

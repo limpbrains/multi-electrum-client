@@ -136,8 +136,7 @@ export class ElectrumClient {
       this.connectedAt = Date.now();
       this.setState('connected');
     } catch (e) {
-      this.detachTransport?.();
-      this.detachTransport = undefined;
+      this.detach();
       this.setState('disconnected');
       throw e;
     }
@@ -145,31 +144,25 @@ export class ElectrumClient {
 
   async disconnect(): Promise<void> {
     this.connectedAt = undefined;
-    this.detachTransport?.();
-    this.detachTransport = undefined;
-    this.failAllInFlight(new TransportError('disconnected by client'));
+    this.detach();
+    this.failInFlight(new TransportError('disconnected by client'));
     this.setState('disconnected');
     await this.transport.close();
+  }
+
+  /** Unbind from the transport; never leaves a stale detach fn behind. */
+  private detach(): void {
+    this.detachTransport?.();
+    this.detachTransport = undefined;
   }
 
   async call<T = unknown>(method: string, params: readonly unknown[] = []): Promise<T> {
     if (this.state !== 'connected') {
       throw new TransportError(`cannot call ${method}: state is ${this.state}`);
     }
-    const id = this.nextId++;
-    const req: JsonRpcRequest = { jsonrpc: '2.0', method, params, id };
-    const text = encodeRequest(req);
-    const def = deferred<T>();
-    this.registerInFlight(id, def as Deferred<unknown>, method);
-
-    try {
-      await this.transport.send(text);
-    } catch (e) {
-      this.cancelInFlight(id);
-      throw e;
-    }
-
-    return def.promise;
+    const { id, def, req } = this.openRequest(method, params);
+    await this.sendOrCancel(encodeRequest(req), [id]);
+    return def.promise as Promise<T>;
   }
 
   /**
@@ -189,22 +182,13 @@ export class ElectrumClient {
     const jsonReqs: JsonRpcRequest[] = [];
 
     for (const r of reqs) {
-      const id = this.nextId++;
+      const { id, def, req } = this.openRequest(r.method, r.params);
       ids.push(id);
-      jsonReqs.push({ jsonrpc: '2.0', method: r.method, params: r.params, id });
-
-      const def = deferred<unknown>();
-      this.registerInFlight(id, def, r.method);
+      jsonReqs.push(req);
       promises.push(def.promise.then(ok, err));
     }
 
-    const text = encodeBatch(jsonReqs);
-    try {
-      await this.transport.send(text);
-    } catch (e) {
-      for (const id of ids) this.cancelInFlight(id);
-      throw e;
-    }
+    await this.sendOrCancel(encodeBatch(jsonReqs), ids);
 
     // Track the batch so a batch-level `id: null` error reply can be
     // mapped back to these items (see `dispatch`). Entry is dropped once
@@ -255,21 +239,47 @@ export class ElectrumClient {
     }
   }
 
+  /** Allocate an id, register the in-flight entry, and build the wire request. */
+  private openRequest(
+    method: string,
+    params: readonly unknown[],
+  ): { id: JsonRpcId; def: Deferred<unknown>; req: JsonRpcRequest } {
+    const id = this.nextId++;
+    const def = deferred<unknown>();
+    this.registerInFlight(id, def, method);
+    return { id, def, req: { jsonrpc: '2.0', method, params, id } };
+  }
+
+  /** Send, unwinding every listed in-flight entry if the transport throws. */
+  private async sendOrCancel(text: string, ids: readonly JsonRpcId[]): Promise<void> {
+    try {
+      await this.transport.send(text);
+    } catch (e) {
+      for (const id of ids) this.takeInFlight(id);
+      throw e;
+    }
+  }
+
   private registerInFlight(id: JsonRpcId, def: Deferred<unknown>, method: string): void {
     const timer = setTimeout(() => {
-      const inflight = this.inFlight.get(id);
-      if (!inflight) return;
-      this.inFlight.delete(id);
-      inflight.def.reject(new TimeoutError(`${method} timed out after ${this.requestTimeoutMs}ms`));
+      const inflight = this.takeInFlight(id);
+      inflight?.def.reject(
+        new TimeoutError(`${method} timed out after ${this.requestTimeoutMs}ms`),
+      );
     }, this.requestTimeoutMs);
     this.inFlight.set(id, { def, method, timer });
   }
 
-  private cancelInFlight(id: JsonRpcId): void {
+  /**
+   * Atomically remove an in-flight entry: the entry leaves the map exactly
+   * once with its timer dead. Every settlement path goes through here.
+   */
+  private takeInFlight(id: JsonRpcId): InFlight | undefined {
     const inflight = this.inFlight.get(id);
-    if (!inflight) return;
+    if (!inflight) return undefined;
     this.inFlight.delete(id);
     clearTimeout(inflight.timer);
+    return inflight;
   }
 
   private handle(ev: TransportEvent): void {
@@ -284,7 +294,7 @@ export class ElectrumClient {
         ev.code !== undefined
           ? `socket closed (code=${ev.code}${ev.reason ? `, reason=${ev.reason}` : ''})`
           : 'socket closed';
-      this.failAllInFlight(new TransportError(reason));
+      this.failInFlight(new TransportError(reason));
       this.setState('disconnected');
       return;
     }
@@ -302,9 +312,9 @@ export class ElectrumClient {
       // parses fine. Surface to the listener instead of dropping silently;
       // the in-flight request this frame answered (if any) falls back to
       // its per-request timeout.
-      const err = e instanceof ProtocolError ? e : new ProtocolError(String(e));
+      const protoErr = e instanceof ProtocolError ? e : new ProtocolError(String(e));
       try {
-        this.protocolErrorListener?.(err);
+        this.protocolErrorListener?.(protoErr);
       } catch {
         // Listener errors must not break the read path.
       }
@@ -332,17 +342,10 @@ export class ElectrumClient {
       this.failOldestOpenBatch(msg.error);
       return;
     }
-    const inflight = this.inFlight.get(msg.id);
+    const inflight = this.takeInFlight(msg.id);
     if (!inflight) return; // unknown id (late response after timeout)
-    this.inFlight.delete(msg.id);
-    clearTimeout(inflight.timer);
     if ('error' in msg) {
-      const e = msg.error;
-      inflight.def.reject(
-        e.data !== undefined
-          ? new RpcError(e.message, e.code, e.data)
-          : new RpcError(e.message, e.code),
-      );
+      inflight.def.reject(toRpcError(msg.error));
     } else {
       inflight.def.resolve(msg.result);
     }
@@ -356,16 +359,9 @@ export class ElectrumClient {
   private failOldestOpenBatch(e: { code: number; message: string; data?: unknown }): void {
     const ids = this.openBatches.shift();
     if (!ids) return;
-    const rpcError =
-      e.data !== undefined
-        ? new RpcError(e.message, e.code, e.data)
-        : new RpcError(e.message, e.code);
+    const rpcError = toRpcError(e);
     for (const id of ids) {
-      const inflight = this.inFlight.get(id);
-      if (!inflight) continue;
-      this.inFlight.delete(id);
-      clearTimeout(inflight.timer);
-      inflight.def.reject(rpcError);
+      this.takeInFlight(id)?.def.reject(rpcError);
     }
   }
 
@@ -381,14 +377,15 @@ export class ElectrumClient {
    * empty Map and produces no second rejection per request.
    */
   failInFlight(e: Error): void {
-    this.failAllInFlight(e);
-  }
-
-  private failAllInFlight(e: Error): void {
     for (const inflight of this.inFlight.values()) {
       clearTimeout(inflight.timer);
       inflight.def.reject(e);
     }
     this.inFlight.clear();
   }
+}
+
+/** Map a wire error object onto RpcError (the ctor drops undefined `data`). */
+function toRpcError(e: { code: number; message: string; data?: unknown }): RpcError {
+  return new RpcError(e.message, e.code, e.data);
 }

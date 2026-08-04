@@ -7,14 +7,15 @@
 // reasonably need.
 
 import type { ClientId, ClientView } from '../client.js';
-import type { RoutingPolicy } from './types.js';
+import type { PickContext, RoutingPolicy } from './types.js';
 
 /** Cycle through eligible (connected, non-banned, non-excluded) clients. */
 export function roundRobin(): RoutingPolicy {
   let cursor = 0;
   return {
-    pick({ candidates, excluded, now, probe }) {
-      const eligible = candidates.filter((c) => isUsable(c, excluded, now));
+    pick(ctx) {
+      const { probe } = ctx;
+      const eligible = usableCandidates(ctx);
       if (eligible.length === 0) return null;
       const picked = eligible[cursor % eligible.length]!;
       // Probe picks are side-effect-free: a discarded hedge probe must not
@@ -32,8 +33,8 @@ export function roundRobin(): RoutingPolicy {
  */
 export function failover(orderHint?: readonly ClientId[]): RoutingPolicy {
   return {
-    pick({ candidates, excluded, now }) {
-      const eligible = candidates.filter((c) => isUsable(c, excluded, now));
+    pick(ctx) {
+      const eligible = usableCandidates(ctx);
       if (eligible.length === 0) return null;
       if (orderHint) {
         for (const id of orderHint) {
@@ -69,15 +70,18 @@ export function preferFastest(opts: PreferFastestOpts = {}): RoutingPolicy {
   const tiebreak = opts.tiebreak ?? 'leastInFlight';
   let cursor = 0;
   return {
-    pick({ candidates, excluded, now, probe }) {
-      const eligible = candidates.filter((c) => isUsable(c, excluded, now));
+    pick(ctx) {
+      const { probe } = ctx;
+      const eligible = usableCandidates(ctx);
       if (eligible.length === 0) return null;
 
-      const tested = eligible.filter((c) => c.telemetry.latency.samples > 0);
-      const minTested =
-        tested.length > 0
-          ? Math.min(...tested.map((c) => c.telemetry.latency.ema))
-          : Number.POSITIVE_INFINITY;
+      // Single pass over the per-request hot loop: min tested EMA without
+      // the filter/map/spread allocations.
+      let minTested = Number.POSITIVE_INFINITY;
+      for (const c of eligible) {
+        const { samples, ema } = c.telemetry.latency;
+        if (samples > 0 && ema < minTested) minTested = ema;
+      }
       const threshold =
         minTested === Number.POSITIVE_INFINITY
           ? Number.POSITIVE_INFINITY
@@ -97,8 +101,8 @@ export function preferFastest(opts: PreferFastestOpts = {}): RoutingPolicy {
       }
       // leastInFlight
       let best = tied[0]!;
-      for (const c of tied.slice(1)) {
-        if (c.telemetry.inFlight < best.telemetry.inFlight) best = c;
+      for (let i = 1; i < tied.length; i++) {
+        if (tied[i]!.telemetry.inFlight < best.telemetry.inFlight) best = tied[i]!;
       }
       return best.id;
     },
@@ -170,6 +174,15 @@ function scripthashKey(req: { method: string; params: readonly unknown[] }): str
   if (!req.method.startsWith('blockchain.scripthash.')) return undefined;
   const first = req.params[0];
   return typeof first === 'string' ? first : undefined;
+}
+
+/** Shared eligibility filter: connected, non-banned, non-excluded. */
+function usableCandidates({
+  candidates,
+  excluded,
+  now,
+}: Pick<PickContext, 'candidates' | 'excluded' | 'now'>): ClientView[] {
+  return candidates.filter((c) => isUsable(c, excluded, now));
 }
 
 function isUsable(c: ClientView, excluded: ReadonlySet<ClientId>, now: number): boolean {

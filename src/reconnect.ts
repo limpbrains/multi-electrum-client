@@ -20,6 +20,7 @@
 
 import type { ClientId } from './client.js';
 import type { ReconnectBackoff } from './protocol/types.js';
+import { setUnrefTimeout } from './util/timers.js';
 
 export interface ReconnectDeps {
   /**
@@ -59,7 +60,7 @@ export class ReconnectRunner {
    * `unregister` / `clear`. Reconnect loop only fires while true.
    * Suspend leaves the flag set so the loop can resume after `running`.
    */
-  private readonly wants = new Map<ClientId, boolean>();
+  private readonly wants = new Set<ClientId>();
   /** Pending timers per client. Cleared on cancel / unregister / clear. */
   private readonly timers = new Map<ClientId, ReturnType<typeof setTimeout>>();
   /**
@@ -76,7 +77,7 @@ export class ReconnectRunner {
 
   /** Manager calls this once per `installServer`. */
   register(id: ClientId): void {
-    this.wants.set(id, true);
+    this.wants.add(id);
     this.attempts.set(id, 0);
   }
 
@@ -106,22 +107,23 @@ export class ReconnectRunner {
    *    (state check at fire time).
    */
   schedule(id: ClientId): void {
-    if (!this.wants.get(id)) return;
+    if (!this.wants.has(id)) return;
     if (!this.deps.isRunning()) return;
     if (this.timers.has(id)) return;
     const client = this.deps.getClient(id);
     if (!client) return;
     const attempt = this.attempts.get(id) ?? 0;
     const delay = computeBackoff(this.backoff, attempt);
-    const timer = setTimeout(() => {
+    const timer = setUnrefTimeout(() => {
       this.timers.delete(id);
       // Re-check at fire time: caller may have unregistered or the
       // manager may have suspended between schedule and fire.
-      if (!this.wants.get(id)) return;
+      if (!this.wants.has(id)) return;
       if (!this.deps.isRunning()) return;
       const c = this.deps.getClient(id);
       if (!c) return;
-      if (c.getState() === 'connected' || c.getState() === 'connecting') return;
+      const state = c.getState();
+      if (state === 'connected' || state === 'connecting') return;
       this.attempts.set(id, attempt + 1);
       c.connect().catch((e) => {
         this.deps.onError(e);
@@ -132,9 +134,6 @@ export class ReconnectRunner {
         this.schedule(id);
       });
     }, delay);
-    if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
-      (timer as { unref: () => void }).unref();
-    }
     this.timers.set(id, timer);
   }
 

@@ -20,22 +20,25 @@ export class TelemetryAccumulator {
   private consecutiveErrors = 0;
 
   recordSuccess(latencyMs: number, now: number): void {
-    this.pushSample(latencyMs);
-    this.ema = this.ema === 0 ? latencyMs : this.ema * (1 - ALPHA) + latencyMs * ALPHA;
+    this.recordLatency(latencyMs);
     this.successCount++;
     this.lastSuccessAt = now;
     this.consecutiveErrors = 0;
   }
 
   recordError(kind: ErrorKind, latencyMs: number, now: number): void {
-    this.pushSample(latencyMs);
     // Latency on errored requests still informs the EMA: a 10s timeout on
     // server X should make X look slow next time policy.pick runs.
-    this.ema = this.ema === 0 ? latencyMs : this.ema * (1 - ALPHA) + latencyMs * ALPHA;
+    this.recordLatency(latencyMs);
     this.errorCount++;
     this.lastErrorKind = kind;
     this.lastErrorAt = now;
     this.consecutiveErrors++;
+  }
+
+  private recordLatency(latencyMs: number): void {
+    this.pushSample(latencyMs);
+    this.ema = this.ema === 0 ? latencyMs : this.ema * (1 - ALPHA) + latencyMs * ALPHA;
   }
 
   /**

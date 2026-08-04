@@ -18,9 +18,17 @@ export class LineFramer {
    */
   push(chunk: string): string[] {
     this.buf += chunk;
-    const parts = this.buf.split(/\r?\n/);
+    // Fast path: no complete line yet — `buf` never retains a '\n', so
+    // this check is exact and skips all allocation for partial frames.
+    if (!this.buf.includes('\n')) return [];
+    const parts = this.buf.split('\n');
     this.buf = parts.pop() ?? '';
-    return parts.filter((p) => p.length > 0);
+    const out: string[] = [];
+    for (let p of parts) {
+      if (p.endsWith('\r')) p = p.slice(0, -1); // what /\r?\n/ consumed
+      if (p.length > 0) out.push(p);
+    }
+    return out;
   }
 
   /** Drop any pending partial line. Call on transport close / reset. */

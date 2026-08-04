@@ -35,27 +35,26 @@ export interface JsonRpcNotification {
 
 export type JsonRpcMessage = JsonRpcResponse | JsonRpcNotification;
 
+/**
+ * Canonical outbound shape: always jsonrpc 2.0, extra fields dropped, fixed
+ * key order (the order is contract — tests assert the exact wire string).
+ */
+const canonical = (req: JsonRpcRequest): JsonRpcRequest => ({
+  jsonrpc: '2.0',
+  method: req.method,
+  params: req.params,
+  id: req.id,
+});
+
 export function encodeRequest(req: JsonRpcRequest): string {
-  return JSON.stringify({
-    jsonrpc: '2.0',
-    method: req.method,
-    params: req.params,
-    id: req.id,
-  });
+  return JSON.stringify(canonical(req));
 }
 
 export function encodeBatch(reqs: readonly JsonRpcRequest[]): string {
   if (reqs.length === 0) {
     throw new ProtocolError('cannot encode empty batch');
   }
-  return JSON.stringify(
-    reqs.map((req) => ({
-      jsonrpc: '2.0',
-      method: req.method,
-      params: req.params,
-      id: req.id,
-    })),
-  );
+  return JSON.stringify(reqs.map(canonical));
 }
 
 export function decodeMessage(text: string): JsonRpcMessage | JsonRpcMessage[] {

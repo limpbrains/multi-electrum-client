@@ -226,13 +226,10 @@ export class WsTransport implements Transport {
       return data.toString('utf-8');
     }
     if (typeof TextDecoder === 'undefined') return undefined;
-    if (data instanceof ArrayBuffer) {
+    if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      // TextDecoder.decode takes any BufferSource — no wrapper view needed.
       this.decoder ??= new TextDecoder();
-      return this.decoder.decode(new Uint8Array(data));
-    }
-    if (ArrayBuffer.isView(data)) {
-      this.decoder ??= new TextDecoder();
-      return this.decoder.decode(data as ArrayBufferView as Uint8Array);
+      return this.decoder.decode(data);
     }
     return undefined;
   }
