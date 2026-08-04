@@ -256,9 +256,14 @@ export class TcpTransport implements Transport {
         }
         settle();
       }, 500);
-      // `settle` is idempotent and a second close() returns early (socket
-      // already nulled), so a plain `on` cannot double-fire teardown.
-      socket.on('close', settle);
+      // Prefer `once` so the listener detaches after firing; shims
+      // without it fall back to `on` — safe either way, `settle` is
+      // idempotent and a second close() returns early (socket nulled).
+      if (typeof socket.once === 'function') {
+        socket.once('close', settle);
+      } else {
+        socket.on('close', settle);
+      }
       try {
         socket.end();
       } catch {

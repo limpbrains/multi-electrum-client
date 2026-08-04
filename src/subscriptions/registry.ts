@@ -230,12 +230,16 @@ export class SubscriptionRegistry {
     } finally {
       this.pending.delete(key);
     }
+    // Attach (and replay the initial status) BEFORE kicking a rebind:
+    // the caller's handler must see the status this subscribe returned
+    // ahead of any side effects of the recovery path.
+    const unsub = this.attach(record, h);
     // If we landed orphaned, kick off a rebind in the background so the
     // record doesn't sit dead until the next state transition.
     if (record.clientId === null) {
       void this.rebindOnce(record);
     }
-    return this.attach(record, h);
+    return unsub;
   }
 
   /**

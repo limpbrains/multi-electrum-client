@@ -161,7 +161,7 @@ export class ElectrumClient {
       throw new TransportError(`cannot call ${method}: state is ${this.state}`);
     }
     const { id, def, req } = this.openRequest(method, params);
-    await this.sendOrCancel(encodeRequest(req), [id]);
+    await this.sendOrCancel(() => encodeRequest(req), [id]);
     return def.promise as Promise<T>;
   }
 
@@ -188,7 +188,7 @@ export class ElectrumClient {
       promises.push(def.promise.then(ok, err));
     }
 
-    await this.sendOrCancel(encodeBatch(jsonReqs), ids);
+    await this.sendOrCancel(() => encodeBatch(jsonReqs), ids);
 
     // Track the batch so a batch-level `id: null` error reply can be
     // mapped back to these items (see `dispatch`). Entry is dropped once
@@ -250,10 +250,16 @@ export class ElectrumClient {
     return { id, def, req: { jsonrpc: '2.0', method, params, id } };
   }
 
-  /** Send, unwinding every listed in-flight entry if the transport throws. */
-  private async sendOrCancel(text: string, ids: readonly JsonRpcId[]): Promise<void> {
+  /**
+   * Encode and send, unwinding every listed in-flight entry if either
+   * step throws. Encoding runs inside the unwind scope deliberately: a
+   * serialization failure (e.g. circular params) after registration
+   * would otherwise leak the entries until their timers fire against a
+   * promise nobody holds — an unhandled rejection.
+   */
+  private async sendOrCancel(buildText: () => string, ids: readonly JsonRpcId[]): Promise<void> {
     try {
-      await this.transport.send(text);
+      await this.transport.send(buildText());
     } catch (e) {
       for (const id of ids) this.takeInFlight(id);
       throw e;
