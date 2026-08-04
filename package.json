@@ -1,7 +1,7 @@
 {
   "name": "multi-electrum-client",
   "version": "0.0.0",
-  "description": "Multi-server Electrum (Bitcoin) client for TypeScript with ban-aware routing, partial-batch redirect, subscription restore, and lifecycle support for Node, React Native, browser, and Bun.",
+  "description": "Multi-server Electrum (Bitcoin) client for TypeScript with ban-aware routing, partial-batch redirect, opt-in request hedging, subscription restore, pool-state connectivity events, and lifecycle support for Node, React Native, browser, and Bun.",
   "type": "module",
   "license": "MIT",
   "engines": {

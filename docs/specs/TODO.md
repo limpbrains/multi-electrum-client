@@ -11,14 +11,14 @@ date.
 Manager already exposes `client-state` / `client-banned` / `subscription-restored`
 / `error` events. Add a thinner UI-friendly stream for status widgets:
 
-- **`status`** — coarse aggregate state across all clients: `online`,
-  `degraded` (some clients banned/disconnected), `offline` (none usable).
-  Fires whenever the aggregate flips, not on every individual client
-  transition.
+- ~~**`status`**~~ — ✅ shipped as the `pool-state` event +
+  `manager.poolState` getter (`online` / `degraded` / `offline` with
+  `{usable, connected, total}` counts, ban-expiry timer, start/resume
+  baseline guarantees). See CHANGELOG.
 - **`message`** — fires once per inbound wire message (request response or
   notification). No payload, just a heartbeat — UIs can bind it to a
   blink/pulse animation. Must NOT include the message body; payloads can be
-  large and binding them to renders kills perf.
+  large and binding them to renders kills perf. Still open.
 
 Use case: a "network status" widget that shows a green/yellow/red dot and
 blinks on incoming traffic. Keep it cheap to subscribe to (constant work

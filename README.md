@@ -1,14 +1,17 @@
 # multi-electrum-client
 
 Multi-server Electrum (Bitcoin) client for TypeScript with ban-aware routing,
-partial-batch redirect, subscription restore, and lifecycle support for
-Node, React Native, browser, and Bun.
+partial-batch redirect, opt-in request hedging, subscription restore,
+pool-state connectivity events, and lifecycle support for Node, React
+Native, browser, and Bun.
 
 > **Status:** pre-release. Unit + integration suites green (Docker
 > Compose stack covers cross-impl parity, failover under toxiproxy fault
-> injection, partial-batch retry, subscription catch-up, auto-reconnect,
-> and ban detection). RN parity tests deferred — see [CHANGELOG](CHANGELOG.md).
-> No `0.1.0` tag yet. Full design at
+> injection, partial-batch retry, whole-batch limit rejection,
+> subscription catch-up, auto-reconnect, ban detection, and pool-state
+> connectivity). Both suites also run on-device in a real React Native
+> runtime — iOS simulator and Android emulator CI jobs — see
+> [CHANGELOG](CHANGELOG.md). No `0.1.0` tag yet. Full design at
 > [`docs/specs/2026-05-08-multi-electrum-client-design.md`](docs/specs/2026-05-08-multi-electrum-client-design.md).
 
 ## Why
@@ -29,6 +32,9 @@ whose value proposition is **resilience**, not raw speed:
   vendor methods opt in per call with `hedge: true`.
 - Subscriptions replay + catch-up diff on reconnect — handlers don't miss events.
 - Auto-reconnect on transport faults with exponential backoff + jitter.
+- Aggregate `pool-state` events (`online` / `degraded` / `offline`) — one
+  signal to drive an "offline" banner, including the ban-expiry recovery
+  no per-client aggregation can see.
 - `suspend()` / `resume()` for React Native background lifecycle.
 
 ## Quick start
@@ -152,7 +158,9 @@ const policy: RoutingPolicy = withSticky(failover(['primary', 'secondary']), 'sc
 ```
 
 `PickContext` carries `request`, `attempt`, `excluded`, `candidates` (with live
-telemetry), `now`, and an optional `stickyKey`. Return `null` to bail with
+telemetry), `now`, an optional `stickyKey`, and `probe` (`true` for hedge
+picks — stateful policies should keep those side-effect-free: don't advance
+cursors or move pins on a probe). Return `null` to bail with
 `NoClientAvailableError`.
 
 ### Manager events
@@ -246,8 +254,8 @@ pnpm test:integration
 
 ### Running the unit suite on-device (React Native)
 
-The same unit tests — all 26 files — run unmodified inside a real React
-Native runtime (Hermes) through [react-native-harness](https://github.com/callstackincubator/react-native-harness),
+The same unit tests — every file of the node suite — run unmodified inside a
+real React Native runtime (Hermes) through [react-native-harness](https://github.com/callstackincubator/react-native-harness),
 hosted by the RN app in `test/rn/app/`. A Metro alias maps `vitest` onto the
 harness runtime and `node:net` / `node:tls` onto `react-native-tcp-socket`,
 so the tcp/tls transport tests talk to the real native socket module. The
