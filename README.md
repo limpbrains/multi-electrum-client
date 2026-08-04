@@ -118,6 +118,33 @@ dispose();
 await manager.stop();
 ```
 
+### Ensure connected (BlueWallet-style guard)
+
+Before a call that must not fail silently (a broadcast, a fee bump),
+wait until the pool is demonstrably live:
+
+```ts
+await manager.ensureConnected(); // resolves when a server is usable & answering
+await manager.transaction.broadcast(rawTxHex);
+```
+
+The manager's reconnect loop does the actual recovery — `ensureConnected`
+waits for it (default budget 30 s) and, per the probe policy, verifies
+liveness with a wire `server.ping` through the normal routing pipeline.
+That wire probe is what catches half-open sockets (established but
+silently dead — the classic mobile-NAT shape after backgrounding) that
+`pool-state` alone cannot see. `probe: 'auto'` (default) only pings when
+no usable server has answered anything in the last 10 s, so it's free
+while traffic is flowing.
+
+Typed throws: `SuspendedError` (stopped / not started / suspended —
+pass `resumeIfSuspended: true` to resume instead; also raised when a
+`stop()`/`suspend()` lands mid-wait), `NoClientAvailableError` (budget
+exhausted while offline or mid-resume/probe), or the last real ping
+failure. The budget and `signal` cover the whole call — including the
+`resumeIfSuspended` resume and the probe. Each concurrent caller keeps
+its own budget and signal; only the liveness ping itself is shared.
+
 ### Caching past finality
 
 Caller-injected `CacheStore`; library writes only entries past `finalizedConfs`
