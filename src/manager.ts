@@ -75,6 +75,38 @@ export type PoolStatus = 'online' | 'degraded' | 'offline';
  *  - `degraded` — at least one usable client, but not all of them.
  *  - `online`   — every pooled client is connected and unbanned.
  */
+export interface EnsureConnectedOpts {
+  /**
+   * Wall-time budget for the whole call. Default 30_000 ms — enough to
+   * cover the default reconnect backoff cap, so a transient total outage
+   * usually recovers within one call.
+   */
+  timeoutMs?: number;
+  /**
+   * Liveness probe policy. The pool tracking socket state cannot see a
+   * half-open socket (established but silently dead — the classic mobile
+   * NAT shape); a wire `server.ping` through the normal routing pipeline
+   * can: a dead pick times out and retries on another server, updating
+   * telemetry along the way.
+   *  - `'auto'` (default): ping only when no usable client has answered
+   *    anything within `probeStaleMs` — free while traffic is flowing,
+   *    a real check after idle.
+   *  - `true`: always ping. `false`: never (wait-for-usable only).
+   */
+  probe?: boolean | 'auto';
+  /** Freshness window for `probe: 'auto'`. Default 10_000 ms. */
+  probeStaleMs?: number;
+  /**
+   * When the manager is suspended: `false` (default) rejects with
+   * `SuspendedError`; `true` awaits `resume()` first. Useful right after
+   * app foregrounding, where a `bindAppState`-driven resume may race
+   * this call.
+   */
+  resumeIfSuspended?: boolean;
+  /** Abort the wait early; rejects with the signal's reason. */
+  signal?: AbortSignal;
+}
+
 export interface PoolState {
   status: PoolStatus;
   /** Clients that are `connected` and not under a ban — actually routable. */
@@ -270,6 +302,30 @@ export class ElectrumManager {
   /** Hoisted so the per-call cache path doesn't allocate a closure per request. */
   private readonly onCacheError = (e: unknown): void => this.emit('error', e);
   /**
+   * Single-flight for the `ensureConnected` liveness ping — the one wire
+   * effect. Waiting is per-caller (each call keeps its own deadline and
+   * abort signal), so a first caller's abort can never poison a second
+   * caller's run.
+   */
+  private ensurePingInFlight: Promise<unknown> | null = null;
+  /**
+   * Rejection hooks for `ensureConnected` calls currently waiting on
+   * pool recovery. `stop()` / `suspend()` fail them immediately — the
+   * pool-state event they wait on goes silent in those states, and a
+   * caller must not sit out its full budget against a manager that has
+   * deliberately gone away.
+   */
+  private readonly ensureWaiters = new Set<(e: Error) => void>();
+  /**
+   * Count of suspend() intents whose queued transition has not settled
+   * yet. Between submit and execution the lifecycle still reads
+   * `running` (the FIFO chain may even be parked behind a hanging
+   * resume) — but once a suspend is requested, ensureConnected must not
+   * promise "live" to anyone. Counter, not boolean: overlapping
+   * suspend() calls each hold the gate until their task settles.
+   */
+  private pendingSuspendIntents = 0;
+  /**
    * Last emitted pool status. `null` = no baseline yet — the next
    * `maybeEmitPoolState` emits unconditionally. Reset by `resume()` so
    * the post-resume snapshot always fires, and by `stop()`.
@@ -364,6 +420,325 @@ export class ElectrumManager {
   /** Current aggregate pool connectivity. Always freshly computed. */
   get poolState(): PoolState {
     return this.computePoolState();
+  }
+
+  /**
+   * BlueWallet-style connection guard: resolve once the pool has a
+   * usable server AND (per the probe policy) it demonstrably answers.
+   * Designed for "make sure we're live before broadcast" call sites:
+   *
+   *   await manager.ensureConnected();
+   *   await manager.transaction.broadcast(rawTx);
+   *
+   * The manager's own reconnect loop does the actual recovery — this
+   * call just waits for it (bounded by `timeoutMs`) and optionally
+   * probes with a wire `server.ping` through the normal routing
+   * pipeline, which is what catches half-open sockets that plain
+   * connection state cannot see.
+   *
+   * Typed-throw contract: `SuspendedError` (stopped / not started /
+   * suspended without `resumeIfSuspended` — or a stop()/suspend()
+   * landing at any point mid-wait, including mid-resume and mid-ping),
+   * `NoClientAvailableError` (budget exhausted while offline or during
+   * a resume/ping race with no prior ping failure), the last real ping
+   * failure (budget exhausted while probing), or the abort signal's
+   * reason.
+   *
+   * Concurrent calls each keep their own budget, abort signal, and
+   * wait; only the liveness ping itself is shared (single wire effect).
+   * One caller aborting or timing out never affects another.
+   *
+   * Note on `resumeIfSuspended`: it covers a manager that is already
+   * `suspending` / `suspended` / `resuming`. In the brief window where a
+   * `suspend()` has been submitted but its queued transition has not run
+   * yet (lifecycle still reads `running`), the call rejects with
+   * `SuspendedError('manager suspending')` regardless — a just-requested
+   * pause is never silently undone; retry after the suspend settles.
+   */
+  async ensureConnected(opts: EnsureConnectedOpts = {}): Promise<void> {
+    // The wall budget covers EVERYTHING below, including a
+    // resumeIfSuspended resume — computed before any await.
+    const timeoutMs = opts.timeoutMs ?? 30_000;
+    if (!(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= 2_147_483_647)) {
+      // Infinity / NaN / negatives / values past the setTimeout clamp
+      // would arm a broken deadline timer (the clamp turns huge delays
+      // into ~1ms — an instant synthetic timeout). Same guard shape as
+      // the hedging option.
+      throw new RangeError(
+        `ensureConnected timeoutMs must be a finite positive number of ms <= 2^31-1, got ${String(timeoutMs)}`,
+      );
+    }
+    const probeStaleMs = opts.probeStaleMs ?? 10_000;
+    if (!(Number.isFinite(probeStaleMs) && probeStaleMs > 0)) {
+      // NaN/negative would silently mean "always probe"; Infinity would
+      // mean "never probe again after any success" — both are misuse.
+      throw new RangeError(
+        `ensureConnected probeStaleMs must be a finite positive number of ms, got ${String(probeStaleMs)}`,
+      );
+    }
+    const deadline = Date.now() + timeoutMs;
+    if (this.lifecycle === 'stopped') {
+      throw new SuspendedError('manager is stopped — construct a new ElectrumManager');
+    }
+    if (this.lifecycle === 'created') {
+      throw new SuspendedError('manager not started — call start() first');
+    }
+    if (this.lifecycle !== 'running') {
+      if (!opts.resumeIfSuspended) {
+        throw new SuspendedError(
+          `manager is ${this.lifecycle} — call resume() first or pass resumeIfSuspended`,
+        );
+      }
+      // The resume itself belongs to the manager and keeps running if we
+      // bail; only THIS caller's wait is bounded by budget/abort.
+      await this.raceBudget(this.resume(), deadline, timeoutMs, opts.signal);
+    }
+    return this.runEnsureConnected(opts, probeStaleMs, deadline, timeoutMs);
+  }
+
+  /**
+   * Throw unless the manager is plainly running — including the window
+   * where a suspend() has been submitted but its queued transition has
+   * not executed yet (lifecycle still reads `running` there).
+   */
+  private assertEnsureRunnable(): void {
+    if (this.pendingSuspendIntents > 0) {
+      throw new SuspendedError('manager suspending');
+    }
+    if (this.lifecycle !== 'running') {
+      throw new SuspendedError(`manager is ${this.lifecycle}`);
+    }
+  }
+
+  private async runEnsureConnected(
+    opts: EnsureConnectedOpts,
+    probeStaleMs: number,
+    deadline: number,
+    timeoutMs: number,
+  ): Promise<void> {
+    const probe = opts.probe ?? 'auto';
+    const signal = opts.signal;
+    let lastPingError: Error | undefined;
+
+    for (;;) {
+      // Re-checked every iteration: stop()/suspend() may land between
+      // waits — a fresh waiter registered after their reject sweep would
+      // otherwise park against pool-state events that have gone silent.
+      this.assertEnsureRunnable();
+      if (signal?.aborted) throw signalAbortReason(signal);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw (
+          lastPingError ??
+          new NoClientAvailableError(
+            `ensureConnected timed out after ${timeoutMs}ms — pool offline`,
+          )
+        );
+      }
+      if (this.computePoolState().status === 'offline') {
+        // The reconnect loop is already working; wait for it (or a ban
+        // expiring) to flip the pool, bounded by the remaining budget.
+        await this.waitForPoolRecovery(remaining, timeoutMs, signal);
+        continue;
+      }
+      if (!this.needsProbe(probe, probeStaleMs)) return;
+      try {
+        // The ping (with its own cross-server retries) may outlive this
+        // caller's budget — race it so the caller honors timeout/abort;
+        // a late ping settles in the background and still feeds telemetry.
+        await this.raceBudget(this.sharedPing(), deadline, timeoutMs, signal);
+        // The ping may have raced a stop()/suspend() and still succeeded
+        // on the wire — resolving then would tell the caller "live" about
+        // a manager that is deliberately going away.
+        this.assertEnsureRunnable();
+        return;
+      } catch (e) {
+        // Abort surfaces as-is; a budget expiry surfaces the last REAL
+        // ping failure when there is one (the API promises it) rather
+        // than raceBudget's synthetic timeout error.
+        if (signal?.aborted) throw e;
+        if (Date.now() >= deadline) throw lastPingError ?? e;
+        // A stop()/suspend() rejected the race: skip the cooldown so the
+        // lifecycle check at the top throws SuspendedError immediately.
+        if (this.lifecycle !== 'running' || this.pendingSuspendIntents > 0) continue;
+        // Otherwise: the routing pipeline already retried across servers
+        // and recorded telemetry/bans. Pause a beat so a flapping pool
+        // isn't hammered, then re-evaluate until the deadline. The pause
+        // wakes early on abort or stop()/suspend(); the checks at the top
+        // of the next iteration turn the cause into the right throw. A
+        // stop/suspend-induced ping failure exits the same way.
+        lastPingError = e as Error;
+        await this.interruptibleDelay(Math.min(500, Math.max(0, deadline - Date.now())), signal);
+      }
+    }
+  }
+
+  /**
+   * Sleep that wakes early on abort or stop()/suspend() — it always
+   * RESOLVES; the caller's loop re-checks lifecycle / signal / deadline
+   * and produces the correct throw.
+   */
+  private interruptibleDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let onAbort: (() => void) | undefined;
+      const wake = (): void => {
+        clearTimeout(timer);
+        this.ensureWaiters.delete(wake);
+        if (onAbort) signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      const timer = setUnrefTimeout(wake, ms);
+      this.ensureWaiters.add(wake);
+      if (signal) {
+        onAbort = wake;
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+
+  /**
+   * One liveness ping shared by all concurrent ensureConnected callers —
+   * routing/retry/telemetry run once; each caller applies its own
+   * budget/abort via `raceBudget`.
+   */
+  private sharedPing(): Promise<unknown> {
+    if (this.ensurePingInFlight) return this.ensurePingInFlight;
+    const p = this.call('server.ping', [], { bypassCache: true }).finally(() => {
+      this.ensurePingInFlight = null;
+    });
+    // Parked callers race this promise and may abandon it — without a
+    // default handler an abandoned rejection would surface as unhandled.
+    p.catch(() => undefined);
+    this.ensurePingInFlight = p;
+    return p;
+  }
+
+  /**
+   * Bound `p` by this caller's remaining budget and abort signal. The
+   * underlying operation is NOT cancelled on loss — it settles in the
+   * background (harmless: resumes belong to the manager, pings feed
+   * telemetry).
+   */
+  private raceBudget<T>(
+    p: Promise<T>,
+    deadline: number,
+    timeoutMs: number,
+    signal: AbortSignal | undefined,
+  ): Promise<T> {
+    if (signal?.aborted) return Promise.reject(signalAbortReason(signal));
+    return new Promise<T>((resolve, reject) => {
+      let onAbort: (() => void) | undefined;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        this.ensureWaiters.delete(fail);
+        if (onAbort) signal?.removeEventListener('abort', onAbort);
+      };
+      const fail = (e: Error): void => {
+        cleanup();
+        reject(e);
+      };
+      const timer = setUnrefTimeout(
+        () => {
+          fail(new NoClientAvailableError(`ensureConnected timed out after ${timeoutMs}ms`));
+        },
+        Math.max(0, deadline - Date.now()),
+      );
+      // stop()/suspend() must interrupt this wait too — the raced
+      // operation may be the very resume() the transition chain is
+      // stuck behind.
+      this.ensureWaiters.add(fail);
+      if (signal) {
+        onAbort = (): void => {
+          fail(signalAbortReason(signal) as Error);
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+      p.then(
+        (v) => {
+          cleanup();
+          resolve(v);
+        },
+        (e: unknown) => {
+          fail(e as Error);
+        },
+      );
+    });
+  }
+
+  /** True when the probe policy requires a wire ping right now. */
+  private needsProbe(probe: boolean | 'auto', staleMs: number): boolean {
+    if (probe !== 'auto') return probe;
+    const now = Date.now();
+    for (const [id, meta] of this.meta) {
+      // A departing client (mid-removeServer) is excluded from pool
+      // state; its freshness must not vouch for the pool it is leaving.
+      if (this.removingServers.has(id)) continue;
+      if (!this.isClientUsable(id, now)) continue;
+      const lastAt = meta.telemetry.successSnapshot().lastAt;
+      if (lastAt !== undefined && now - lastAt < staleMs) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Resolve when the pool leaves `offline`; reject on budget expiry,
+   * abort, or stop()/suspend() (via `ensureWaiters`). All listeners and
+   * timers are unwound on every exit path.
+   */
+  private waitForPoolRecovery(
+    budgetMs: number,
+    totalTimeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      // stop()/suspend() sweep existing waiters; a waiter registered
+      // AFTER the sweep would wait on events that never fire again.
+      try {
+        this.assertEnsureRunnable();
+      } catch (e) {
+        reject(e as Error);
+        return;
+      }
+      let unsubscribe: () => void = () => {};
+      let onAbort: (() => void) | undefined;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        unsubscribe();
+        this.ensureWaiters.delete(fail);
+        if (onAbort) signal?.removeEventListener('abort', onAbort);
+      };
+      const fail = (e: Error): void => {
+        cleanup();
+        reject(e);
+      };
+      const timer = setUnrefTimeout(() => {
+        fail(
+          new NoClientAvailableError(
+            `ensureConnected timed out after ${totalTimeoutMs}ms — pool offline`,
+          ),
+        );
+      }, budgetMs);
+      this.ensureWaiters.add(fail);
+      unsubscribe = this.on('pool-state', (s) => {
+        if (s.status !== 'offline') {
+          cleanup();
+          resolve();
+        }
+      });
+      if (signal) {
+        onAbort = (): void => {
+          fail(signalAbortReason(signal) as Error);
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+
+  /** Fail every pending ensureConnected waiter (stop / suspend paths). */
+  private rejectEnsureWaiters(reason: string): void {
+    for (const fail of [...this.ensureWaiters]) {
+      fail(new SuspendedError(reason));
+    }
   }
 
   /**
@@ -472,6 +847,9 @@ export class ElectrumManager {
   async stop(): Promise<void> {
     this.stopped = true;
     this.lifecycle = 'stopped';
+    // Fail ensureConnected waiters FIRST: the transition tail we await
+    // next may itself be a hanging resume() that a waiter is parked on.
+    this.rejectEnsureWaiters('manager stopped');
     // Tail is catch-wrapped at append time — never rejects, so we can
     // safely `await` without try/catch.
     await this.transitionTail;
@@ -512,12 +890,27 @@ export class ElectrumManager {
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot suspend a stopped manager');
     }
+    // Fail ensureConnected waiters at INTENT time, not when the queued
+    // task runs — the FIFO chain may be stuck behind a hanging resume()
+    // that a waiter is parked on, and once a suspend is requested we can
+    // no longer promise "live" to anyone. runSuspend's own sweep stays
+    // for waiters that register between here and there. The intent
+    // counter closes the same window for NEW ensureConnected calls,
+    // which would otherwise still see lifecycle === 'running'.
+    this.rejectEnsureWaiters('manager suspending');
+    this.pendingSuspendIntents++;
     // Append to the FIFO chain: our task waits for any prior transition
     // (success or failure — outcome of the prior call is independent of
     // ours) and then re-evaluates lifecycle. The catch on the tail
     // assignment keeps it never-rejecting so subsequent appenders and
     // `stop()` can `await transitionTail` without seeing throws.
-    return this.queueTransition(() => this.doSuspendIfNeeded(opts));
+    const task = this.queueTransition(() => this.doSuspendIfNeeded(opts));
+    void task
+      .catch(() => undefined)
+      .finally(() => {
+        this.pendingSuspendIntents--;
+      });
+    return task;
   }
 
   /**
@@ -553,6 +946,10 @@ export class ElectrumManager {
 
   private async runSuspend(opts: SuspendOptions): Promise<void> {
     this.lifecycle = 'suspending';
+    // ensureConnected waiters listen on pool-state, which is suppressed
+    // for the whole suspended period — fail them now instead of letting
+    // them sit out their budget against a deliberately-paused manager.
+    this.rejectEnsureWaiters('manager suspending');
     const graceMs = opts.graceMs ?? 2000;
     const cancelInFlight = opts.cancelInFlight ?? false;
 

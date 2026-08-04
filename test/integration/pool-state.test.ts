@@ -46,8 +46,14 @@ describe('integration: pool-state across total outage and recovery', () => {
         label: 'pool offline',
       });
 
+      // BlueWallet-style guard across the outage: starts while the pool
+      // is fully down, must resolve once the lanes come back (real
+      // reconnect + wire ping through the routing pipeline).
+      const ensured = manager.ensureConnected({ timeoutMs: 30_000 });
+
       await toxic.enable('electrumx-tcp');
       await toxic.enable('fulcrum-tcp');
+      await ensured;
       await waitFor(() => events.at(-1)?.status === 'online', {
         timeoutMs: 30_000,
         label: 'pool online again',
