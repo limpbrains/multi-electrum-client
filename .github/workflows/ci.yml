@@ -107,6 +107,7 @@ jobs:
       # gradle, and the compose stack; keeping them all alive for the whole
       # job risks the OOM killer taking out containers mid-run.
       - name: boot integration stack
+        id: boot
         run: docker compose -f docker/compose.yml --profile slim up -d --wait
       - name: stack health snapshot
         run: |
@@ -242,13 +243,16 @@ jobs:
         run: docker compose -f docker/compose.yml --profile slim up -d --wait
       # Same suite, both wire shapes. Sequential steps in one job: the
       # stack boot dominates, and a matrix would boot (and pull) twice.
-      # `!cancelled()` keeps the ws signal when the tcp lane fails.
+      # The ws step keeps its signal when the TCP LANE fails, but must
+      # not run when the stack itself never booted — a bare
+      # `!cancelled()` is true after any earlier failure and would pile
+      # secondary timeouts on top of the real bootstrap error.
       - name: integration tests (tcp lane)
         run: pnpm test:integration
         env:
           INTEGRATION_LANE: tcp
       - name: integration tests (ws lane)
-        if: '!cancelled()'
+        if: "!cancelled() && steps.boot.conclusion == 'success'"
         run: pnpm test:integration
         env:
           INTEGRATION_LANE: ws
