@@ -1,8 +1,10 @@
 // One-shot side-channel poll against ElectrumX. Used by tests that
 // need to observe ElectrumX's view of the chain WITHOUT going through
 // the manager (e.g. while the manager is suspended or its lane is
-// proxied off via toxiproxy). Always hits the direct port (not the
-// toxiproxy lane).
+// proxied off via toxiproxy). Always hits the direct TCP port —
+// deliberately LANE-INDEPENDENT (raw node:net even when the suite runs
+// its ws lane): this is an out-of-band probe of the server's chain
+// view, not part of the transport surface under test.
 
 import { createConnection } from 'node:net';
 

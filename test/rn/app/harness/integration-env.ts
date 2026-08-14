@@ -13,3 +13,9 @@ declare const global: typeof globalThis & {
 global.process ??= { env: {} };
 global.process.env ??= {};
 global.process.env['INTEGRATION_HOST'] ??= Platform.OS === 'android' ? '10.0.2.2' : '127.0.0.1';
+// On-device integration stays on the TCP lane: the rn job is already
+// the longest in CI, a second harness pass would re-bundle everything
+// through Metro, and the ws transport gets its real-server coverage
+// from the node ws lane (RN WebSocket quirks are covered on-device by
+// the unit suite's ws shim).
+global.process.env['INTEGRATION_LANE'] ??= 'tcp';

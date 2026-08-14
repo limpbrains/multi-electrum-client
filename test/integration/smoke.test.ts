@@ -15,11 +15,9 @@ import { describe, expect, it } from 'vitest';
 // in the factory (side-effect imports inside `src/index.ts`).
 import { ElectrumManager, failover, type ServerSpec, type ServerVersion } from '../../src/index.js';
 
-import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { lane } from './helpers/config.js';
 
-const SERVERS: ServerSpec[] = [
-  { id: 'ex', host: INTEGRATION_HOST, port: PORTS.electrumxTcp, protocol: 'tcp' },
-];
+const SERVERS: ServerSpec[] = [{ id: 'ex', ...lane.spec('electrumx') }];
 
 describe('integration: smoke against ElectrumX over TCP', () => {
   it('handshake: server.version returns [softwareName, protocolVersion]', async () => {

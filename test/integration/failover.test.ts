@@ -14,12 +14,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { ElectrumManager, roundRobin, type ServerSpec } from '../../src/index.js';
 
-import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { lane } from './helpers/config.js';
 import * as toxic from './helpers/toxic.js';
 
+const PROXY = lane.proxy('electrumx');
+
 const SERVERS: ServerSpec[] = [
-  { id: 'direct', host: INTEGRATION_HOST, port: PORTS.electrumxTcp, protocol: 'tcp' },
-  { id: 'proxy', host: INTEGRATION_HOST, port: PORTS.toxiproxyElectrumxTcp, protocol: 'tcp' },
+  { id: 'direct', ...lane.spec('electrumx') },
+  { id: 'proxy', ...lane.spec('electrumx', { via: 'proxy' }) },
 ];
 
 describe('integration: failover under toxiproxy faults', () => {
@@ -32,7 +34,7 @@ describe('integration: failover under toxiproxy faults', () => {
   });
 
   afterEach(async () => {
-    await toxic.enable('electrumx-tcp');
+    await toxic.enable(PROXY);
   });
 
   it('marks the proxy lane disconnected once toxiproxy drops it; routes future calls to direct', async () => {
@@ -49,7 +51,7 @@ describe('integration: failover under toxiproxy faults', () => {
       expect(await manager.server.ping()).toBeNull();
 
       // Kill the proxy lane. toxiproxy drops existing connections on disable.
-      await toxic.disable('electrumx-tcp');
+      await toxic.disable(PROXY);
 
       // Drive enough traffic that any in-flight on `proxy` finishes (success
       // or timeout) and the manager observes the disconnect. Timing-loose

@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ElectrumManager, failover, type ServerSpec, type ServerVersion } from '../../src/index.js';
 
-import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { lane } from './helpers/config.js';
 
 interface Impl {
   name: string;
@@ -20,17 +20,17 @@ const IMPLS: Impl[] = [
   {
     name: 'ElectrumX',
     software: /^ElectrumX\b/,
-    spec: { id: 'ex', host: INTEGRATION_HOST, port: PORTS.electrumxTcp, protocol: 'tcp' },
+    spec: { id: 'ex', ...lane.spec('electrumx') },
   },
   {
     name: 'Fulcrum',
     software: /^Fulcrum\b/,
-    spec: { id: 'fc', host: INTEGRATION_HOST, port: PORTS.fulcrumTcp, protocol: 'tcp' },
+    spec: { id: 'fc', ...lane.spec('fulcrum') },
   },
   {
     name: 'electrs',
     software: /^electrs/i,
-    spec: { id: 'el', host: INTEGRATION_HOST, port: PORTS.electrsTcp, protocol: 'tcp' },
+    spec: { id: 'el', ...lane.spec('electrs') },
   },
 ];
 

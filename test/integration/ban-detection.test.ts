@@ -26,7 +26,7 @@ import {
   type ServerSpec,
 } from '../../src/index.js';
 
-import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { lane } from './helpers/config.js';
 
 // 32-byte hex scripthash. Fulcrum costs the subscribe before knowing
 // whether the script is interesting, so unique random hashes work fine.
@@ -41,8 +41,8 @@ function randomScripthash(): string {
 const SERVERS: ServerSpec[] = [
   // Strict lane first so the failover policy hands every request here
   // until it's banned.
-  { id: 'strict', host: INTEGRATION_HOST, port: PORTS.fulcrumStrictTcp, protocol: 'tcp' },
-  { id: 'default', host: INTEGRATION_HOST, port: PORTS.fulcrumTcp, protocol: 'tcp' },
+  { id: 'strict', ...lane.spec('fulcrum-strict') },
+  { id: 'default', ...lane.spec('fulcrum') },
 ];
 
 describe('integration: ban detection on Fulcrum with tight max_subs_per_ip', () => {

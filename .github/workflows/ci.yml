@@ -240,8 +240,18 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: boot integration stack
         run: docker compose -f docker/compose.yml --profile slim up -d --wait
-      - name: integration tests
+      # Same suite, both wire shapes. Sequential steps in one job: the
+      # stack boot dominates, and a matrix would boot (and pull) twice.
+      # `!cancelled()` keeps the ws signal when the tcp lane fails.
+      - name: integration tests (tcp lane)
         run: pnpm test:integration
+        env:
+          INTEGRATION_LANE: tcp
+      - name: integration tests (ws lane)
+        if: '!cancelled()'
+        run: pnpm test:integration
+        env:
+          INTEGRATION_LANE: ws
       - name: dump logs on failure
         if: failure()
         run: docker compose -f docker/compose.yml --profile slim logs --no-color
