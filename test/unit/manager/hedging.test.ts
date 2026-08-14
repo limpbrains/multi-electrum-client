@@ -786,7 +786,10 @@ describe('ElectrumManager — hedged requests', () => {
     await manager.start();
 
     const p = manager.call('blockchain.transaction.get', ['tx1']);
-    const rejected = expect(p).rejects.toMatchObject({ name: 'TransportError' });
+    // Teardown outranks the retry: the primary's socket dies with stop(),
+    // and the loop refuses to dispatch a replacement attempt, so the
+    // caller is told the manager is gone rather than shown the symptom.
+    const rejected = expect(p).rejects.toMatchObject({ name: 'SuspendedError' });
     await delay(0);
     expect(h.transports.get('a')!.sent).toHaveLength(1);
 

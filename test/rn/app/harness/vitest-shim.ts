@@ -8,8 +8,8 @@ import './setup';
 
 import {
   describe as harnessDescribe,
-  it,
-  test,
+  it as harnessIt,
+  test as harnessTest,
   expect,
   beforeAll,
   afterAll,
@@ -59,7 +59,7 @@ export const vi = {
   },
 };
 
-// vitest-style title interpolation for describe.each: `$prop` reads a
+// vitest-style title interpolation for describe.each / it.each: `$prop` reads a
 // property off an object case; printf-ish `%s`/`%i`/`%d` consume the case
 // positionally. The suite's single call site uses the `$name` form.
 const formatTitle = (template: string, testCase: unknown, index: number): string => {
@@ -101,5 +101,32 @@ export const describe: SuiteFn & {
       },
   },
 );
+
+/**
+ * `it.each` / `test.each`: same table expansion as `describe.each`, but
+ * each case becomes a test rather than a suite. The node suite uses it
+ * for fixture tables (framer limits, scanner forms), so the shim needs
+ * it to run those files unmodified.
+ */
+const withEach = <F extends (name: string, body: () => unknown) => unknown>(
+  base: F,
+): F & {
+  each: (
+    cases: readonly unknown[],
+  ) => (template: string, body: (...args: never[]) => unknown) => void;
+} =>
+  Object.assign(base, {
+    each:
+      (cases: readonly unknown[]) =>
+      (template: string, body: (...args: never[]) => unknown): void => {
+        cases.forEach((testCase, index) => {
+          const args = (Array.isArray(testCase) ? testCase : [testCase]) as never[];
+          base(formatTitle(template, testCase, index), () => body(...args));
+        });
+      },
+  });
+
+const it = withEach(harnessIt as (name: string, body: () => unknown) => unknown);
+const test = withEach(harnessTest as (name: string, body: () => unknown) => unknown);
 
 export { it, test, expect, beforeAll, afterAll, beforeEach, afterEach };

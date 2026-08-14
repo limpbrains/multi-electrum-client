@@ -35,6 +35,10 @@ const spec = (s: DemoServer): ServerSpec => ({
   host: '127.0.0.1',
   port: s.port,
   protocol: 'ws',
+  // The demo reaches TCP-only servers through the compose stack's
+  // ws↔tcp byte bridge, so payloads are newline-delimited with
+  // arbitrary frame boundaries — not native message framing.
+  wsFraming: 'newline',
 });
 
 // Any 64-hex scripthash works — unknown hashes return an empty balance.

@@ -31,6 +31,8 @@ export interface TlsTransportOpts {
   connect?: (host: string, port: number) => TcpSocketLike;
   /** Connect timeout, default 10_000ms. */
   connectTimeoutMs?: number;
+  /** Cap on one logical line (default 32 MiB) — see `TcpTransportOpts`. */
+  maxLineLength?: number;
   /**
    * Optional `tls.ConnectionOptions` merged into the default connect call.
    * Ignored when `connect` is provided. Use it to pin a CA bundle or relax
@@ -69,6 +71,7 @@ export class TlsTransport implements Transport {
         opts.connect ??
         ((host, port) => tlsConnect({ host, port, ...tlsOptions }) as unknown as TcpSocketLike),
       ...(opts.connectTimeoutMs !== undefined ? { connectTimeoutMs: opts.connectTimeoutMs } : {}),
+      ...(opts.maxLineLength !== undefined ? { maxLineLength: opts.maxLineLength } : {}),
     };
     this.inner = new TcpTransport(innerOpts);
   }

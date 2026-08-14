@@ -243,6 +243,43 @@ describe('ElectrumManager — auto-reconnect', () => {
     await manager.stop();
   });
 
+  it('re-arms reconnect for a client whose resume connect failed', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+      reconnectBackoff: { minMs: 100, maxMs: 5000, factor: 2, jitter: 0 },
+    });
+    manager.on('error', () => {});
+    const startP = manager.start();
+    await flush();
+    await startP;
+    const t = h.transports.get('a')!;
+
+    const suspendP = manager.suspend({ graceMs: 0 });
+    await flush();
+    await suspendP;
+
+    // First resume connect fails — the disconnected transition lands
+    // while lifecycle is 'resuming', where schedule() is gated.
+    t.nextConnectError = new Error('resume connect failed');
+    const resumeP = manager.resume();
+    await flush();
+    await resumeP;
+    expect(manager.state).toBe('running');
+    expect(t.connectCalls).toBe(2); // start + failed resume attempt
+
+    // Backoff reconnect must now be armed and eventually restore it.
+    await vi.advanceTimersByTimeAsync(100);
+    await flush();
+    expect(t.connectCalls).toBe(3);
+    expect(manager.poolState.status).toBe('online');
+    await manager.stop();
+  });
+
   it('does not schedule reconnects while suspended', async () => {
     const h = buildHarness();
     const manager = new ElectrumManager({

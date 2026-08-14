@@ -626,4 +626,114 @@ describe('Manager lifecycle — suspend / resume', () => {
     await unsub();
     await manager.stop();
   });
+
+  it('installs the tip subscription once a server finally connects', async () => {
+    // A cache-configured manager whose tip subscribe fails at start used
+    // to spend the whole session without a tip: the single attempt from
+    // start() rejected, surfaced as an `error` event, and was never
+    // retried — so nothing could be proven finalized and the cache stayed
+    // empty even after servers were available.
+    const h = buildHarness();
+    const cache = new (await import('../../../src/cache/memory.js')).MemoryCache();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [],
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+      cache,
+    });
+    const errors: unknown[] = [];
+    manager.on('error', (e) => errors.push(e));
+
+    // Nothing in the pool: the tip subscribe has nowhere to go.
+    await manager.start();
+    expect(errors).toHaveLength(1);
+
+    // A server shows up.
+    manager.addServer({ id: 'a', host: 'a', port: 50001, protocol: 'ws' });
+    await delay(0);
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'blockchain.headers.subscribe'
+        ? { id: req.id, result: { height: 200, hex: '00' } }
+        : undefined,
+    );
+    await delay(0);
+
+    // Tip known, so a deeply-confirmed read is cacheable again.
+    const probe = manager.call('blockchain.block.header', [100]);
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'blockchain.block.header' ? { id: req.id, result: 'HDR' } : undefined,
+    );
+    await probe;
+    await delay(0);
+    expect(await cache.get('et:regtest:v1:hdr:64')).toBe('"HDR"');
+
+    await manager.stop();
+  });
+});
+
+describe('Manager lifecycle — an invalid suspend must not disturb anything', () => {
+  it('does not abort an in-flight resume', async () => {
+    // `suspend()` published its teardown intent — rejecting waiters,
+    // gating discovery and addServer, and aborting a running resume —
+    // before validating its own argument. When the queued transition
+    // then threw, nothing put any of that back: the manager sat in
+    // `resuming` forever, with `resume()` refusing to run from that
+    // state.
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await manager.suspend({ graceMs: 0 });
+
+    const resuming = manager.resume();
+    await expect(manager.suspend({ graceMs: Number.NaN })).rejects.toThrow(RangeError);
+    await resuming;
+
+    expect(manager.state).toBe('running');
+    await manager.stop();
+  });
+});
+
+describe('Manager lifecycle — suspend options are frozen at submission', () => {
+  it('a caller mutating its options object after submit changes nothing', async () => {
+    // `opts` belongs to the caller and the transition may sit in the
+    // queue. Re-reading it at run time meant a value validated at
+    // submission was not the value consumed: mutated to Infinity, the
+    // grace drain polled forever and the manager never suspended.
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    // One request stays in flight, so a non-zero grace would wait on it.
+    const inflight = manager.call('server.ping', [], { retry: 'none' }).catch(() => undefined);
+    await delay(0);
+
+    const opts = { graceMs: 0 };
+    const suspending = manager.suspend(opts);
+    opts.graceMs = Number.POSITIVE_INFINITY;
+
+    const outcome = await Promise.race([
+      suspending.then(() => 'suspended'),
+      delay(400).then(() => 'still draining'),
+    ]);
+    expect(outcome).toBe('suspended');
+    expect(manager.state).toBe('suspended');
+    await inflight;
+    await manager.stop();
+  });
 });

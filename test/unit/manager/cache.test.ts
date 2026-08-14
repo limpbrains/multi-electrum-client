@@ -222,3 +222,61 @@ describe('Manager cache — finality-gated writes', () => {
     await manager.stop();
   });
 });
+describe('Manager cache — tip install retry', () => {
+  it('a trigger arriving during a failing install queues one retry', async () => {
+    // Both servers connect during start(); each 'connected' transition
+    // triggers installTipSubscription. The first becomes the leader; a
+    // trigger landing while the leader's wire call is in flight must
+    // not be discarded — if the leader then fails non-retryably, that
+    // dropped trigger was the only retry, and with no further
+    // connection transition the session runs forever with no tip and
+    // every cache write silently disabled.
+    const h = buildHarness();
+    const cache = new MemoryCache();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [
+        { id: 'a', host: 'a', port: 50001, protocol: 'ws' },
+        { id: 'b', host: 'b', port: 50001, protocol: 'ws' },
+      ],
+      policy: failover(['a', 'b']),
+      transportFactory: h.factory,
+      autoBatch: false,
+      cache,
+      finalizedConfs: 6,
+    });
+    let subAttempts = 0;
+    const startPromise = manager.start();
+    await delay(0);
+    await delay(0);
+    // Leader's subscribe fails non-retryably.
+    h.reply('a', (req: { id: number; method: string }) => {
+      if (req.method !== 'blockchain.headers.subscribe') return undefined;
+      subAttempts++;
+      return { id: req.id, error: { code: -32601, message: 'unknown method' } };
+    });
+    await delay(0);
+    await delay(0);
+    // The queued retry re-attempts; answer it with a real tip.
+    h.reply('a', (req: { id: number; method: string }) => {
+      if (req.method !== 'blockchain.headers.subscribe') return undefined;
+      subAttempts++;
+      return { id: req.id, result: { height: 100, hex: '00' } };
+    });
+    await startPromise;
+    await delay(0);
+    expect(subAttempts).toBeGreaterThanOrEqual(2);
+
+    // The tip took: finalized writes are enabled.
+    const p = manager.call('blockchain.block.header', [50]);
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'blockchain.block.header' ? { id: req.id, result: 'H' } : undefined,
+    );
+    expect(await p).toBe('H');
+    await delay(0);
+    expect(await cache.get('et:regtest:v1:hdr:32')).toBe('"H"');
+
+    await manager.stop();
+  });
+});

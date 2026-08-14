@@ -34,6 +34,43 @@ export interface Endpoint {
   protocol: Protocol;
   /** Optional URL path for WebSocket endpoints, e.g. `/ws` or `/electrum`. */
   path?: string;
+  /**
+   * How a `ws`/`wss` peer delimits JSON-RPC payloads. `'message'`
+   * (default) is the native Electrum-over-WebSocket protocol — one
+   * complete payload per WebSocket message, no trailing newline
+   * (Fulcrum's WS mode, public WS gateways). `'newline'` is for a
+   * byte-tunnel that relays a newline-delimited TCP stream over
+   * WebSocket frames with arbitrary message boundaries (e.g. a ws↔tcp
+   * bridge for browsers). The two disagree about whether a message
+   * boundary ends a payload, and traffic cannot distinguish them
+   * reliably — a tunnel's fragment looks exactly like a native
+   * server's complete message — so it is declared, not guessed.
+   */
+  wsFraming?: 'message' | 'newline';
+  /**
+   * Per-endpoint override of the transport's line/response cap (see
+   * `DEFAULT_MAX_LINE_LENGTH`). Lower it on memory-constrained
+   * deployments that never fetch large transactions; raise it for a
+   * server whose MAX_SEND is configured above the default envelope.
+   * Takes precedence over a cap passed at transport construction —
+   * that one is a fleet-wide default, this one sizes a single server.
+   */
+  maxLineLength?: number;
+  /**
+   * Aggregate bound on one WebSocket message in `'newline'` framing,
+   * where a bridge may legally coalesce several complete lines into one
+   * message. Default: four full-cap lines with their terminators,
+   * floored at 8 MiB — ~128 MiB at the default 32 MiB line cap; a
+   * bridge coalescing more aggressively than that needs this set
+   * explicitly, and memory-sensitive deployments should lower it
+   * (native browser WebSocket has no `maxPayload` to delegate the
+   * receive bound to). Must be at least `maxLineLength + 1`; there is
+   * deliberately no pool-wide manager default — a tunnel is per-server
+   * infrastructure, declared on the endpoints that are tunnels.
+   * Ignored in `'message'` framing, where the payload bound is the cap
+   * itself.
+   */
+  maxMessageLength?: number;
 }
 
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'banned';

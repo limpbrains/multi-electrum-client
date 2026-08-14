@@ -469,3 +469,109 @@ describe('ElectrumManager — telemetry feeds preferFastest', () => {
     await manager.stop();
   });
 });
+describe('ElectrumManager — per-server transport options', () => {
+  it('threads ServerSpec.maxLineLength into the transport endpoint', async () => {
+    const seen: (number | undefined)[] = [];
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [{ id: 'a', host: 'a', port: 50001, protocol: 'ws', maxLineLength: 123456 }],
+      policy: failover(['a']),
+      transportFactory: (endpoint) => {
+        seen.push(endpoint.maxLineLength);
+        return h.factory(endpoint);
+      },
+      autoBatch: false,
+    });
+    await manager.start();
+    expect(seen).toEqual([123456]);
+    await manager.stop();
+  });
+
+  it('public preferClient stays a hint: a banned preference falls back even with retry none', async () => {
+    // CallOpts documents preferClient as a routing HINT that falls back
+    // when the client is banned or gone. The registry's addressed calls
+    // use the internal strict pin instead — retry:'none' alone must not
+    // silently change a public option's documented semantics.
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [
+        { id: 'a', host: 'a', port: 50001, protocol: 'ws' },
+        { id: 'b', host: 'b', port: 50001, protocol: 'ws' },
+      ],
+      policy: failover(['a', 'b']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    // Ban `a` with a rate-limit error.
+    const ping = manager.call('server.ping', [], { preferClient: 'a', retry: 'none' });
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'server.ping'
+        ? { id: req.id, error: { code: -32603, message: 'excessive resource usage' } }
+        : undefined,
+    );
+    await expect(ping).rejects.toThrow();
+
+    // Banned `a` preferred: the hint must fall back to healthy `b`.
+    const p = manager.call('server.ping', [], { preferClient: 'a', retry: 'none' });
+    await delay(0);
+    const bSaw = h.transports
+      .get('b')!
+      .sent.filter((s) => (JSON.parse(s) as { method?: string }).method === 'server.ping');
+    expect(bSaw).toHaveLength(1);
+    h.reply('b', (req: { id: number; method: string }) =>
+      req.method === 'server.ping' ? { id: req.id, result: null } : undefined,
+    );
+    await p;
+    await manager.stop();
+  });
+
+  it('pinStrict without retry none is rejected up front', async () => {
+    // An addressed call has exactly one meaningful dispatch; combining
+    // pinStrict with a retry policy would silently reduce every retry
+    // to nothing (the failed pin lands in `excluded` and the strict
+    // branch then no-picks). Fail fast instead of surprising later.
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [{ id: 'a', host: 'a', port: 50001, protocol: 'ws' }],
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    await expect(
+      manager.call('server.ping', [], { preferClient: 'a', pinStrict: true }),
+    ).rejects.toThrow(/pinStrict/);
+    await manager.stop();
+  });
+
+  it('applies the pool-wide maxLineLength default, letting a spec override it', async () => {
+    // The pool-wide value is the only route to discovery-admitted peers,
+    // which no per-spec configuration can reach.
+    const seen = new Map<string, number | undefined>();
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [
+        { id: 'a', host: 'a', port: 50001, protocol: 'ws' },
+        { id: 'b', host: 'b', port: 50001, protocol: 'ws', maxLineLength: 555 },
+      ],
+      policy: failover(['a']),
+      maxLineLength: 999,
+      transportFactory: (endpoint) => {
+        seen.set(endpoint.host, endpoint.maxLineLength);
+        return h.factory(endpoint);
+      },
+      autoBatch: false,
+    });
+    await manager.start();
+    expect(seen.get('a')).toBe(999);
+    expect(seen.get('b')).toBe(555);
+    await manager.stop();
+  });
+});
