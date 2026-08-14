@@ -36,7 +36,11 @@ services:
       start_period: 5s
 
   electrumx-default:
-    image: lukechilds/electrumx:latest
+    # ElectrumX 1.18.0 — pinned by digest (the tag is mutable; a rotated
+    # `latest` would silently change the server code CI tests against).
+    # Update the digest deliberately: docker pull lukechilds/electrumx:latest
+    # && docker inspect --format '{{index .RepoDigests 0}}' ...
+    image: lukechilds/electrumx@sha256:c7e630b2ab68545a43907724d9e8b80b105c253ee9794bfa0658ada031a0d22d
     profiles: [slim, full]
     depends_on:
       bitcoind:

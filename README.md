@@ -216,6 +216,54 @@ start()` — even when every initial connect failed — and one after
 silent: a deliberate pause is not an outage; read `manager.state` for
 lifecycle.
 
+## Security notes
+
+- **Peer discovery is off by default and should stay curated.** With
+  `discover: { enabled: true }` and no `onDiscover` callback, every peer a
+  connected server advertises is admitted to the pool — a malicious server
+  can route your wallet's queries to attacker-controlled infrastructure.
+  In production always supply `onDiscover` with an explicit allowlist /
+  validation, or keep discovery disabled.
+- **Broadcast retries touch more than one server.** A transient failure
+  while broadcasting retries the same raw transaction on another pooled
+  server. Re-broadcasting is idempotent on-chain, but it discloses the
+  transaction to an additional operator; pass `retry: 'none'` on the
+  broadcast call if single-server semantics matter to you. (Broadcast is
+  always hard-excluded from hedging.)
+- **Hedged requests trade privacy for latency.** Hedging is opt-in; when
+  enabled, an idempotent read (including scripthash queries) may be sent
+  to a second server. Enable it only against servers you are equally
+  willing to show your wallet's addresses to.
+- **Never disable TLS verification in production.** `TlsTransport`'s
+  `tlsOptions` accepts `rejectUnauthorized: false` for local test rigs
+  only; against a real server that removes all transport security. Pin a
+  CA via `tlsOptions.ca` instead.
+- **Trust model.** Like every non-SPV Electrum client, this library
+  trusts the serving peer's view of the chain: block headers, merkle
+  proofs and the tip height used to gate finalized cache writes all
+  come from whichever pooled server answered, and a malicious SERVING
+  peer can misrepresent them. Multi-server pools, routing policies and
+  the finality confirmation depth (`finalizedConfs`) reduce exposure;
+  local header-chain validation (SPV) is out of scope. Subscription
+  status payloads are change signals — resync on every callback rather
+  than persisting the raw value (see the `subscribe` docs).
+- **Line-length cap.** Inbound frames are bounded (32 MiB per line by
+  default — sized so the protocol's largest valid responses, including
+  verbose transactions, still fit) so a malicious or broken server
+  cannot grow the framing buffer without limit; on overflow the
+  transport emits one `error` plus one `close` event and disconnects.
+  Size it per server with `ServerSpec.maxLineLength`, or pool-wide
+  (including discovery-admitted peers) with the manager's
+  `maxLineLength` option; `maxLineLength` on a transport's own options
+  acts as a fleet default under any per-server value. On WebSocket the
+  platform materializes each complete message before delivery, so the
+  cap bounds what the framer retains and fails an oversized message
+  loudly before decoding it — for a pre-delivery receive bound,
+  configure the injected WebSocket implementation itself (e.g.
+  `maxPayload` in the `ws` package).
+  An invalid `maxLineLength` (NaN, Infinity, zero, negative, fractional)
+  is rejected with `RangeError` rather than silently disabling the cap.
+
 ## Roadmap
 
 | Milestone | Scope | Status |
@@ -229,6 +277,27 @@ lifecycle.
 | M6 | TCP + TLS transports | ✅ |
 | M7 | Polish + integration suite + property tests | ✅ |
 | M8 | 0.1.0 release | in progress |
+
+## WebSocket framing
+
+Electrum-over-WebSocket has two incompatible wire shapes, and traffic
+cannot tell them apart — a byte tunnel's fragment is byte-identical to a
+native server's complete message — so the shape is **declared** per
+server, never guessed:
+
+- `wsFraming: 'message'` (**default**) — the native protocol: one
+  complete JSON-RPC payload per WebSocket message, no trailing newline
+  (Fulcrum's `ws=` mode, public WS gateways). The default is the
+  protocol's own definition; this library has never been released with
+  any other, so there is no deployed base the default could break.
+- `wsFraming: 'newline'` — a ws↔tcp byte tunnel (websockify-style
+  bridge) relaying a newline-delimited TCP stream with arbitrary
+  message boundaries. If you built the bridge, declare it. In this mode
+  one message may legally coalesce several complete lines; the
+  aggregate message bound defaults to four full-cap lines (floored at
+  8 MiB — ~128 MiB at the default line cap) and is tunable per server
+  via `maxMessageLength` — lower it on memory-sensitive deployments,
+  raise it for bridges that coalesce more than four near-cap responses.
 
 ## Platform notes
 

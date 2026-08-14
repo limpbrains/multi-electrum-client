@@ -50,6 +50,8 @@ export type { ManagerOptions, BatchRequest } from './protocol/types.js';
 
 interface ClientMeta {
   bannedUntil: number | undefined;
+  /** Bumped on every `connected` transition; see SubscriptionEnv.sessionSeq. */
+  sessionSeq: number;
   capabilities: { serverSoftware?: string; protocolVersion?: string };
   telemetry: TelemetryAccumulator;
 }
@@ -226,6 +228,28 @@ type CallArgs<M extends string> = M extends MethodName
     : [params: ParamsOf<M>, opts?: CallOpts]
   : [params: readonly unknown[], opts?: CallOpts];
 
+/**
+ * Validate the grace the drain loop will actually use.
+ *
+ * `Infinity` parks that loop until something else ends it — `stop()`
+ * breaks out, but a queued `resume()` sits behind the transition
+ * indefinitely. `NaN` and negatives are the opposite failure: every
+ * comparison against the deadline is false, so the drain the caller
+ * asked for is silently skipped and in-flight requests are cut. Neither
+ * is a grace period, so neither is accepted.
+ */
+function assertGraceMs(graceMs: number): void {
+  if (!Number.isFinite(graceMs) || graceMs < 0) {
+    throw new RangeError(`suspend: graceMs must be a finite non-negative number, got ${graceMs}`);
+  }
+}
+
+/** `SuspendOptions` snapshotted and defaulted at submission time. */
+interface FrozenSuspendOptions {
+  graceMs: number;
+  cancelInFlight: boolean;
+}
+
 export class ElectrumManager {
   readonly network: Network;
   private readonly clients = new Map<ClientId, ElectrumClient>();
@@ -237,6 +261,7 @@ export class ElectrumManager {
   private readonly hedging: { afterMs: number } | undefined;
   private readonly cooldownMs: number;
   private readonly requestTimeoutMs: number | undefined;
+  private readonly defaultMaxLineLength: number | undefined;
   private readonly transportFactory: (endpoint: Endpoint) => Transport;
   private readonly batcher: MicrotaskBatcher<BatchItem>;
   private readonly registry: SubscriptionRegistry;
@@ -346,6 +371,10 @@ export class ElectrumManager {
    * window must still emit immediately).
    */
   private readonly removingServers = new Set<ClientId>();
+  /** In-flight `installTipSubscription` task; concurrent triggers join it. */
+  private tipInstallTask: Promise<void> | null = null;
+  /** A trigger landed while the task was in flight — retry once it fails. */
+  private tipRetryQueued = false;
   /** Timer armed for the earliest future `bannedUntil` (see `armBanExpiryTimer`). */
   private banExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -373,16 +402,33 @@ export class ElectrumManager {
     this.hedging = opts.hedging;
     this.cooldownMs = opts.cooldownMs ?? 60_000;
     this.requestTimeoutMs = opts.requestTimeoutMs;
+    this.defaultMaxLineLength = opts.maxLineLength;
     this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
     this.cache = opts.cache;
     this.finalizedConfs = opts.finalizedConfs ?? 6;
     this.discovery = opts.discover
       ? new PeerDiscoveryRunner(opts.discover, {
           call: (clientId, method, params) =>
-            this.callDirect(method, params, { preferClient: clientId, retry: 'none' }),
+            // Strictly addressed AND ban-aware (the pickFor default):
+            // the probe must be attributed to this exact peer, but
+            // server.peers.subscribe is NEW work — a banned peer sits
+            // out its cooldown, and the runner re-arms its poll timer
+            // on refusal.
+            this.callDirect(method, params, {
+              preferClient: clientId,
+              retry: 'none',
+              pinStrict: true,
+            }),
           hasClient: (id) => this.clients.has(id),
           addServer: (spec) => this.addServer(spec),
-          isStopped: () => this.stopped,
+          // Teardown INTENT, not just `stopped`: `runSuspend` may sit
+          // behind a resume that is still awaiting reconnects, and until
+          // it runs, a probe timer would fire — or an `onDiscover`
+          // already awaiting would resolve — and admit a peer into a pool
+          // that is on its way down. Asked at the point of use rather
+          // than cancelling at intent, because an intent can still be
+          // rejected (a bad `graceMs`), and a cancel would not come back.
+          isStopped: () => this.stopped || this.teardownIntent() !== null,
           onError: (e) => this.emit('error', e),
         })
       : undefined;
@@ -401,11 +447,29 @@ export class ElectrumManager {
     this.registry = new SubscriptionRegistry({
       call: (method, params, callOpts) =>
         // Subscribe wire calls bypass auto-batch — they need an immediate
-        // round-trip so we have the initial status to compare against.
-        this.callDirect(method, params, callOpts),
+        // round-trip so we have the initial status to compare against —
+        // and report the serving client so records bind to the server
+        // that really owns the wire subscription.
+        this.callPinned(method, params, callOpts),
       emit: (event, payload) => this.emit(event, payload),
       pickConnectedClient: () => this.firstConnectedClient(),
-      isClientConnected: (id) => this.isClientUsable(id),
+      // Connection-only, deliberately NOT ban-aware: a ban gates routing
+      // of new calls, but it neither closes the socket nor cancels a
+      // wire subscription the server already accepted. Answering
+      // ban-aware here orphans a record whose server got banned while
+      // the subscribe response was in flight — its pushes then only
+      // buffer, silencing a live subscription for the whole ban (and in
+      // a single-server pool nobody else can pick it up).
+      isClientConnected: (id) => this.clients.get(id)?.getState() === 'connected',
+      sessionSeq: (id) => this.meta.get(id)?.sessionSeq ?? 0,
+      retireClient: (id) => {
+        const client = this.clients.get(id);
+        if (!client || client.getState() !== 'connected') return;
+        // disconnect() fires the standard 'disconnected' transition:
+        // subscriptions orphan, restoreOrphans rebinds them, and the
+        // reconnect scheduler revives the socket.
+        void client.disconnect().catch((e) => this.emit('error', e));
+      },
     });
     for (const spec of opts.servers) {
       this.installServer(spec);
@@ -762,6 +826,11 @@ export class ElectrumManager {
     }
     this.lifecycle = 'running';
     await this.forEachClientSafe((c) => c.connect());
+    // A stop() (or a suspend) can land while the initial wave is in
+    // flight — start() is not part of the serialized transition chain.
+    // Continuing here would publish a pool baseline and subscribe for the
+    // tip on a manager that has already been torn down.
+    if (this.teardownIntent() !== null) return;
     // Initial connect wave settled — release the pool-state gate and
     // emit the baseline snapshot. `lastPoolStatus` is null here, so this
     // fires even when every connect failed (all-offline start is exactly
@@ -780,21 +849,54 @@ export class ElectrumManager {
    */
   private async installTipSubscription(): Promise<void> {
     if (!this.cache || this.tipUnsub !== null) return;
-    try {
-      this.tipUnsub = await this.registry.subscribe<BlockHeader>(
-        'blockchain.headers.subscribe',
-        [],
-        (h) => {
-          // Validate at the boundary; an arbitrary registry handler
-          // shape shouldn't be trusted to be a BlockHeader.
-          if (h && typeof (h as BlockHeader).height === 'number') {
-            this.tipHeight = (h as BlockHeader).height;
-          }
-        },
-      );
-    } catch (e) {
-      this.emit('error', e);
+    // Single-flight, but triggers are never DISCARDED: a 'connected'
+    // transition landing while the in-flight attempt awaits its
+    // response is the signal that a retry could now succeed — dropping
+    // it (the old boolean guard did) could leave a stable session with
+    // no tip and every cache write silently disabled, because the
+    // failed leader was the only attempt and nothing else would fire.
+    // A joined trigger queues exactly one retry; the loop consumes it
+    // only if the current attempt fails. One task also means one
+    // handler closure — two would register two tip trackers on the
+    // same registry record.
+    if (this.tipInstallTask !== null) {
+      this.tipRetryQueued = true;
+      return this.tipInstallTask;
     }
+    this.tipInstallTask = (async () => {
+      try {
+        do {
+          this.tipRetryQueued = false;
+          try {
+            this.tipUnsub = await this.registry.subscribe<BlockHeader>(
+              'blockchain.headers.subscribe',
+              [],
+              (h) => {
+                // Validate at the boundary; an arbitrary registry handler
+                // shape shouldn't be trusted to be a BlockHeader.
+                if (h && typeof (h as BlockHeader).height === 'number') {
+                  this.tipHeight = (h as BlockHeader).height;
+                }
+              },
+            );
+            return;
+          } catch (e) {
+            this.emit('error', e);
+          }
+        } while (this.tipRetryQueued && this.teardownIntent() === null);
+      } finally {
+        // Nulled INSIDE the task, synchronously with the loop's exit:
+        // an outer `await task; finally { null }` leaves a microtask
+        // window where the task has settled but the field still points
+        // at it — a trigger landing there joins the dead task, sets the
+        // queued flag nobody will ever read, and its retry is silently
+        // lost. With the reset here there is no such window: after the
+        // final loop check, the next trigger to run sees null and
+        // becomes a fresh leader.
+        this.tipInstallTask = null;
+      }
+    })();
+    await this.tipInstallTask;
   }
 
   /**
@@ -850,12 +952,17 @@ export class ElectrumManager {
     // Fail ensureConnected waiters FIRST: the transition tail we await
     // next may itself be a hanging resume() that a waiter is parked on.
     this.rejectEnsureWaiters('manager stopped');
+    // Invalidate background work BEFORE awaiting the tail, not after: the
+    // tail can be a suspend still draining, and during that wait a
+    // discovery probe or a subscription rebind would otherwise start new
+    // wire work on a manager the caller has already stopped.
+    this.discovery?.cancelAll();
+    this.registry.clear();
     // Tail is catch-wrapped at append time — never rejects, so we can
     // safely `await` without try/catch.
     await this.transitionTail;
     // Reject anything queued during a prior suspend so callers don't dangle.
     this.rejectSuspendQueue('manager stopped before resume');
-    this.discovery?.cancelAll();
     // Auto-reconnect off — clear timers + intent flags so a `disconnected`
     // event triggered by our own `c.disconnect()` below doesn't reschedule.
     this.reconnect.clear();
@@ -864,6 +971,8 @@ export class ElectrumManager {
     this.poolBaselineReady = false;
     this.lastPoolStatus = null;
     await this.teardownTipSubscription();
+    // Second clear: the tip teardown above unsubscribes through the
+    // registry, and anything that raced the first one is dropped here.
     this.registry.clear();
     await this.forEachClientSafe((c) => c.disconnect());
     // Drop event listeners after the last possible emit (`error` paths
@@ -877,7 +986,9 @@ export class ElectrumManager {
    * subscription registry is preserved across suspend so `resume()` can
    * replay subscriptions with catch-up. Calls submitted while suspended
    * queue (or reject if `failOnSuspend` is set on the call). Idempotent —
-   * calling `suspend` while already suspended / suspending is a no-op.
+   * calling `suspend` while already suspended / suspending is a no-op —
+   * except that an invalid `graceMs` ALWAYS rejects, whatever the state:
+   * options are validated once, at submission, uniformly.
    *
    * `graceMs` (default 2000) bounds how long we wait for in-flight requests
    * to settle before forcibly rejecting them with `SuspendedError`.
@@ -890,6 +1001,21 @@ export class ElectrumManager {
     if (this.lifecycle === 'stopped') {
       throw new SuspendedError('cannot suspend a stopped manager');
     }
+    // Freeze and validate BEFORE publishing intent. Everything below this
+    // line is visible to the rest of the manager — it rejects
+    // `ensureConnected` waiters, aborts an in-flight resume, and gates
+    // discovery and `addServer` — and none of it is undone if the queued
+    // transition were to refuse the argument later: the manager would be
+    // parked in `resuming`, which `resume()` itself will not recover
+    // from. Freezing (not just validating) closes the rest of that
+    // class: `opts` belongs to the caller and may be mutated while the
+    // task sits in the queue, so the transition consumes this snapshot
+    // and never re-reads the caller's object.
+    const frozen = {
+      graceMs: opts.graceMs ?? 2000,
+      cancelInFlight: opts.cancelInFlight ?? false,
+    };
+    assertGraceMs(frozen.graceMs);
     // Fail ensureConnected waiters at INTENT time, not when the queued
     // task runs — the FIFO chain may be stuck behind a hanging resume()
     // that a waiter is parked on, and once a suspend is requested we can
@@ -904,7 +1030,7 @@ export class ElectrumManager {
     // ours) and then re-evaluates lifecycle. The catch on the tail
     // assignment keeps it never-rejecting so subsequent appenders and
     // `stop()` can `await transitionTail` without seeing throws.
-    const task = this.queueTransition(() => this.doSuspendIfNeeded(opts));
+    const task = this.queueTransition(() => this.doSuspendIfNeeded(frozen));
     void task
       .catch(() => undefined)
       .finally(() => {
@@ -935,7 +1061,7 @@ export class ElectrumManager {
    * a no-op — for the latter, the user must have called stop() while we
    * were queued; honor stop's terminal intent rather than re-throwing.
    */
-  private async doSuspendIfNeeded(opts: SuspendOptions): Promise<void> {
+  private async doSuspendIfNeeded(opts: FrozenSuspendOptions): Promise<void> {
     if (this.lifecycle === 'suspended' || this.lifecycle === 'stopped') return;
     if (this.lifecycle === 'created') {
       this.lifecycle = 'suspended';
@@ -944,14 +1070,22 @@ export class ElectrumManager {
     await this.runSuspend(opts);
   }
 
-  private async runSuspend(opts: SuspendOptions): Promise<void> {
+  private async runSuspend(opts: FrozenSuspendOptions): Promise<void> {
+    // `opts` is the snapshot suspend() froze and validated at submission
+    // — never the caller's mutable object — so what was checked is what
+    // runs, and this transition cannot refuse an argument after intent
+    // was published.
+    const { graceMs, cancelInFlight } = opts;
     this.lifecycle = 'suspending';
     // ensureConnected waiters listen on pool-state, which is suppressed
     // for the whole suspended period — fail them now instead of letting
     // them sit out their budget against a deliberately-paused manager.
     this.rejectEnsureWaiters('manager suspending');
-    const graceMs = opts.graceMs ?? 2000;
-    const cancelInFlight = opts.cancelInFlight ?? false;
+    // Discovery off first: a timer that fires during the grace window
+    // would send `server.peers.subscribe` on a manager that is already
+    // suspending, and a callback resolving there could admit a peer. The
+    // generation bump also invalidates probes already in flight.
+    this.discovery?.cancelAll();
 
     if (!cancelInFlight && graceMs > 0) {
       // Best-effort drain. Poll inFlightCount across all clients; bail out
@@ -960,6 +1094,11 @@ export class ElectrumManager {
       const deadline = Date.now() + graceMs;
       while (Date.now() < deadline) {
         if (this.totalInFlight() === 0) break;
+        // A stop() that arrived mid-grace is terminal and outranks a
+        // courtesy drain: it is waiting on this very transition, and
+        // every request we are being polite to is about to be failed
+        // anyway.
+        if (this.stopped) break;
         await sleep(20);
       }
     }
@@ -1046,12 +1185,12 @@ export class ElectrumManager {
     // 'stopped' while we awaited reconnects. Bail before re-installing
     // the headers subscription / draining the queue (which would
     // dispatch through call() against soon-to-be-disconnected clients).
-    if (this.resumeAbortedByStop()) return;
+    if (this.resumeAborted()) return;
     // Re-install the tip subscription if a cache was configured. `tipUnsub`
     // was cleared inside `suspend()`; it should always be `null` here.
     await this.installTipSubscription();
     // Re-check after the second await for the same race window.
-    if (this.resumeAbortedByStop()) return;
+    if (this.resumeAborted()) return;
     // Drain order matters: splice the queue while we're still `resuming`
     // (so any call() that lands between this line and the lifecycle flip
     // joins the queue rather than dispatching ahead of the drained
@@ -1061,6 +1200,19 @@ export class ElectrumManager {
     // microtask-scheduled caller can sneak in.
     const queued = this.suspendQueue.splice(0);
     this.lifecycle = 'running';
+    // Re-arm auto-reconnect for clients whose resume connect failed.
+    // Their `disconnected` transition fired while lifecycle was still
+    // `resuming`, where ReconnectRunner.isRunning() gates scheduling —
+    // without this sweep such a client would stay dead until another
+    // socket event, which never comes. (Scheduling here rather than
+    // treating `resuming` as running avoids racing a backoff connect
+    // against the resume wave's own in-flight connect.)
+    for (const [id, client] of this.clients) {
+      const s = client.getState();
+      if (s !== 'connected' && s !== 'connecting') {
+        this.reconnect.schedule(id);
+      }
+    }
     // Fresh baseline after the pause: reset so the post-resume snapshot
     // always emits, even if the status happens to match the pre-suspend one.
     // `poolBaselineReady` is normally set by start(), but a manager
@@ -1083,24 +1235,41 @@ export class ElectrumManager {
    * The cast widens the TS-narrowed literal — TS doesn't know `stop()`
    * can mutate `lifecycle` across awaits.
    */
-  private resumeAbortedByStop(): boolean {
+  /**
+   * Should this resume stop where it is?
+   *
+   * A stop is terminal, and a suspend submitted while we were awaiting is
+   * next in the transition chain: finishing the resume would re-install
+   * the tip subscription, flip to `running` and drain queued calls onto
+   * clients the very next task is about to disconnect.
+   */
+  private resumeAborted(): boolean {
     if ((this.lifecycle as LifecycleState) === 'stopped') {
       this.rejectSuspendQueue('manager stopped during resume');
       return true;
     }
-    return false;
+    // Queued calls stay queued: the suspend that is about to run owns
+    // them, and resume() is not the one to decide their fate.
+    return this.pendingSuspendIntents > 0;
   }
 
   /**
-   * Add a server to the pool. Coordinated with lifecycle:
+   * Add a server to the pool. Dialled immediately while the manager is
+   * running; installed without dialling when it is not — `created` waits
+   * for `start()`, and a pending or active teardown waits for `resume()`
+   * (with a reconnect scheduled as a backstop, since a submitted suspend
+   * can still be rejected). Coordinated with lifecycle:
    *  - `running`: connect immediately.
    *  - `created`: install only; `start()` will connect.
    *  - `suspending` / `suspended`: install only; the next `resume()` will
    *    connect along with the rest of the pool. An eager connect here
    *    would defeat suspend (a fresh socket goes live while the manager
    *    is supposed to be paused).
-   *  - `resuming`: connect immediately. resume()'s reconnect snapshot was
-   *    already captured, so we wire this one up ourselves.
+   *  - `resuming`: connect immediately — resume()'s reconnect snapshot was
+   *    already captured, so we wire this one up ourselves — unless a
+   *    suspend has already been submitted behind that resume, in which
+   *    case dialling would only hand the next transition a socket to
+   *    close.
    *  - `stopped`: throws — terminal state.
    */
   addServer(spec: ServerSpec): void {
@@ -1111,7 +1280,22 @@ export class ElectrumManager {
     const client = this.clients.get(spec.id);
     if (!client) return;
     if (this.lifecycle === 'created') return;
-    if (this.lifecycle === 'suspending' || this.lifecycle === 'suspended') return;
+    // Installed but not dialled while teardown is pending. The lifecycle
+    // field alone is not enough: a suspend submitted while a resume is
+    // still awaiting reconnects leaves the state at `resuming` until its
+    // queued task runs, and a server added in that window connected only
+    // to be closed again moments later.
+    if (this.teardownIntent() !== null) {
+      // The intent may never become a transition — `suspend()` can still
+      // reject on a bad `graceMs`, leaving the manager running — and then
+      // nothing else would ever dial this server: `installServer` only
+      // registers reconnect INTENT, and the backoff runner is driven by
+      // `disconnected` events, which a socket that never opened cannot
+      // produce. Schedule it: the runner is gated on `running`, so it
+      // fires only if the suspend never happens.
+      this.reconnect.schedule(spec.id);
+      return;
+    }
     client.connect().catch((e) => this.emit('error', e));
     // Pool grew: `online` may drop to `degraded` until the new client
     // connects (its own state transitions re-emit as they land).
@@ -1163,6 +1347,7 @@ export class ElectrumManager {
     ...args: CallArgs<M>
   ): Promise<M extends MethodName ? ResultOf<M> : unknown>;
   async call(method: string, params: readonly unknown[] = [], opts?: CallOpts): Promise<unknown> {
+    this.assertPinStrictOpts(opts);
     // Lifecycle gate: while the manager is in (or transitioning through)
     // a non-running state, calls either reject (when `failOnSuspend` is
     // set) or queue and replay on `resume()`. `resuming` is included so
@@ -1244,6 +1429,19 @@ export class ElectrumManager {
    * and by the namespace API when a method needs to bypass the cache
    * (e.g. mempool-sensitive lookups).
    */
+  private assertPinStrictOpts(opts: CallOpts | undefined): void {
+    // An addressed call has exactly one meaningful dispatch. Combined
+    // with a retry policy the first failure would put the pin into
+    // `excluded` and the strict branch would no-pick every later
+    // attempt — the retry policy silently reduced to nothing. Reject
+    // the combination up front instead.
+    if (opts?.pinStrict && opts.retry !== 'none') {
+      throw new ProtocolError(
+        "pinStrict requires retry: 'none' — an addressed call has exactly one dispatch",
+      );
+    }
+  }
+
   private async callInner(
     method: string,
     params: readonly unknown[],
@@ -1286,6 +1484,15 @@ export class ElectrumManager {
      * returned `Unsubscribe` removes this handler; when the last handler for
      * a given scripthash is gone the manager sends
      * `blockchain.scripthash.unsubscribe` to the bound server.
+     *
+     * CONTRACT: treat the payload as a CHANGE SIGNAL, not as the
+     * authoritative history digest — react to a callback by refetching
+     * (history / balance) from a server, and do not persist the raw
+     * status value as truth. During failovers and rebinds the registry
+     * may deliver a status buffered from a server other than the one
+     * currently bound (dropping it could silently lose the only notice
+     * of a change); a resync-driven consumer is correct in every such
+     * case, a consumer storing the payload verbatim is not.
      *
      * Multiple callers asking for the same scripthash share one wire
      * subscription — handlers fan out from a single notification stream.
@@ -1452,11 +1659,18 @@ export class ElectrumManager {
     if (this.clients.has(spec.id)) {
       throw new ProtocolError(`duplicate server id: ${spec.id}`);
     }
+    // Spec value first, then the pool-wide default — the only route by
+    // which discovery-admitted peers (no per-spec config possible) get a
+    // bounded cap on memory-constrained deployments.
+    const maxLineLength = spec.maxLineLength ?? this.defaultMaxLineLength;
     const endpoint: Endpoint = {
       host: spec.host,
       port: spec.port,
       protocol: spec.protocol,
       ...(spec.path !== undefined ? { path: spec.path } : {}),
+      ...(spec.wsFraming !== undefined ? { wsFraming: spec.wsFraming } : {}),
+      ...(maxLineLength !== undefined ? { maxLineLength } : {}),
+      ...(spec.maxMessageLength !== undefined ? { maxMessageLength: spec.maxMessageLength } : {}),
     };
     const transport = this.transportFactory(endpoint);
     const client = new ElectrumClient({
@@ -1491,6 +1705,16 @@ export class ElectrumManager {
     client.onStateChange((state) => {
       this.emit('client-state', { clientId: spec.id, state });
       if (state === 'connected') {
+        // Session identity first, unconditionally: every `connected` is
+        // a NEW session, and continuations that captured the previous
+        // seq must see the difference even mid-teardown.
+        const meta = this.meta.get(spec.id);
+        if (meta) meta.sessionSeq++;
+        // A socket that finishes connecting while stop()/suspend() is
+        // draining must not pull the manager back to life: a handshake,
+        // a discovery probe and a subscription restore are all new wire
+        // work on a connection teardown is about to close.
+        if (this.teardownIntent() !== null) return;
         // Fresh connection — reset reconnect backoff; the next disconnect
         // will start over from `minMs`.
         this.reconnect.resetAttempts(spec.id);
@@ -1503,6 +1727,17 @@ export class ElectrumManager {
         // Fire-and-forget: rebind any orphaned subs onto the new connection.
         // Errors surface through the manager `error` event via runAttempts.
         this.registry.restoreOrphans().catch((e) => this.emit('error', e));
+        // Retry the tip subscription if it never took. It was attempted
+        // once from start() / resume() and its failure only surfaced as
+        // an `error` event — so a manager started while the pool was
+        // unreachable ran the whole session with `tipHeight` unknown,
+        // which silently disables every cache write (nothing can be
+        // proven finalized without a tip). A fresh connection is exactly
+        // the moment it can succeed. `installTipSubscription` no-ops
+        // when there is no cache or the subscription is already live.
+        // Only while `running`: `resume()` installs its own, and racing
+        // it here would register a second tip handler on the same record.
+        if (this.lifecycle === 'running') void this.installTipSubscription();
         // Kick off a peer-discovery probe on this fresh connection.
         // `runFor` self-no-ops when discovery is disabled; we don't
         // gate at the call site so the runner stays the single source
@@ -1512,8 +1747,13 @@ export class ElectrumManager {
         this.registry.clientDisconnected(spec.id);
         // Subs bound to this client are now orphaned — immediately try to
         // re-bind them onto any other already-connected client without
-        // waiting for the next state transition.
-        this.registry.restoreOrphans().catch((e) => this.emit('error', e));
+        // waiting for the next state transition. Not when teardown is
+        // underway, though: suspend/stop disconnect clients one by one,
+        // and rebinding onto a peer that is about to be closed too just
+        // sends a subscribe the server will never get to serve.
+        if (this.teardownIntent() === null) {
+          this.registry.restoreOrphans().catch((e) => this.emit('error', e));
+        }
         // Cancel any scheduled re-poll: it would fire against a dead
         // client and route via policy.pick to a different server, which
         // is fine but wasteful. The next `connected` re-installs it.
@@ -1530,6 +1770,7 @@ export class ElectrumManager {
     this.reconnect.register(spec.id);
     this.meta.set(spec.id, {
       bannedUntil: undefined,
+      sessionSeq: 0,
       capabilities: {},
       telemetry: new TelemetryAccumulator(),
     });
@@ -1545,6 +1786,28 @@ export class ElectrumManager {
    * recovered transparently — exclude that id and try again without burning
    * a real attempt. Retries are reserved for actual failures.
    */
+  /**
+   * Reason a NEW wire dispatch must not start, or null when it may.
+   *
+   * Letting an already-dispatched request finish during the suspend grace
+   * is deliberate; starting a fresh retry, hedge, batch or handshake
+   * after teardown was requested is not — those land on sockets that are
+   * being closed, and the caller is told the manager is gone anyway.
+   * `resuming` is NOT teardown: resume's own reconnect work dispatches
+   * through here.
+   */
+  private teardownIntent(): string | null {
+    if (this.stopped) return 'manager stopped';
+    if (
+      this.pendingSuspendIntents > 0 ||
+      this.lifecycle === 'suspending' ||
+      this.lifecycle === 'suspended'
+    ) {
+      return 'manager suspending';
+    }
+    return null;
+  }
+
   private async runAttempts(
     method: string,
     params: readonly unknown[],
@@ -1553,7 +1816,7 @@ export class ElectrumManager {
     initialAttempt: number,
     opts?: CallOpts,
     seed?: Error,
-  ): Promise<unknown> {
+  ): Promise<{ value: unknown; servedBy: ClientId }> {
     let lastErr: Error | undefined = seed;
     let attempt = initialAttempt;
     // Bound on `client-missing` recoveries: every real client can plausibly
@@ -1563,6 +1826,22 @@ export class ElectrumManager {
     let missCount = 0;
     const missCap = this.clients.size + 4;
     while (attempt < maxAttempts) {
+      // Teardown may have been requested while the previous attempt was in
+      // flight. A retry is a NEW wire dispatch: it would go out on a socket
+      // suspend/stop is closing, and its result would arrive for a caller
+      // we are about to fail anyway.
+      // Unconditional, including the first iteration: a call whose entry
+      // check passed can still be waiting on something (a cache read, a
+      // rebind's continuation) when teardown is requested, and its first
+      // wire request would then go out on a manager that is stopping.
+      const teardown = this.teardownIntent();
+      if (teardown !== null) {
+        throw new SuspendedError(
+          attempt > initialAttempt
+            ? `${teardown} before the retry was dispatched`
+            : `${teardown} before the request was dispatched`,
+        );
+      }
       // A hedge is a second wire dispatch and consumes a second unit of the
       // attempt budget — only arm it when the budget has room for both.
       // With `retry: 'none'` (maxAttempts 1) the caller's contract is
@@ -1575,8 +1854,20 @@ export class ElectrumManager {
         const o = await this.attemptOnce(method, params, excluded, attempt, opts);
         outcome = o.kind === 'error' ? { kind: 'failures', failures: [o] } : o;
       }
-      if (outcome.kind === 'success') return outcome.value;
-      if (outcome.kind === 'no-pick') throw lastErr ?? outcome.error;
+      if (outcome.kind === 'success') {
+        // `servedBy` is the client that actually answered — with retry
+        // failover (or a hedge) that can differ from the first pick, and
+        // pinned consumers (subscription registry) must record the real
+        // owner of the wire subscription, not the preferred one.
+        return { value: outcome.value, servedBy: outcome.clientId };
+      }
+      if (outcome.kind === 'no-pick') {
+        // A teardown outranks whatever the previous attempt failed with:
+        // the caller needs to know the manager is going down, not what
+        // the server that is no longer relevant said.
+        if (outcome.error instanceof SuspendedError) throw outcome.error;
+        throw lastErr ?? outcome.error;
+      }
       if (outcome.kind === 'client-missing') {
         excluded.add(outcome.clientId);
         if (++missCount > missCap) {
@@ -1657,6 +1948,13 @@ export class ElectrumManager {
     }
 
     // Primary still pending past afterMs — try to pick a second client.
+    // Unless teardown was requested while we waited out the hedge delay:
+    // the primary is still allowed to finish, but a speculative SECOND
+    // dispatch is exactly the work suspend/stop is trying to end.
+    if (this.teardownIntent() !== null) {
+      const settled = await primary;
+      return settled.kind === 'success' ? settled : { kind: 'failures', failures: [settled] };
+    }
     const hedgeExcluded = new Set(excluded);
     hedgeExcluded.add(picked.clientId);
     // Probe semantics: a hedge is speculative (the primary may still win),
@@ -1717,6 +2015,21 @@ export class ElectrumManager {
     params: readonly unknown[],
     opts?: CallOpts,
   ): Promise<unknown> {
+    return this.callPinned(method, params, opts).then((r) => r.value);
+  }
+
+  /**
+   * Like `callDirect`, but also reports WHICH client served the call.
+   * The subscription registry binds records to the serving client — with
+   * retry failover the preferred pick and the actual server can differ,
+   * and binding to the wrong one silently drops that subscription's
+   * future notifications and misroutes its unsubscribe.
+   */
+  private callPinned(
+    method: string,
+    params: readonly unknown[],
+    opts?: CallOpts,
+  ): Promise<{ value: unknown; servedBy: ClientId }> {
     return this.runAttempts(
       method,
       params,
@@ -1800,6 +2113,13 @@ export class ElectrumManager {
     this.banExpiryTimer = setUnrefTimeout(() => {
       this.banExpiryTimer = null;
       this.maybeEmitPoolState();
+      // A ban lifting is the one recovery that fires no socket event: the
+      // client stayed `connected` throughout. Subscriptions orphaned
+      // while it was unusable would otherwise wait for an unrelated
+      // transition — on a single-server pool, indefinitely.
+      if (this.teardownIntent() === null) {
+        this.registry.restoreOrphans().catch((e) => this.emit('error', e));
+      }
     }, delay);
   }
 
@@ -1812,8 +2132,10 @@ export class ElectrumManager {
 
   /**
    * True iff the client is in the pool, in `connected` state, and not
-   * currently banned. Gates the registry's pinned wire `unsubscribe`, the
-   * `preferClient` pin, and first-connected binding.
+   * currently banned. Gates ROUTING decisions — the `preferClient` pin
+   * and first-connected picks. The registry's `isClientConnected` is
+   * deliberately not this: subscription ownership follows the socket,
+   * not ban state (see the registry env wiring in the constructor).
    */
   private isClientUsable(id: ClientId, now = Date.now()): boolean {
     const client = this.clients.get(id);
@@ -1933,21 +2255,52 @@ export class ElectrumManager {
     const now = Date.now();
     const candidates = this.buildCandidates(now);
 
-    // `preferClient` lets the registry route an unsubscribe (or any other
-    // pinned call) at the exact server we're targeting without consulting
-    // the policy. Honored only when the client is in the pool, connected,
-    // not banned, and not in `excluded`. Falls through to `policy.pick`
-    // otherwise.
+    // `preferClient` pins the call at the exact server we're targeting
+    // without consulting the policy.
+    //
+    // With `pinStrict` the pin is ADDRESSED — that server or nobody.
+    // Both such callers (the registry's wire unsubscribe, discovery's
+    // peer probe) address protocol state living on one specific
+    // connection; falling through to `policy.pick` would deliver the
+    // call to a server it is not about — a misrouted unsubscribe can
+    // land after a fresh subscribe on the picked server and silently
+    // kill it. Strict pins are ban-AWARE by default (strict addressing
+    // is not permission to send new work to a cooling-down peer);
+    // `pinBanExempt` lifts that for cleanup of state the session
+    // already holds — the wire unsubscribe must reach the connection
+    // that owns the subscription even mid-cooldown. The policy lives
+    // HERE, at the one place picks are decided, so a future strict-pin
+    // caller cannot silently inherit ban-bypass.
+    //
+    // WITHOUT `pinStrict`, `preferClient` keeps its documented public
+    // semantics — a HINT, whatever the retry policy: honored when the
+    // client is in the pool, connected, not banned, and not in
+    // `excluded`; falls through to `policy.pick` otherwise (that
+    // fallback is how subscribe fails over to a server that can
+    // answer).
     const preferred = opts?.preferClient;
+    const strictPin = preferred !== undefined && opts?.pinStrict === true;
     let clientId: ClientId | null = null;
-    if (
-      preferred !== undefined &&
-      !excluded.has(preferred) &&
-      // Same timestamp as the candidate snapshot — a ban expiring between
-      // the two reads must not make the pin and the snapshot disagree.
-      this.isClientUsable(preferred, now)
-    ) {
-      clientId = preferred;
+    if (preferred !== undefined && !excluded.has(preferred)) {
+      if (strictPin) {
+        const connected = this.clients.get(preferred)?.getState() === 'connected';
+        const allowed =
+          opts?.pinBanExempt === true ? connected : this.isClientUsable(preferred, now);
+        if (allowed && connected) clientId = preferred;
+      } else if (
+        // Same timestamp as the candidate snapshot — a ban expiring
+        // between the two reads must not make the pin and the snapshot
+        // disagree.
+        this.isClientUsable(preferred, now)
+      ) {
+        clientId = preferred;
+      }
+    }
+    if (clientId === null && strictPin) {
+      return {
+        kind: 'no-pick',
+        error: new NoClientAvailableError(`pinned client for ${method} is not connected`),
+      };
     }
     if (clientId === null) {
       const ctx: PickContext = {
@@ -1965,6 +2318,21 @@ export class ElectrumManager {
       return {
         kind: 'no-pick',
         error: new NoClientAvailableError(`no eligible client for ${method}`),
+      };
+    }
+    // The routing decision is the last thing that runs before a dispatch,
+    // and `policy.pick` is user code: a policy that suspends the manager
+    // from inside `pick()` would otherwise have its own request go out on
+    // a pool that is being torn down. Checked here rather than at each
+    // dispatch site — every path (single, hedge primary, hedge probe,
+    // batch routing) resolves its target through this one function, and
+    // reporting it as a pick result keeps `executeOn`'s contract that it
+    // never rejects, which the hedge races depend on.
+    const teardown = this.teardownIntent();
+    if (teardown !== null) {
+      return {
+        kind: 'no-pick',
+        error: new SuspendedError(`${teardown} before the request was dispatched`),
       };
     }
     const client = this.clients.get(clientId);
@@ -2040,6 +2408,19 @@ export class ElectrumManager {
         unroutable.push(item);
         continue;
       }
+      // Same window as the single-call route: `policy.pick` is user code
+      // and may have torn the manager down from inside this very loop.
+      const teardown = this.teardownIntent();
+      if (teardown !== null) {
+        if (probe) {
+          // A hedge probe settles nothing — the primary batch is still
+          // live and owns these items. Just decline to hedge.
+          return { groups: new Map(), unroutable: [] };
+        }
+        const e = new SuspendedError(`${teardown} before the batch was dispatched`);
+        for (const pending of items) pending.def.reject(e);
+        return { groups: new Map(), unroutable: [] };
+      }
       const grp = groups.get(clientId) ?? [];
       grp.push(item);
       groups.set(clientId, grp);
@@ -2048,6 +2429,23 @@ export class ElectrumManager {
   }
 
   private async flushBatch(items: BatchItem[]): Promise<void> {
+    // `call()` only queues; this runs a microtask later, by which time the
+    // manager may have been stopped or suspended. Dispatching then would
+    // put a request on a socket teardown is already closing — a wire side
+    // effect after the caller asked to stop — and the caller would see a
+    // transport error rather than being told the manager is gone.
+    // `teardownIntent`, not the lifecycle field: a submitted suspend has
+    // not flipped `lifecycle` yet (its task is queued behind whatever
+    // transition is running), and this flush would sail straight past a
+    // check that only looked at the flag.
+    const teardown =
+      this.teardownIntent() ??
+      (this.lifecycle !== 'running' ? `manager is ${this.lifecycle}` : null);
+    if (teardown !== null) {
+      const e = new SuspendedError(`${teardown} before the batch was dispatched`);
+      for (const item of items) item.def.reject(e);
+      return;
+    }
     // A throwing custom policy must reject the items, not strand them:
     // the flush runs fire-and-forget, so an escaped throw would only
     // reach the 'error' event while every caller hangs forever.
@@ -2085,7 +2483,7 @@ export class ElectrumManager {
       item.opts,
       seed,
     ).then(
-      (v) => item.def.resolve(v),
+      (r) => item.def.resolve(r.value),
       (e) => item.def.reject(e),
     );
   }
@@ -2227,6 +2625,12 @@ export class ElectrumManager {
     }
 
     // Primary still pending past afterMs — try to pick a second client.
+    // Unless teardown was requested while we waited: the primary may
+    // finish, but a speculative SECOND batch is new wire work of exactly
+    // the kind suspend/stop is ending.
+    if (this.teardownIntent() !== null) {
+      return primary;
+    }
     // A throwing custom policy must not strand the group: the primary is
     // still live, so a failed probe degrades to no-hedge.
     let hedgePick: { clientId: ClientId; client: ElectrumClient } | null;
@@ -2550,6 +2954,15 @@ export class ElectrumManager {
   private async redispatchGroup(entries: RetryEntry[]): Promise<void> {
     const lastError = new Map<BatchItem, Error>();
     for (const e of entries) lastError.set(e.item, e.error);
+    // A re-batch is a new wire dispatch: refuse it once teardown has been
+    // requested, and tell the callers why rather than letting them see
+    // whatever the closing socket produced.
+    const teardown = this.teardownIntent();
+    if (teardown !== null) {
+      const e = new SuspendedError(`${teardown} before the batch was retried`);
+      for (const entry of entries) entry.item.def.reject(e);
+      return;
+    }
     // Same stale-id recovery bound as runAttempts: a buggy policy that
     // keeps naming clients we no longer have must not spin forever.
     let missCount = 0;
@@ -2692,7 +3105,10 @@ export class ElectrumManager {
   private emit<K extends keyof ManagerEvents>(event: K, payload: ManagerEvents[K]): void {
     const set = this.listeners.get(event);
     if (!set) return;
-    for (const l of set) {
+    // Snapshot: a Set iterator revisits an entry removed and re-added
+    // while it runs, so a listener that unsubscribes and resubscribes
+    // itself from inside its own callback was called again, forever.
+    for (const l of [...set]) {
       try {
         l(payload);
       } catch {

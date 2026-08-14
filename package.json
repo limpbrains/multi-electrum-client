@@ -79,7 +79,8 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "demo": "pnpm -C examples/demo install && pnpm -C examples/demo dev"
+    "demo": "pnpm -C examples/demo install && pnpm -C examples/demo dev",
+    "prepack": "pnpm build"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
@@ -87,7 +88,7 @@
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
-    "@vitest/coverage-v8": "^2.0.0",
+    "@vitest/coverage-v8": "^3.2.7",
     "eslint": "^9.0.0",
     "eslint-config-prettier": "^9.0.0",
     "fast-check": "^3.0.0",
@@ -95,8 +96,8 @@
     "tsd": "^0.31.0",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0",
-    "vitest": "^2.0.0",
-    "ws": "^8.20.0"
+    "vitest": "^3.2.7",
+    "ws": "^8.21.2"
   },
   "packageManager": "pnpm@9.0.0",
   "keywords": [

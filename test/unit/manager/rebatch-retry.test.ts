@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { describe, expect, it } from 'vitest';
 
+import { SuspendedError } from '../../../src/errors/types.js';
 import { ElectrumManager } from '../../../src/manager.js';
 import { failover } from '../../../src/policy/builtins.js';
 import type { RoutingPolicy } from '../../../src/policy/types.js';
@@ -340,6 +341,290 @@ describe('ElectrumManager — re-batched retries', () => {
     expect(await p0).toBe('b-tx0');
     expect(await p1).toBe('b-tx1');
 
+    await manager.stop();
+  });
+});
+
+describe('ElectrumManager — stop() and queued batch work', () => {
+  it('does not put a microtask-batched call on the wire after stop()', async () => {
+    // `call()` only queues; the flush runs on a microtask. stop() marked
+    // the manager stopped and yielded, so the already-queued flush ran
+    // afterwards and dispatched to a socket that was still connected —
+    // a wire side effect after the caller asked for teardown, and a
+    // transport rejection instead of SuspendedError.
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      autoBatch: true,
+    });
+    await manager.start();
+    const aT = h.transports.get('a')!;
+    const sentBefore = aT.sent.length;
+
+    const call = manager.call('blockchain.transaction.get', ['tx0']);
+    const stopping = manager.stop();
+
+    await expect(call).rejects.toThrow(SuspendedError);
+    await stopping;
+    expect(aT.sent).toHaveLength(sentBefore);
+  });
+});
+
+describe('ElectrumManager — teardown intent stops new wire work', () => {
+  it('does not dispatch a retry after suspend was requested', async () => {
+    // Letting an already-dispatched request finish during the suspend
+    // grace is deliberate. Starting a NEW attempt is not: it goes out on
+    // a socket suspend is closing, and its answer arrives for a caller
+    // the manager is about to fail anyway.
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    const call = manager.call('blockchain.transaction.get', ['tx0']);
+    await delay(0);
+    expect(h.transports.get('a')!.sent).toHaveLength(1);
+
+    const suspending = manager.suspend({ graceMs: 0 });
+    h.transports.get('a')!.pushClose(1006, 'cut');
+
+    await expect(call).rejects.toMatchObject({ name: 'SuspendedError' });
+    await suspending;
+    // b was never asked: the failover retry would have been new traffic.
+    expect(h.transports.get('b')?.sent ?? []).toHaveLength(0);
+    await manager.stop();
+  });
+
+  it('rejects a non-finite suspend grace instead of hanging teardown', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    // An unbounded grace would park the drain loop forever, and stop()
+    // waits on that very transition. NaN is the opposite failure: every
+    // deadline comparison is false, so the drain the caller asked for is
+    // silently skipped.
+    await expect(manager.suspend({ graceMs: Number.POSITIVE_INFINITY })).rejects.toThrow(
+      RangeError,
+    );
+    await expect(manager.suspend({ graceMs: Number.NaN })).rejects.toThrow(RangeError);
+
+    // The rejection leaves the manager where it was: validation runs
+    // before the transition mutates anything, so a bad argument cannot
+    // strand it in `suspending` with calls queueing behind it.
+    expect(manager.state).toBe('running');
+    const ping = manager.call('server.ping', [], { retry: 'none' });
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'server.ping' ? { id: req.id, result: null } : undefined,
+    );
+    await expect(ping).resolves.toBeNull();
+
+    // `null` means "unset" for an optional option, the way `?? 2000`
+    // reads it — validating before that default would turn it into an
+    // error for anyone forwarding a config value.
+    await manager.suspend({ graceMs: null as unknown as number });
+    expect(manager.state).toBe('suspended');
+    await manager.stop();
+  });
+});
+
+describe('ElectrumManager — teardown intent covers every dispatch site', () => {
+  it('does not send a first request that was queued behind an await', async () => {
+    // The entry check passes, then the call waits (a cache read, a
+    // rebind continuation). By the time it wants the wire, teardown has
+    // been requested — this dispatch had not gone out yet, so it must not.
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      autoBatch: true,
+    });
+    await manager.start();
+    const aT = h.transports.get('a')!;
+    const sentBefore = aT.sent.length;
+
+    const call = manager.call('blockchain.transaction.get', ['tx0']);
+    const suspending = manager.suspend({ graceMs: 0 });
+
+    await expect(call).rejects.toMatchObject({ name: 'SuspendedError' });
+    await suspending;
+    expect(aT.sent).toHaveLength(sentBefore);
+    await manager.stop();
+  });
+
+  it('does not re-batch survivors after suspend was requested', async () => {
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy: failover(['a', 'b', 'c']),
+      transportFactory: h.factory,
+      autoBatch: true,
+    });
+    await manager.start();
+
+    const calls = Array.from({ length: 3 }, (_, i) =>
+      manager.call('blockchain.transaction.get', [`tx${i}`]),
+    );
+    await delay(0);
+    expect(h.transports.get('a')!.sent).toHaveLength(1);
+
+    // Suspend enters its grace, then the server rate-limits every item:
+    // those are retryable, and the re-batch must not travel to b.
+    const suspending = manager.suspend({ graceMs: 50 });
+    h.reply('a', (req: { id: number }) => ({
+      id: req.id,
+      error: { code: -32603, message: 'excessive resource usage' },
+    }));
+
+    const reasons = await Promise.all(
+      calls.map((p) =>
+        p.then(
+          () => 'ok',
+          (e: Error) => e.name,
+        ),
+      ),
+    );
+    await suspending;
+    // Rejected because the manager is going down, not because the retry
+    // that would have gone to b failed on its own.
+    expect(reasons).toEqual(['SuspendedError', 'SuspendedError', 'SuspendedError']);
+    expect(h.transports.get('b')?.sent ?? []).toHaveLength(0);
+    await manager.stop();
+  });
+});
+
+describe('ElectrumManager — policy re-entrancy cannot outrun teardown', () => {
+  it('a policy that suspends from inside pick() does not get its request sent', async () => {
+    // The routing policy is user code and it runs between the caller's
+    // teardown check and the dispatch. Without a check at the wire, the
+    // request went out on a manager the policy itself had just suspended:
+    // the caller saw SuspendedError (suspend fails everything in flight)
+    // while the server had already been asked to do the work.
+    const h = buildHarness();
+    let manager!: ElectrumManager;
+    let suspended: Promise<void> | undefined;
+    const policy: RoutingPolicy = {
+      pick(ctx) {
+        // Only for the call under test: start()'s own handshake routes
+        // through here too.
+        if (ctx.request.method === 'blockchain.transaction.get') {
+          suspended ??= manager.suspend({ graceMs: 0 });
+        }
+        return ctx.candidates[0]?.id ?? null;
+      },
+    };
+    manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [SERVERS3[0]!],
+      policy,
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+    const aT = h.transports.get('a')!;
+    const sentBefore = aT.sent.length;
+
+    await expect(
+      manager.call('blockchain.transaction.get', ['tx0'], { retry: 'none' }),
+    ).rejects.toMatchObject({ name: 'SuspendedError' });
+    await suspended;
+
+    expect(aT.sent).toHaveLength(sentBefore);
+    await manager.stop();
+  });
+
+  it('holds for the hedged path too, and settles the caller', async () => {
+    // The hedge races two dispatches and attaches no rejection handler to
+    // the second one, so the guard must report through the routing
+    // result rather than by throwing: a rejection here left the caller's
+    // promise pending forever and raised an unhandled rejection.
+    const h = buildHarness();
+    let manager!: ElectrumManager;
+    let suspended: Promise<void> | undefined;
+    const policy: RoutingPolicy = {
+      pick(ctx) {
+        if (ctx.request.method === 'blockchain.transaction.get') {
+          suspended ??= manager.suspend({ graceMs: 0 });
+        }
+        return ctx.candidates[0]?.id ?? null;
+      },
+    };
+    manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS3,
+      policy,
+      transportFactory: h.factory,
+      autoBatch: false,
+      hedging: { afterMs: 5 },
+    });
+    await manager.start();
+    const sentBefore = SERVERS3.map((s) => h.transports.get(s.host)?.sent.length ?? 0);
+
+    const settled = await Promise.race([
+      manager.call('blockchain.transaction.get', ['tx0']).then(
+        () => 'resolved',
+        (e: Error) => e.name,
+      ),
+      delay(300).then(() => 'never settled'),
+    ]);
+    await suspended;
+
+    expect(settled).toBe('SuspendedError');
+    expect(SERVERS3.map((s) => h.transports.get(s.host)?.sent.length ?? 0)).toEqual(sentBefore);
+    await manager.stop();
+  });
+
+  it('holds for the auto-batch path too', async () => {
+    const h = buildHarness();
+    let manager!: ElectrumManager;
+    let suspended: Promise<void> | undefined;
+    const policy: RoutingPolicy = {
+      pick(ctx) {
+        if (ctx.request.method === 'blockchain.transaction.get') {
+          suspended ??= manager.suspend({ graceMs: 0 });
+        }
+        return ctx.candidates[0]?.id ?? null;
+      },
+    };
+    manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [SERVERS3[0]!],
+      policy,
+      transportFactory: h.factory,
+      autoBatch: true,
+    });
+    await manager.start();
+    const aT = h.transports.get('a')!;
+    const sentBefore = aT.sent.length;
+
+    const outcome = await Promise.race([
+      manager.call('blockchain.transaction.get', ['tx0']).then(
+        () => 'resolved',
+        (e: Error) => e.name,
+      ),
+      delay(300).then(() => 'never settled'),
+    ]);
+    await suspended;
+
+    expect(outcome).toBe('SuspendedError');
+    expect(aT.sent).toHaveLength(sentBefore);
     await manager.stop();
   });
 });

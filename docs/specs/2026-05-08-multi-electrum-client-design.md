@@ -214,7 +214,7 @@ class ProtocolError  extends Error {}
 
 - Multiple callers subscribing to the same `(method, params)` share one wire subscription; manager fans out to all handlers.
 - Last `unsub` triggers `blockchain.scripthash.unsubscribe` on servers that support it (ElectrumX ≥ 1.4.2, Fulcrum, electrs); on older servers manager stops dispatching but cannot tell server to stop pushing — documented.
-- Idempotency contract: handlers may receive the same status more than once across rebinds; document that handlers should be idempotent. We do not deduplicate beyond "skip notification if new status equals stored last-known".
+- Idempotency contract: handlers may receive the same status more than once across rebinds; document that handlers should be idempotent. ~~We do not deduplicate beyond "skip notification if new status equals stored last-known"~~ *(superseded: live pushes are never deduplicated — the protocol mandates delivery even when the status is unchanged, e.g. a same-height reorg; see `src/subscriptions/registry.ts`)*.
 
 ### Server discovery
 

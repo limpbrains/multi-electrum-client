@@ -127,6 +127,17 @@ export class PeerDiscoveryRunner {
   private readonly options: DiscoverOptions;
   private readonly deps: PeerDiscoveryDeps;
   private readonly timers = new Map<ClientId, ReturnType<typeof setTimeout>>();
+  /**
+   * Bumped by `cancelAll`. A probe that is already awaiting the network —
+   * or the user's `onDiscover` — captures the current value and abandons
+   * its work if it no longer matches: `isStopped()` alone is false during
+   * a suspend, so a callback resolving after `await suspend()` returned
+   * used to admit a peer into a pool that was supposed to be quiescent
+   * (and get it connected on the next resume).
+   */
+  private generation = 0;
+  /** Per-client counterpart, bumped by `cancelFor`. */
+  private readonly clientGenerations = new Map<ClientId, number>();
 
   constructor(options: DiscoverOptions, deps: PeerDiscoveryDeps) {
     this.options = options;
@@ -142,17 +153,29 @@ export class PeerDiscoveryRunner {
   async runFor(clientId: ClientId): Promise<void> {
     if (!this.options.enabled) return;
     if (this.deps.isStopped()) return;
+    const generation = this.generation;
+    const clientGeneration = this.clientGenerations.get(clientId) ?? 0;
+    const cancelled = (): boolean =>
+      this.deps.isStopped() ||
+      generation !== this.generation ||
+      clientGeneration !== (this.clientGenerations.get(clientId) ?? 0);
 
     let response: unknown;
     try {
       response = await this.deps.call(clientId, 'server.peers.subscribe', []);
     } catch {
-      // Server doesn't support discovery or transient failure — runAttempts
-      // already surfaced anything callers care about. Drop silently.
-      return;
+      // Server doesn't support discovery, transient failure, or the
+      // peer is sitting out a ban — runAttempts already surfaced
+      // anything callers care about. Do NOT return before the re-poll
+      // arming below: a probe refused during a cooldown must not end
+      // discovery for a still-connected client for the life of its
+      // socket (the next 'connected' transition is the only other
+      // re-kick, and a ban does not disconnect).
+      response = undefined;
     }
 
-    const candidates = parsePeerList(response);
+    if (cancelled()) return;
+    const candidates = response === undefined ? [] : parsePeerList(response);
     for (const cand of candidates) {
       // Pre-await dedup: skip peers already in the pool. The re-check
       // post-`onDiscover` below is a separate guard against the user's
@@ -173,7 +196,7 @@ export class PeerDiscoveryRunner {
       // `onDiscover` ran. The user's callback can synchronously call
       // `addServer` / `removeServer`, so this isn't redundant with the
       // pre-await dedup above.
-      if (this.deps.isStopped()) return;
+      if (cancelled()) return;
       if (this.deps.hasClient(cand.id)) continue;
       try {
         this.deps.addServer(cand);
@@ -185,7 +208,7 @@ export class PeerDiscoveryRunner {
 
     const interval = this.options.intervalMs ?? DEFAULT_DISCOVER_INTERVAL_MS;
     if (interval <= 0) return;
-    if (this.deps.isStopped()) return;
+    if (cancelled()) return;
     // The probe `await`s above may have outlasted the client itself
     // (manager `cancelFor` + `removeServer` on disconnect), so a re-poll
     // timer for an id that's no longer in the pool would just retry
@@ -202,6 +225,10 @@ export class PeerDiscoveryRunner {
 
   /** Cancel any pending re-poll timer for `clientId`. */
   cancelFor(clientId: ClientId): void {
+    // Also invalidates a probe already running for this client: its
+    // source has gone away, so nothing it learned should still admit
+    // peers into the pool.
+    this.clientGenerations.set(clientId, (this.clientGenerations.get(clientId) ?? 0) + 1);
     const t = this.timers.get(clientId);
     if (t !== undefined) {
       clearTimeout(t);
@@ -211,6 +238,8 @@ export class PeerDiscoveryRunner {
 
   /** Cancel every pending timer. Used by manager on `stop` / `suspend`. */
   cancelAll(): void {
+    // Also invalidates probes already in flight — see `generation`.
+    this.generation++;
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
   }

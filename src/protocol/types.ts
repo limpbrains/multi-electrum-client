@@ -38,6 +38,24 @@ export interface ServerSpec {
   protocol: Protocol;
   /** Optional URL path for WebSocket endpoints, e.g. `/ws`. */
   path?: string;
+  /**
+   * Payload framing for `ws`/`wss` peers. `'message'` (default) — the
+   * native Electrum-over-WebSocket protocol, one complete JSON-RPC per
+   * message. `'newline'` — a byte tunnel relaying a newline-delimited
+   * TCP stream over frames with arbitrary boundaries. Declared, not
+   * guessed; see `Endpoint.wsFraming`.
+   */
+  wsFraming?: 'message' | 'newline';
+  /**
+   * Per-server override of the transport's line/response cap — see
+   * `Endpoint.maxLineLength`.
+   */
+  maxLineLength?: number;
+  /**
+   * Per-server aggregate WebSocket message bound for `'newline'`
+   * framing — see `Endpoint.maxMessageLength`.
+   */
+  maxMessageLength?: number;
 }
 
 // --- Transactions ----------------------------------------------------------
@@ -229,6 +247,27 @@ export interface CallOpts {
    */
   preferClient?: ClientId;
   /**
+   * Escalates `preferClient` from a hint to an ADDRESSED call: that
+   * exact connection or nobody — no `policy.pick` fallback, because
+   * the call targets protocol state living on one specific session (a
+   * wire unsubscribe, a discovery probe of one peer) where any
+   * fallback is a misroute. Ban-AWARE by default: strict addressing is
+   * not permission to send new work to a peer sitting out a cooldown.
+   * Requires `retry: 'none'` — an addressed call has exactly one
+   * meaningful dispatch, and any retry policy would silently reduce to
+   * nothing (the failed pin joins `excluded` and the strict branch
+   * then no-picks); other combinations are rejected up front.
+   */
+  pinStrict?: boolean;
+  /**
+   * With `pinStrict`, also allow a BANNED (but connected) target. Only
+   * for cleanup of state the session already holds — the registry's
+   * wire unsubscribe must reach the connection that owns the
+   * subscription even while that server cools down. New work never
+   * sets this.
+   */
+  pinBanExempt?: boolean;
+  /**
    * Forwarded into `PickContext.stickyKey` so user policies wrapped in
    * `withSticky(...)` can pin requests beyond the scripthash heuristic.
    * Default: undefined (the policy receives the field as undefined and
@@ -259,6 +298,14 @@ export interface ManagerOptions {
   classifier?: ErrorClassifier;
   autoBatch?: boolean;
   requestTimeoutMs?: number;
+  /**
+   * Pool-wide default for the transport line/response cap, applied to
+   * every server the manager installs — including peers admitted by
+   * discovery, which no per-`ServerSpec` value can reach. A spec's own
+   * `maxLineLength` overrides it for that server. See
+   * `ServerSpec.maxLineLength`.
+   */
+  maxLineLength?: number;
   reconnectBackoff?: ReconnectBackoff;
   cooldownMs?: number;
   finalizedConfs?: number;
