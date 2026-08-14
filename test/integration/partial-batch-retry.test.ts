@@ -14,12 +14,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { ElectrumManager, roundRobin, type ServerSpec } from '../../src/index.js';
 
-import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { lane } from './helpers/config.js';
 import * as toxic from './helpers/toxic.js';
 
+const PROXY = lane.proxy('electrumx');
+
 const SERVERS: ServerSpec[] = [
-  { id: 'direct', host: INTEGRATION_HOST, port: PORTS.electrumxTcp, protocol: 'tcp' },
-  { id: 'proxy', host: INTEGRATION_HOST, port: PORTS.toxiproxyElectrumxTcp, protocol: 'tcp' },
+  { id: 'direct', ...lane.spec('electrumx') },
+  { id: 'proxy', ...lane.spec('electrumx', { via: 'proxy' }) },
 ];
 
 describe('integration: partial-batch retry under toxiproxy faults', () => {
@@ -32,7 +34,7 @@ describe('integration: partial-batch retry under toxiproxy faults', () => {
   });
 
   afterEach(async () => {
-    await toxic.enable('electrumx-tcp');
+    await toxic.enable(PROXY);
   });
 
   it('survives the proxy lane dying mid-batch — every item resolves', async () => {
@@ -59,7 +61,7 @@ describe('integration: partial-batch retry under toxiproxy faults', () => {
       // delay so the items have a chance to enqueue; toxiproxy disable
       // closes existing connections.
       setTimeout(() => {
-        toxic.disable('electrumx-tcp').catch(() => undefined);
+        toxic.disable(PROXY).catch(() => undefined);
       }, 5);
 
       const results = await batchPromise;

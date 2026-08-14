@@ -49,11 +49,16 @@ services:
       DAEMON_URL: http://ci:ci@bitcoind:18443
       COIN: BitcoinSegwit
       NET: regtest
-      SERVICES: tcp://:50001
+      # ws:// is ElectrumX's native Electrum-over-WebSocket (one JSON-RPC
+      # payload per message, no trailing newline) — the integration ws
+      # lane. Verified in the container log: "TCP server listening" plus
+      # a WS service line on 50003.
+      SERVICES: tcp://:50001,ws://:50003
       INITIAL_CONCURRENT: '50'
       PEER_DISCOVERY: 'self'
     ports:
       - '50001:50001' # direct lane
+      - '50003:50003' # direct ws lane (native message framing)
     healthcheck:
       # ElectrumX image is alpine-ish without bash; python3 ships with it.
       test:
@@ -61,7 +66,7 @@ services:
           'CMD',
           'python3',
           '-c',
-          "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 50001)); s.close()",
+          "import socket; [socket.create_connection(('127.0.0.1', p), timeout=2).close() for p in (50001, 50003)]",
         ]
       interval: 2s
       timeout: 5s
@@ -107,10 +112,12 @@ services:
     command: ['Fulcrum', '/etc/fulcrum.conf']
     ports:
       - '50101:50001' # direct lane (host) → 50001 (container)
+      - '50103:50003' # direct ws lane (native message framing)
     healthcheck:
       # /dev/tcp is bash-only and the image's `sh` is dash. Invoke bash
-      # explicitly.
-      test: ['CMD', 'bash', '-c', 'echo > /dev/tcp/127.0.0.1/50001']
+      # explicitly. Probes both listeners so `up --wait` guarantees the
+      # ws lane too.
+      test: ['CMD', 'bash', '-c', 'echo > /dev/tcp/127.0.0.1/50001 && echo > /dev/tcp/127.0.0.1/50003']
       interval: 2s
       timeout: 5s
       retries: 30
@@ -135,8 +142,9 @@ services:
     command: ['Fulcrum', '/etc/fulcrum.conf']
     ports:
       - '50102:50001' # strict lane
+      - '50104:50003' # strict ws lane
     healthcheck:
-      test: ['CMD', 'bash', '-c', 'echo > /dev/tcp/127.0.0.1/50001']
+      test: ['CMD', 'bash', '-c', 'echo > /dev/tcp/127.0.0.1/50001 && echo > /dev/tcp/127.0.0.1/50003']
       interval: 2s
       timeout: 5s
       retries: 30
@@ -178,13 +186,45 @@ services:
     ports:
       - '8474:8474' # admin HTTP
       - '52001:52001' # electrumx-tcp lane
+      - '52003:52003' # electrumx-ws lane
       - '52101:52101' # fulcrum-tcp lane
+      - '52103:52103' # fulcrum-ws lane
       - '52201:52201' # electrs-tcp lane
+      # 52203 (electrs-ws) stays internal — only wsbridge-electrs-int
+      # dials it; the host-facing electrs ws endpoint is the bridge.
     # No healthcheck: the toxiproxy image is scratch-based and ships only
     # the `toxiproxy-server` binary — nothing to drive a `bash` / `python`
     # / `curl` probe with. No other service gates on toxiproxy; CI's `up
     # --wait` succeeds once electrumx is healthy. Tests that need the
     # admin HTTP API poll it themselves at :8474.
+
+  wsbridge-electrs-int:
+    # Integration ws lane for electrs, which has no native WebSocket:
+    # the ws↔tcp byte bridge (`wsFraming: 'newline'` on the client).
+    # Routed THROUGH toxiproxy (electrs-ws lane) so disabling that proxy
+    # severs the ws lane end-to-end — the bridge's connect-before-upgrade
+    # turns a disabled proxy into a 502 and the client's connect() fails,
+    # matching what a disabled TCP lane does.
+    # Bun 1.3-alpine — pinned by digest (mutable tags rotate; the slim
+    # bridge is CI-critical). Bump deliberately:
+    # docker pull oven/bun:1.3-alpine && docker inspect --format
+    # '{{index .RepoDigests 0}}' oven/bun:1.3-alpine
+    image: oven/bun@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0
+    profiles: [slim, full]
+    depends_on:
+      toxiproxy:
+        condition: service_started
+      electrs-default:
+        condition: service_healthy
+    volumes:
+      - ./wsbridge/bridge.ts:/app/bridge.ts:ro
+    command: ['bun', '/app/bridge.ts']
+    environment:
+      LISTEN_PORT: '8080'
+      TARGET_HOST: 'toxiproxy'
+      TARGET_PORT: '52203'
+    ports:
+      - '50203:8080' # electrs ws lane (byte tunnel, newline framing)
 
   # --- demo profile: ws↔tcp bridges for the browser demo -------------------
   #
@@ -196,7 +236,11 @@ services:
   # See ../examples/demo for the app (`pnpm demo`).
 
   wsbridge-electrumx:
-    image: oven/bun:1.3-alpine
+    # Bun 1.3-alpine — pinned by digest (mutable tags rotate; the slim
+    # bridge is CI-critical). Bump deliberately:
+    # docker pull oven/bun:1.3-alpine && docker inspect --format
+    # '{{index .RepoDigests 0}}' oven/bun:1.3-alpine
+    image: oven/bun@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0
     profiles: [demo]
     depends_on:
       - toxiproxy
@@ -211,7 +255,11 @@ services:
       - '52002:8080'
 
   wsbridge-fulcrum:
-    image: oven/bun:1.3-alpine
+    # Bun 1.3-alpine — pinned by digest (mutable tags rotate; the slim
+    # bridge is CI-critical). Bump deliberately:
+    # docker pull oven/bun:1.3-alpine && docker inspect --format
+    # '{{index .RepoDigests 0}}' oven/bun:1.3-alpine
+    image: oven/bun@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0
     profiles: [demo]
     depends_on:
       - toxiproxy
@@ -226,7 +274,11 @@ services:
       - '52102:8080'
 
   wsbridge-electrs:
-    image: oven/bun:1.3-alpine
+    # Bun 1.3-alpine — pinned by digest (mutable tags rotate; the slim
+    # bridge is CI-critical). Bump deliberately:
+    # docker pull oven/bun:1.3-alpine && docker inspect --format
+    # '{{index .RepoDigests 0}}' oven/bun:1.3-alpine
+    image: oven/bun@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0
     profiles: [demo]
     depends_on:
       - toxiproxy

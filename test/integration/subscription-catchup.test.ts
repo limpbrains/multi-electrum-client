@@ -18,15 +18,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { ElectrumManager, failover, type BlockHeader, type ServerSpec } from '../../src/index.js';
 
-import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { lane } from './helpers/config.js';
 import { electrumxKnowsHeight } from './helpers/electrumxPoll.js';
 import { getBlockCount, mineBlocks } from './helpers/regtestRpc.js';
 import * as toxic from './helpers/toxic.js';
 import { waitFor } from './helpers/wait.js';
 
-const SERVERS: ServerSpec[] = [
-  { id: 'ex', host: INTEGRATION_HOST, port: PORTS.electrumxTcp, protocol: 'tcp' },
-];
+const SERVERS: ServerSpec[] = [{ id: 'ex', ...lane.spec('electrumx') }];
 
 describe('integration: subscription catch-up across suspend / resume', () => {
   beforeAll(async () => {

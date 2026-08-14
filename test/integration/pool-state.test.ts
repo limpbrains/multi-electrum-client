@@ -5,13 +5,16 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { ElectrumManager, roundRobin, type PoolState, type ServerSpec } from '../../src/index.js';
 
-import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { lane } from './helpers/config.js';
 import * as toxic from './helpers/toxic.js';
 import { waitFor } from './helpers/wait.js';
 
+const EX_PROXY = lane.proxy('electrumx');
+const F_PROXY = lane.proxy('fulcrum');
+
 const SERVERS: ServerSpec[] = [
-  { id: 'ex-proxy', host: INTEGRATION_HOST, port: PORTS.toxiproxyElectrumxTcp, protocol: 'tcp' },
-  { id: 'f-proxy', host: INTEGRATION_HOST, port: PORTS.toxiproxyFulcrumTcp, protocol: 'tcp' },
+  { id: 'ex-proxy', ...lane.spec('electrumx', { via: 'proxy' }) },
+  { id: 'f-proxy', ...lane.spec('fulcrum', { via: 'proxy' }) },
 ];
 
 describe('integration: pool-state across total outage and recovery', () => {
@@ -39,8 +42,8 @@ describe('integration: pool-state across total outage and recovery', () => {
       await manager.start();
       expect(events.at(-1)?.status).toBe('online');
 
-      await toxic.disable('electrumx-tcp');
-      await toxic.disable('fulcrum-tcp');
+      await toxic.disable(EX_PROXY);
+      await toxic.disable(F_PROXY);
       await waitFor(() => events.at(-1)?.status === 'offline', {
         timeoutMs: 15_000,
         label: 'pool offline',
@@ -51,8 +54,8 @@ describe('integration: pool-state across total outage and recovery', () => {
       // reconnect + wire ping through the routing pipeline).
       const ensured = manager.ensureConnected({ timeoutMs: 30_000 });
 
-      await toxic.enable('electrumx-tcp');
-      await toxic.enable('fulcrum-tcp');
+      await toxic.enable(EX_PROXY);
+      await toxic.enable(F_PROXY);
       await ensured;
       await waitFor(() => events.at(-1)?.status === 'online', {
         timeoutMs: 30_000,

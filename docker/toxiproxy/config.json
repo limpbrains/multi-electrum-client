@@ -18,6 +18,24 @@
     "enabled": true
   },
   {
+    "name": "electrumx-ws",
+    "listen": "0.0.0.0:52003",
+    "upstream": "electrumx-default:50003",
+    "enabled": true
+  },
+  {
+    "name": "fulcrum-ws",
+    "listen": "0.0.0.0:52103",
+    "upstream": "fulcrum-default:50003",
+    "enabled": true
+  },
+  {
+    "name": "electrs-ws",
+    "listen": "0.0.0.0:52203",
+    "upstream": "electrs-default:50001",
+    "enabled": true
+  },
+  {
     "name": "electrumx-demo",
     "listen": "0.0.0.0:52011",
     "upstream": "electrumx-default:50001",

@@ -12,11 +12,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { ElectrumManager, failover, type ServerSpec } from '../../src/index.js';
 
-import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { lane } from './helpers/config.js';
 
 const SERVERS: ServerSpec[] = [
-  { id: 'fulcrum', host: INTEGRATION_HOST, port: PORTS.fulcrumTcp, protocol: 'tcp' },
-  { id: 'electrumx', host: INTEGRATION_HOST, port: PORTS.electrumxTcp, protocol: 'tcp' },
+  { id: 'fulcrum', ...lane.spec('fulcrum') },
+  { id: 'electrumx', ...lane.spec('electrumx') },
 ];
 
 // Comfortably above Fulcrum's 345-item cap.

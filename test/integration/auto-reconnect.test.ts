@@ -24,16 +24,14 @@ import {
   type ServerSpec,
 } from '../../src/index.js';
 
-import { INTEGRATION_HOST, PORTS } from './helpers/config.js';
+import { lane } from './helpers/config.js';
 import { electrumxKnowsHeight } from './helpers/electrumxPoll.js';
 import { getBlockCount, mineBlocks } from './helpers/regtestRpc.js';
 import * as toxic from './helpers/toxic.js';
 import { waitFor } from './helpers/wait.js';
 
-const PROXY = 'electrumx-tcp';
-const SERVERS: ServerSpec[] = [
-  { id: 'ex', host: INTEGRATION_HOST, port: PORTS.toxiproxyElectrumxTcp, protocol: 'tcp' },
-];
+const PROXY = lane.proxy('electrumx');
+const SERVERS: ServerSpec[] = [{ id: 'ex', ...lane.spec('electrumx', { via: 'proxy' }) }];
 
 describe('integration: auto-reconnect on transport fault', () => {
   beforeAll(async () => {
