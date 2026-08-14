@@ -11,6 +11,8 @@ interface FakeEnv extends SubscriptionEnv {
   setClientGone(id: string): void;
   /** Client ids handed to env.retireClient, in order. */
   retired: string[];
+  /** Test hook: runs synchronously inside retireClient. */
+  onRetire: (() => void) | undefined;
   /** Bump the session counter for `id` (simulates a reconnect). */
   bumpSession(id: string): void;
   /**
@@ -32,6 +34,7 @@ function fakeEnv(): FakeEnv {
   let pendingHold: {
     resolve: (status: unknown) => void;
     reject: (e: unknown) => void;
+    arm(real: { resolve: (v: unknown) => void; reject: (e: unknown) => void }): void;
   } | null = null;
 
   const env: FakeEnv = {
@@ -44,8 +47,10 @@ function fakeEnv(): FakeEnv {
         const hold = pendingHold;
         pendingHold = null;
         return new Promise<{ value: unknown; servedBy: string }>((resolve, reject) => {
-          hold.resolve = (status: unknown) => resolve({ value: status, servedBy });
-          hold.reject = reject;
+          hold.arm({
+            resolve: (status: unknown) => resolve({ value: status, servedBy }),
+            reject,
+          });
         });
       }
       const key = `${method} ${JSON.stringify(params)}`;
@@ -58,8 +63,10 @@ function fakeEnv(): FakeEnv {
       return connected;
     },
     retired: [],
+    onRetire: undefined,
     retireClient(id: string) {
       this.retired.push(id);
+      this.onRetire?.();
     },
     sessionSeq(id: string) {
       return sessionSeqs.get(id) ?? 0;
@@ -83,9 +90,31 @@ function fakeEnv(): FakeEnv {
       usable.delete(id);
     },
     holdNextCall() {
+      // Buffer an early settlement: the registry defers its wire call by
+      // one microtask (leader registration must be visible before any
+      // synchronous side effect), so a test may settle the hold before
+      // env.call arms the real resolvers.
+      let armed: { resolve: (v: unknown) => void; reject: (e: unknown) => void } | null = null;
+      let early: { kind: 'resolve' | 'reject'; value: unknown } | null = null;
       const handle = {
-        resolve: (_: unknown) => undefined,
-        reject: (_: unknown) => undefined,
+        resolve: (v: unknown) => {
+          if (armed) armed.resolve(v);
+          // First settlement wins, like a real promise — a later
+          // resolve must not overwrite a buffered reject (or vice
+          // versa).
+          else early ??= { kind: 'resolve', value: v };
+        },
+        reject: (e: unknown) => {
+          if (armed) armed.reject(e);
+          else early ??= { kind: 'reject', value: e };
+        },
+        arm(real: { resolve: (v: unknown) => void; reject: (e: unknown) => void }) {
+          armed = real;
+          if (early) {
+            if (early.kind === 'resolve') real.resolve(early.value);
+            else real.reject(early.value);
+          }
+        },
       };
       pendingHold = handle;
       return handle;
@@ -447,6 +476,9 @@ describe('SubscriptionRegistry — concurrency', () => {
 
     const handler = vi.fn();
     const subPromise = reg.subscribe('blockchain.scripthash.subscribe', ['H'], handler);
+    // Let the (microtask-deferred) wire call dispatch on A first — the
+    // scenario under test is a call already in flight when A dies.
+    await flushMicrotasks();
 
     // Disconnect the bound client while the subscribe wire call is pending.
     reg.clientDisconnected('A');
@@ -1248,6 +1280,115 @@ describe('SubscriptionRegistry — the unsubscribe barrier stays safe', () => {
     expect(env.callLog).toHaveLength(3);
     hold.resolve(true);
     await p;
+  });
+});
+
+describe('SubscriptionRegistry — unsubscribe is bound to the subscribing session', () => {
+  it('skips the wire unsubscribe when the bound session was replaced', async () => {
+    // The record remembers which SESSION its subscribe ran on. If that
+    // server dropped and reconnected, the fresh session never held the
+    // subscription — writing an unsubscribe there is spurious, and its
+    // ambiguous timeout would poison (and later retire) a healthy
+    // socket.
+    const env = fakeEnv();
+    env.setStatus('blockchain.scripthash.subscribe', ['H'], 'INIT');
+    const reg = new SubscriptionRegistry(env);
+    const unsub = await reg.subscribe('blockchain.scripthash.subscribe', ['H'], () => undefined);
+
+    // The socket drops and reconnects: same client id, new session.
+    reg.clientDisconnected('A');
+    env.bumpSession('A');
+    // (isClientConnected('A') is true again — the reconnect completed.)
+
+    const callsBefore = env.callLog.length;
+    await unsub();
+    expect(env.callLog).toHaveLength(callsBefore);
+    expect(env.retired).toEqual([]);
+  });
+});
+
+describe('SubscriptionRegistry — the leader always gets its own response', () => {
+  it('replays the initial status even when the serving client died mid-call', async () => {
+    // The status is not a stale snapshot — this very call fetched it.
+    // Parking the FIRST subscriber in awaitingBaseline because the
+    // socket dropped before the continuation ran means subscribe()
+    // resolves but the handler never fires until a rebind holds — in an
+    // offline single-server pool, never.
+    const env = fakeEnv();
+    const reg = new SubscriptionRegistry(env);
+    const seen: unknown[] = [];
+    const hold = env.holdNextCall();
+    const p = reg.subscribe('blockchain.scripthash.subscribe', ['H'], (s) => seen.push(s));
+    await flushMicrotasks();
+
+    // Server answers, then the socket drops before our continuation —
+    // and the pool is empty, so no rebind can deliver anything.
+    env.setClientGone('A');
+    env.setNoClient();
+    hold.resolve('S');
+    await p;
+    await flushMicrotasks();
+
+    expect(seen).toEqual(['S']);
+  });
+});
+
+describe('SubscriptionRegistry — coalesced joiners share the leader fallback', () => {
+  it('a joiner of the same wire call also gets the fetched status when the pool is empty', async () => {
+    // The joiner's status is exactly as fresh as the leader's — the
+    // same wire call fetched it. Settling only the leader left
+    // subscriber #2 parked in awaitingBaseline, silent until a
+    // reconnect that offline never brings.
+    const env = fakeEnv();
+    const reg = new SubscriptionRegistry(env);
+    const seenL: unknown[] = [];
+    const seenJ: unknown[] = [];
+    const hold = env.holdNextCall();
+    const p1 = reg.subscribe('blockchain.scripthash.subscribe', ['H'], (s) => seenL.push(s));
+    const p2 = reg.subscribe('blockchain.scripthash.subscribe', ['H'], (s) => seenJ.push(s));
+    await flushMicrotasks();
+
+    env.setClientGone('A');
+    env.setNoClient();
+    hold.resolve('S');
+    await Promise.all([p1, p2]);
+    await flushMicrotasks();
+
+    expect(seenL).toEqual(['S']);
+    expect(seenJ).toEqual(['S']);
+  });
+});
+
+describe('SubscriptionRegistry — leader dedup survives synchronous re-entry', () => {
+  it('a subscribe re-entered from inside retireClient joins the leader instead of forking', async () => {
+    // retireClient runs synchronously inside the leader's prefix; in
+    // the manager it fires 'client-state' synchronously, and a listener
+    // may subscribe the same key re-entrantly. If the leader has not
+    // yet registered itself in `pending`, the re-entrant call becomes a
+    // SECOND leader: two wire subscribes, and the loser throws a
+    // spurious 'registry cleared while subscribing'.
+    const env = fakeEnv();
+    env.setStatus('blockchain.scripthash.subscribe', ['H'], 'INIT');
+    const reg = new SubscriptionRegistry(env);
+    const unsub = await reg.subscribe('blockchain.scripthash.subscribe', ['H'], () => undefined);
+    const hold = env.holdNextCall();
+    await unsub();
+    hold.reject(new Error('request timed out'));
+    await flushMicrotasks();
+    // Key is poisoned; the next subscribe will retire the session.
+
+    let reentrant: Promise<unknown> | null = null;
+    env.onRetire = () => {
+      reentrant = reg.subscribe('blockchain.scripthash.subscribe', ['H'], () => undefined);
+    };
+    const callsBefore = env.callLog.length;
+    await reg.subscribe('blockchain.scripthash.subscribe', ['H'], () => undefined);
+    await expect(reentrant!).resolves.toBeDefined();
+    // One wire subscribe, shared by both callers.
+    const subs = env.callLog
+      .slice(callsBefore)
+      .filter((c) => c.method === 'blockchain.scripthash.subscribe');
+    expect(subs).toHaveLength(1);
   });
 });
 

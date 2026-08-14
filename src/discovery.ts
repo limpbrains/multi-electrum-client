@@ -175,6 +175,11 @@ export class PeerDiscoveryRunner {
     }
 
     if (cancelled()) return;
+    // The probed client itself may have LEFT THE POOL while the call
+    // was in flight (removeServer → forget() deletes its generation
+    // entry, which un-cancels a probe that captured generation 0) — a
+    // removed server's peer list must not keep admitting peers.
+    if (!this.deps.hasClient(clientId)) return;
     const candidates = response === undefined ? [] : parsePeerList(response);
     for (const cand of candidates) {
       // Pre-await dedup: skip peers already in the pool. The re-check
@@ -224,6 +229,27 @@ export class PeerDiscoveryRunner {
   }
 
   /** Cancel any pending re-poll timer for `clientId`. */
+  /**
+   * Drop all state for a client that left the pool for good. `cancelFor`
+   * only BUMPS the per-client generation (an in-flight probe must see
+   * the mismatch), which left one map entry per ever-seen client id —
+   * an unbounded slow leak under discovery-driven peer churn. Deleting
+   * is safe once the client is out of the pool: an in-flight probe that
+   * captured generation g >= 1 sees `?? 0 !== g` and cancels, and a
+   * probe that captured 0 is stopped by the `hasClient` guards.
+   */
+  forget(clientId: ClientId): void {
+    const t = this.timers.get(clientId);
+    if (t !== undefined) clearTimeout(t);
+    this.timers.delete(clientId);
+    this.clientGenerations.delete(clientId);
+  }
+
+  /** Diagnostic: number of client ids currently tracked. */
+  trackedClients(): number {
+    return this.clientGenerations.size;
+  }
+
   cancelFor(clientId: ClientId): void {
     // Also invalidates a probe already running for this client: its
     // source has gone away, so nothing it learned should still admit

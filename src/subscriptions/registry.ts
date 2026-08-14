@@ -181,6 +181,15 @@ interface SubscriptionRecord {
    * clears it.
    */
   baselineUncertain: boolean;
+  /**
+   * `env.sessionSeq(servedBy)` at the moment this record bound (initial
+   * subscribe or rebind). A wire unsubscribe is only valid against the
+   * SESSION that accepted the subscribe — the server reconnecting under
+   * the same client id starts a fresh session that never held it, and
+   * writing there is spurious cleanup whose ambiguous timeout would
+   * poison a healthy socket.
+   */
+  boundSessionSeq: number;
   /** Last status we delivered to handlers (for catch-up diff). */
   lastKnownStatus: unknown;
   /**
@@ -352,7 +361,16 @@ export class SubscriptionRegistry {
       if (joinedEpoch !== this.epoch || this.subs.get(key) !== shared) {
         throw new Error(`subscribe(${method}): registry cleared while subscribing`);
       }
-      return this.attach(shared, h);
+      const joined = this.attach(shared, h);
+      // The joiner's status is exactly as fresh as the leader's — the
+      // same wire call fetched it — so it shares the leader's
+      // empty-pool fallback: parked with no rebind even possible, it
+      // would otherwise stay silent until a reconnect that offline
+      // never brings.
+      if (shared.clientId === null && this.env.pickConnectedClient() === null) {
+        this.settleAwaitingWithOwnResponse(shared, h);
+      }
+      return joined;
     }
 
     const clientId = this.env.pickConnectedClient();
@@ -361,7 +379,23 @@ export class SubscriptionRegistry {
     }
 
     const epoch = this.epoch;
-    const inflightPromise = (async () => {
+    // The leader's registration in `pending` must be visible before ANY
+    // of its side effects run — `retireClient` fires 'client-state'
+    // synchronously, and a listener subscribing this same key
+    // re-entrantly must join this leader instead of forking a second
+    // wire subscribe. A deferred promise keeps the WIRE DISPATCH
+    // synchronous with the subscribe() call itself (a one-microtask
+    // delay let a same-tick suspend() win the race and reject a call
+    // that used to complete under the grace period).
+    let settleLeader!: {
+      resolve: (r: SubscriptionRecord) => void;
+      reject: (e: unknown) => void;
+    };
+    const inflightPromise = new Promise<SubscriptionRecord>((resolve, reject) => {
+      settleLeader = { resolve, reject };
+    });
+    this.pending.set(key, inflightPromise);
+    void (async () => {
       // Serialize behind a wire unsubscribe still in flight for this key
       // (see `pendingWireUnsubs`), and re-check the epoch afterwards:
       // clear() landing while we are parked here must not let a stray
@@ -404,6 +438,11 @@ export class SubscriptionRegistry {
         preferClient: clientId,
         stickyKey: key,
       });
+      // Session identity FIRST, before anything else can interleave:
+      // the response arrived on servedBy's session, and every microtask
+      // between the resolve and this line is a window in which a
+      // synchronously-reconnecting embedding can replace it.
+      const servedSessionSeq = this.env.sessionSeq(servedBy);
       if (epoch !== this.epoch) {
         // clear() ran while this was in flight — the registry this record
         // belonged to is gone.
@@ -424,14 +463,17 @@ export class SubscriptionRegistry {
         // below picks it up.
         clientId: this.env.isClientConnected(servedBy) ? servedBy : null,
         servedBy,
+        boundSessionSeq: servedSessionSeq,
         baselineUncertain: false,
         lastKnownStatus: status,
         hasStatus: true,
       };
       this.subs.set(key, record);
       return record;
-    })();
-    this.pending.set(key, inflightPromise);
+    })().then(
+      (r) => settleLeader.resolve(r),
+      (e: unknown) => settleLeader.reject(e),
+    );
     let record: SubscriptionRecord;
     try {
       record = await inflightPromise;
@@ -458,11 +500,39 @@ export class SubscriptionRegistry {
     // uncertainty mark instead (see `flushEarlyNotification`).
     this.flushEarlyNotification(record);
     // If we landed orphaned, kick off a rebind in the background so the
-    // record doesn't sit dead until the next state transition.
+    // record doesn't sit dead until the next state transition. When no
+    // rebind can even START (the pool is empty — mobile offline right
+    // after the answer), the LEADER must not be left silent: its status
+    // is not a snapshot of unknown age, this very call fetched it, and
+    // the documented contract promises the handler its initial status.
+    // With a rebind available the parked handler is settled by the
+    // binding that actually holds — fresher than an answer from a
+    // socket that already died.
     if (record.clientId === null) {
-      void this.rebindOnce(record);
+      if (this.env.pickConnectedClient() === null) {
+        this.settleAwaitingWithOwnResponse(record, h);
+      } else {
+        void this.rebindOnce(record);
+      }
     }
     return unsub;
+  }
+
+  /**
+   * Settle one handler's awaitingBaseline debt with the record's own
+   * just-fetched status. Used by the leader and its coalesced joiners
+   * when the record landed orphaned AND the pool is empty: the status
+   * is not a snapshot of unknown age — the wire call these subscribers
+   * share fetched it — and with no rebind even possible, parking would
+   * leave them silent until a reconnect that offline never brings.
+   */
+  private settleAwaitingWithOwnResponse(record: SubscriptionRecord, h: SubscriptionHandler): void {
+    if (!record.hasStatus) return;
+    const token = record.handlers.get(h);
+    if (token !== undefined && record.awaitingBaseline.has(h)) {
+      record.awaitingBaseline.delete(h);
+      this.invokeHandler(record, h, token, record.lastKnownStatus);
+    }
   }
 
   /**
@@ -772,7 +842,7 @@ export class SubscriptionRegistry {
       // consumer for the life of the connection. `wireUnsubscribe`
       // itself skips a client that is gone — then there is nobody left
       // to tell.
-      this.wireUnsubscribe(record.method, record.params, boundTo);
+      this.wireUnsubscribe(record.method, record.params, boundTo, record.boundSessionSeq);
     };
   }
 
@@ -786,15 +856,24 @@ export class SubscriptionRegistry {
    * `retry: 'none'`) — that exact connection or nobody; routing it via
    * policy.pick would land at a server that has no such subscription.
    */
-  private wireUnsubscribe(method: string, params: readonly unknown[], clientId: ClientId): void {
+  private wireUnsubscribe(
+    method: string,
+    params: readonly unknown[],
+    clientId: ClientId,
+    bindSeq: number,
+  ): void {
     const unsubMethod = UNSUB_METHOD[method];
     if (!unsubMethod) return;
+    // Valid only against the session that accepted the subscribe: a
+    // reconnected client (same id, new session) never held it, and a
+    // spurious unsubscribe there could time out ambiguously and poison
+    // a healthy socket.
     if (!this.env.isClientConnected(clientId)) return;
+    if (this.env.sessionSeq(clientId) !== bindSeq) return;
     const key = canonicalKey(method, params);
     // Chain behind any unsubscribe already in flight for this key so the
     // barrier a replacement subscribe awaits covers every one of them.
     const prior = this.pendingWireUnsubs.get(key);
-    const sessionAtEntry = this.env.sessionSeq(clientId);
     const task = (async () => {
       if (prior) await prior;
       // The chain can outlive a session (the client recycles while the
@@ -805,13 +884,10 @@ export class SubscriptionRegistry {
       // would poison, and later retire, a healthy socket. Re-checked
       // here, after the wait and immediately before dispatch; past this
       // point the seq is the session we are writing to.
-      if (
-        !this.env.isClientConnected(clientId) ||
-        this.env.sessionSeq(clientId) !== sessionAtEntry
-      ) {
+      if (!this.env.isClientConnected(clientId) || this.env.sessionSeq(clientId) !== bindSeq) {
         return;
       }
-      const sessionAtSend = sessionAtEntry;
+
       try {
         // A rejection here must also never poison the barrier a
         // replacement subscribe awaits. try/catch rather than .catch():
@@ -856,7 +932,7 @@ export class SubscriptionRegistry {
           !(e instanceof RpcError) &&
           !(e instanceof SuspendedError) &&
           this.env.isClientConnected(clientId) &&
-          this.env.sessionSeq(clientId) === sessionAtSend
+          this.env.sessionSeq(clientId) === bindSeq
         ) {
           this.poisonedSessions.set(key, clientId);
         }
@@ -947,12 +1023,17 @@ export class SubscriptionRegistry {
     }
     let status: unknown;
     let servedBy: ClientId;
+    let servedSessionSeq: number;
     this.earlyNotifications.delete(record.key);
     try {
       ({ value: status, servedBy } = await this.env.call(record.method, record.params, {
         preferClient: clientId,
         stickyKey: record.key,
       }));
+      // Session identity FIRST — same reasoning as the initial bind:
+      // this rebind's subscription lives on the session that answered,
+      // and any later sampling can observe a replacement session.
+      servedSessionSeq = this.env.sessionSeq(servedBy);
     } catch {
       // Rebind failed (e.g. server doesn't support the method, or the
       // request timed out on a bad link). Leave orphaned — rebindOnce's
@@ -979,27 +1060,25 @@ export class SubscriptionRegistry {
       // would cancel ITS subscription and the server would stop pushing
       // to a live subscriber.
       const successor = this.subs.get(record.key);
-      // `servedBy`, not just the binding: a successor that answered on
-      // this same server but failed to bind (it was banned at the time)
-      // still owns a live subscription there, and unsubscribing would
-      // silence it.
-      const successorOwnsIt =
-        successor !== undefined &&
-        (successor.clientId === servedBy || successor.servedBy === servedBy);
-      // Deliberately conservative: with a successor record present or a
-      // subscribe still in flight, ownership of this server's
-      // subscription cannot be decided — the successor may yet land (or
+      // Deliberately conservative: with ANY successor record present —
+      // whichever server it points at, because it may yet land (or
       // later rebind) exactly here, and any deferred re-check acts on a
       // snapshot the next transition can invalidate; one such deferred
       // cleanup was observed unsubscribing the very server a successor
-      // had just rebound to. So the unsubscribe is sent only when NOBODY
-      // could own it. The cost of restraint is a subscription the server
-      // pushes into the void until that connection closes — bounded and
-      // self-healing; the cost of a wrong unsubscribe is a live
-      // subscription silently killed, which for a wallet is missed
-      // transactions with nothing to correct them.
-      if (!successorOwnsIt && successor === undefined && !this.pending.has(record.key)) {
-        this.wireUnsubscribe(record.method, record.params, servedBy);
+      // had just rebound to — or a subscribe still in flight, ownership
+      // of this server's subscription cannot be decided, and the
+      // unsubscribe is sent only when NOBODY could own it. The cost of
+      // restraint is a subscription the server pushes into the void
+      // until that connection closes — bounded and self-healing; the
+      // cost of a wrong unsubscribe is a live subscription silently
+      // killed, which for a wallet is missed transactions with nothing
+      // to correct them.
+      if (successor === undefined && !this.pending.has(record.key)) {
+        // Bind-time seq, captured right after the response: passing the
+        // CURRENT seq made wireUnsubscribe's session guard a tautology,
+        // and a servedBy that recycled while this continuation was
+        // queued received spurious cleanup on a fresh session.
+        this.wireUnsubscribe(record.method, record.params, servedBy, servedSessionSeq);
       }
       return;
     }
@@ -1007,6 +1086,7 @@ export class SubscriptionRegistry {
     // while the call was in flight, stay orphaned for the next round.
     record.clientId = this.env.isClientConnected(servedBy) ? servedBy : null;
     record.servedBy = servedBy;
+    record.boundSessionSeq = servedSessionSeq;
     const hadStatus = record.hasStatus;
     const baseline = record.lastKnownStatus;
     const wasUncertain = record.baselineUncertain;

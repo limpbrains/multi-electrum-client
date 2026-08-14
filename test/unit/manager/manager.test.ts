@@ -2,6 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { describe, expect, it } from 'vitest';
 
+import { NoClientAvailableError } from '../../../src/errors/types.js';
 import { ElectrumManager } from '../../../src/manager.js';
 import { failover, preferFastest, roundRobin } from '../../../src/policy/builtins.js';
 import type { PickContext } from '../../../src/policy/types.js';
@@ -528,6 +529,22 @@ describe('ElectrumManager — per-server transport options', () => {
     );
     await p;
     await manager.stop();
+  });
+
+  it('a batched call on a never-started manager gets the same error class as unbatched', async () => {
+    // SuspendedError says "wait for resume()" — but resume() on a
+    // created manager throws; start() is the remedy, and the unbatched
+    // path already says NoClientAvailableError. The error class must
+    // not depend on the autoBatch flag.
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [{ id: 'a', host: 'a', port: 50001, protocol: 'ws' }],
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: true,
+    });
+    await expect(manager.call('server.ping', [])).rejects.toThrow(NoClientAvailableError);
   });
 
   it('pinStrict without retry none is rejected up front', async () => {

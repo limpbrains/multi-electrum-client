@@ -271,3 +271,20 @@ describe('LineFramer — protocol envelope', () => {
     }
   });
 });
+describe('LineFramer — overflow diagnostics', () => {
+  it('reports the real line length, not the post-reset remainder', () => {
+    // The error message is an operator's only lead when tuning
+    // maxLineLength from logs; reading pendingLen after reset() zeroed
+    // it reported just the final chunk's size — self-contradictory
+    // ("line of 1024 chars exceeds maxLineLength (16)").
+    const f = new LineFramer(22);
+    f.push('x'.repeat(10));
+    f.push('y'.repeat(10));
+    try {
+      f.push('zzzzz\n');
+      expect.unreachable('must throw');
+    } catch (e) {
+      expect(String(e)).toMatch(/line of 25 chars/);
+    }
+  });
+});

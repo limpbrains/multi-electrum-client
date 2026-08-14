@@ -50,7 +50,14 @@ export type { ManagerOptions, BatchRequest } from './protocol/types.js';
 
 interface ClientMeta {
   bannedUntil: number | undefined;
-  /** Bumped on every `connected` transition; see SubscriptionEnv.sessionSeq. */
+  /**
+   * Identity of the CURRENT session: assigned from the manager's global
+   * monotonic counter on every `connected` transition (never reset —
+   * per-client counters restarted at 0 across removeServer/addServer,
+   * so a re-added server's fresh session could collide with a
+   * boundSessionSeq recorded under the old incarnation). See
+   * SubscriptionEnv.sessionSeq.
+   */
   sessionSeq: number;
   capabilities: { serverSoftware?: string; protocolVersion?: string };
   telemetry: TelemetryAccumulator;
@@ -375,6 +382,8 @@ export class ElectrumManager {
   private tipInstallTask: Promise<void> | null = null;
   /** A trigger landed while the task was in flight — retry once it fails. */
   private tipRetryQueued = false;
+  /** Global monotonic session counter; see `ClientMeta.sessionSeq`. */
+  private sessionCounter = 0;
   /** Timer armed for the earliest future `bannedUntil` (see `armBanExpiryTimer`). */
   private banExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1327,6 +1336,10 @@ export class ElectrumManager {
     }
     this.clients.delete(id);
     this.meta.delete(id);
+    // The client is gone for good — drop discovery's per-client state
+    // too, or churn through discovered peers grows its generation map
+    // one entry per ever-seen id, forever.
+    this.discovery?.forget(id);
     this.maybeEmitPoolState();
   }
 
@@ -1703,13 +1716,20 @@ export class ElectrumManager {
       this.emit('error', e);
     });
     client.onStateChange((state) => {
+      if (state === 'connected') {
+        // Session identity FIRST, before any listener can observe the
+        // transition: every `connected` is a NEW session, and a
+        // 'client-state' listener acting synchronously (unsubscribing,
+        // subscribing) must capture the new seq, not the dead
+        // session's — a stray unsubscribe tagged with the stale seq
+        // would go untracked by the poison machinery. Assigned from the
+        // GLOBAL counter so no two sessions ever share a seq, even
+        // across removeServer/addServer recreating the meta entry.
+        const meta = this.meta.get(spec.id);
+        if (meta) meta.sessionSeq = ++this.sessionCounter;
+      }
       this.emit('client-state', { clientId: spec.id, state });
       if (state === 'connected') {
-        // Session identity first, unconditionally: every `connected` is
-        // a NEW session, and continuations that captured the previous
-        // seq must see the difference even mid-teardown.
-        const meta = this.meta.get(spec.id);
-        if (meta) meta.sessionSeq++;
         // A socket that finishes connecting while stop()/suspend() is
         // draining must not pull the manager back to life: a handshake,
         // a discovery probe and a subscription restore are all new wire
@@ -1737,7 +1757,15 @@ export class ElectrumManager {
         // when there is no cache or the subscription is already live.
         // Only while `running`: `resume()` installs its own, and racing
         // it here would register a second tip handler on the same record.
-        if (this.lifecycle === 'running') void this.installTipSubscription();
+        // 'resuming' counts too: the resume-time reconnect wave lands
+        // before the lifecycle flips to 'running', and discarding its
+        // triggers left one transient failure of runResume's own
+        // install with no retry — cache writes silently disabled for
+        // the session. Double-handler is already prevented by the
+        // tipUnsub early-return and the single-flight install task.
+        if (this.lifecycle === 'running' || this.lifecycle === 'resuming') {
+          void this.installTipSubscription();
+        }
         // Kick off a peer-discovery probe on this fresh connection.
         // `runFor` self-no-ops when discovery is disabled; we don't
         // gate at the call site so the runner stays the single source
@@ -2438,9 +2466,16 @@ export class ElectrumManager {
     // not flipped `lifecycle` yet (its task is queued behind whatever
     // transition is running), and this flush would sail straight past a
     // check that only looked at the flag.
+    // 'created' is excluded: a never-started manager is not tearing
+    // down, and SuspendedError's documented remedy — resume() — throws
+    // there. Falling through to routing yields the same
+    // NoClientAvailableError the unbatched path gives, so the error
+    // class does not depend on the autoBatch flag.
     const teardown =
       this.teardownIntent() ??
-      (this.lifecycle !== 'running' ? `manager is ${this.lifecycle}` : null);
+      (this.lifecycle !== 'running' && this.lifecycle !== 'created'
+        ? `manager is ${this.lifecycle}`
+        : null);
     if (teardown !== null) {
       const e = new SuspendedError(`${teardown} before the batch was dispatched`);
       for (const item of items) item.def.reject(e);
