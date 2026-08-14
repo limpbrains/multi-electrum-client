@@ -311,6 +311,34 @@ describe('TcpTransport', () => {
     ).toThrow(TransportError);
   });
 
+  it('a socket whose destroy() synchronously re-emits error cannot recurse the teardown', async () => {
+    // Injected sockets (the reason TcpSocketLike exists) may emit
+    // 'error' synchronously from destroy(). The pre-open error handler
+    // destroys the socket — without a settled guard that is handler →
+    // destroy → 'error' → handler → … until the stack overflows. The
+    // WS transport guards this exact class; TCP must too.
+    const { EventEmitter } = await import('node:events');
+    const ee = new EventEmitter();
+    const sock = {
+      on: ee.on.bind(ee),
+      once: ee.once.bind(ee),
+      emit: ee.emit.bind(ee),
+      setEncoding: () => sock,
+      write: () => true,
+      end: () => undefined,
+      destroy: () => {
+        ee.emit('error', new Error('destroy failed'));
+      },
+    };
+    const t = new TcpTransport({
+      endpoint: { host: 'h', port: 1, protocol: 'tcp' },
+      connect: () => sock as unknown as TcpSocketLike,
+    });
+    const p = t.connect();
+    ee.emit('error', new Error('boom'));
+    await expect(p).rejects.toThrow();
+  });
+
   it('emits an error and closes when a peer streams past the line-length cap', async () => {
     const { EventEmitter } = await import('node:events');
     const ee = new EventEmitter();

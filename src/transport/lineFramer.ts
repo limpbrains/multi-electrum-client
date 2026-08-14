@@ -150,9 +150,13 @@ export class LineFramer {
       // just to be rejected. `- 1` leaves room for a trailing CR, which
       // belongs to the delimiter rather than the line.
       if (this.pendingLen + (nl - start) - 1 > this.maxLineLength) {
+        // Capture BEFORE reset() zeroes pendingLen — the message is an
+        // operator's only lead when tuning the cap from logs, and the
+        // post-reset value reported just the final chunk's size.
+        const lineLen = this.pendingLen + (nl - start);
         this.reset();
         throw new LineTooLongError(
-          `line of ${this.pendingLen + (nl - start)} chars exceeds maxLineLength (${this.maxLineLength})`,
+          `line of ${lineLen} chars exceeds maxLineLength (${this.maxLineLength})`,
         );
       }
       const line = this.takeLine(chunk.slice(start, nl));

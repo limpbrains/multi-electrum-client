@@ -201,6 +201,37 @@ describe('Manager subscriptions — failover binding', () => {
   });
 });
 
+describe('Manager subscriptions — same-tick suspend does not kill a subscribe', () => {
+  it('a subscribe issued in the same turn as suspend() dispatches under the grace', async () => {
+    // The wire subscribe must leave in the same synchronous turn as the
+    // subscribe() call: a one-microtask dispatch delay let a suspend()
+    // issued right after it win the race, rejecting the call and
+    // silently unwatching the address after resume().
+    const h = buildHarness();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: [{ id: 'a', host: 'a', port: 50001, protocol: 'ws' }],
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+    });
+    await manager.start();
+
+    const handler = vi.fn();
+    const subPromise = manager.scripthash.subscribe('HASH', handler);
+    const suspend = manager.suspend({ graceMs: 1000 });
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'blockchain.scripthash.subscribe' ? { id: req.id, result: 'S1' } : undefined,
+    );
+    const unsub = await subPromise;
+    expect(handler).toHaveBeenCalledWith('S1');
+    await suspend;
+    await manager.stop();
+    void unsub;
+  });
+});
+
 describe('Manager subscriptions — ban vs socket ownership', () => {
   it('binds to the answering server even when a ban landed while the response was in flight', async () => {
     // A ban gates ROUTING of new calls; it does not disconnect the

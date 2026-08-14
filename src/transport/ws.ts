@@ -18,6 +18,7 @@ import { TransportError } from '../errors/types.js';
 import { registerTransport } from './factory.js';
 import { setUnrefTimeout } from '../util/timers.js';
 import { TransportLifecycle } from './lifecycle.js';
+import { ListenerSet } from '../util/listeners.js';
 import {
   assertMaxLineLength,
   DEFAULT_MAX_LINE_LENGTH,
@@ -62,7 +63,7 @@ export interface WsTransportOpts {
 export class WsTransport implements Transport {
   readonly endpoint: Endpoint;
   private ws: WebSocket | null = null;
-  private readonly listeners = new Set<TransportListener>();
+  private readonly listeners = new ListenerSet<TransportEvent>();
   private readonly Ctor: WebSocketCtor;
   private readonly connectTimeoutMs: number;
   /**
@@ -643,26 +644,14 @@ export class WsTransport implements Transport {
   }
 
   on(listener: TransportListener): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
+    return this.listeners.add(listener);
   }
 
   private emit(ev: TransportEvent): void {
-    // Snapshot: a Set iterator revisits an entry removed and re-added
-    // while it runs, so a listener that unsubscribes and resubscribes
-    // itself from inside its own callback was called again, forever.
-    for (const l of [...this.listeners]) {
-      try {
-        l(ev);
-      } catch {
-        // A consumer callback must not break the transport: swallowing
-        // here keeps the remaining listeners (and the socket's own
-        // teardown) running. Listener bugs surface through the
-        // manager's `error` event, which wraps its own callbacks.
-      }
-    }
+    // Revisit safety, throwing-listener isolation and copy-on-write
+    // snapshots all live in ListenerSet — shared with the other
+    // transport so the next emitter cannot fork the semantics.
+    this.listeners.emit(ev);
   }
 }
 

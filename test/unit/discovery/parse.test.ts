@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { parsePeerEntry, parsePeerList } from '../../../src/discovery.js';
+import { PeerDiscoveryRunner, parsePeerEntry, parsePeerList } from '../../../src/discovery.js';
 
 describe('parsePeerEntry', () => {
   it('extracts ws:port and wss:port features', () => {
@@ -60,5 +60,58 @@ describe('parsePeerList', () => {
     expect(parsePeerList(null)).toEqual([]);
     expect(parsePeerList('something')).toEqual([]);
     expect(parsePeerList({})).toEqual([]);
+  });
+});
+describe('PeerDiscoveryRunner — per-client state lifecycle', () => {
+  it('a probe whose client left the pool mid-flight admits nothing', async () => {
+    // removeServer → forget() deletes the generation entry, which
+    // un-cancels a probe that captured generation 0 — the explicit
+    // hasClient(self) check after the call is what stops a removed
+    // server's peer list from still being admitted.
+    let inPool = true;
+    const added: string[] = [];
+    let release!: (v: unknown) => void;
+    const runner = new PeerDiscoveryRunner(
+      { enabled: true },
+      {
+        call: () => new Promise((r) => (release = r)),
+        hasClient: (id) => (id === 'src' ? inPool : false),
+        addServer: (spec) => {
+          added.push(spec.id);
+        },
+        isStopped: () => false,
+        onError: () => undefined,
+      },
+    );
+    const run = runner.runFor('src');
+    // The server is removed while its probe is in flight.
+    inPool = false;
+    runner.forget('src');
+    release([['peer.example.com', '1.1.1.1', ['v1.4', 'ws:50001']]]);
+    await run;
+    expect(added).toEqual([]);
+  });
+
+  it('forget() drops the tracked entry cancelFor() leaves behind', () => {
+    const runner = new PeerDiscoveryRunner(
+      { enabled: true },
+      {
+        call: () => Promise.resolve([]),
+        hasClient: () => false,
+        addServer: () => undefined,
+        isStopped: () => false,
+        onError: () => undefined,
+      },
+    );
+    // cancelFor only bumps (an in-flight probe must observe the
+    // mismatch) — under discovery-driven churn that left one entry per
+    // ever-seen client id, forever.
+    runner.cancelFor('peer-1');
+    runner.cancelFor('peer-2');
+    expect(runner.trackedClients()).toBe(2);
+    runner.forget('peer-1');
+    expect(runner.trackedClients()).toBe(1);
+    runner.forget('peer-2');
+    expect(runner.trackedClients()).toBe(0);
   });
 });

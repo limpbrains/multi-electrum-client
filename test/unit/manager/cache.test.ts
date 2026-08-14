@@ -280,3 +280,60 @@ describe('Manager cache — tip install retry', () => {
     await manager.stop();
   });
 });
+describe('Manager cache — tip install across resume', () => {
+  it('a transient tip failure during resume still retries — cache writes are not lost for the session', async () => {
+    // The reconnect wave completes while lifecycle is 'resuming', so
+    // its 'connected' transitions must still count as tip-install
+    // triggers: with them discarded, one transient failure of the
+    // resume-time install left tipHeight undefined — and every
+    // finalized cache write silently disabled — until an unrelated
+    // disconnect.
+    const h = buildHarness();
+    const cache = new MemoryCache();
+    const manager = new ElectrumManager({
+      network: 'regtest',
+      servers: SERVERS,
+      policy: failover(['a']),
+      transportFactory: h.factory,
+      autoBatch: false,
+      cache,
+      finalizedConfs: 6,
+    });
+    await startWithTip(h, manager, 100);
+    await manager.suspend({ graceMs: 0 });
+
+    let subAttempts = 0;
+    const resume = manager.resume();
+    for (let i = 0; i < 40 && subAttempts === 0; i++) {
+      await delay(5);
+      h.reply('a', (req: { id: number; method: string }) => {
+        if (req.method !== 'blockchain.headers.subscribe') return undefined;
+        subAttempts++;
+        return { id: req.id, error: { code: -32601, message: 'unknown method' } };
+      });
+    }
+    for (let i = 0; i < 40 && subAttempts < 2; i++) {
+      await delay(5);
+      h.reply('a', (req: { id: number; method: string }) => {
+        if (req.method !== 'blockchain.headers.subscribe') return undefined;
+        subAttempts++;
+        return { id: req.id, result: { height: 200, hex: '00' } };
+      });
+    }
+    await resume;
+    await delay(0);
+    expect(subAttempts).toBeGreaterThanOrEqual(2);
+
+    // Tip took: finalized writes work.
+    const p = manager.call('blockchain.block.header', [50]);
+    await delay(0);
+    h.reply('a', (req: { id: number; method: string }) =>
+      req.method === 'blockchain.block.header' ? { id: req.id, result: 'H' } : undefined,
+    );
+    expect(await p).toBe('H');
+    await delay(0);
+    expect(await cache.get('et:regtest:v1:hdr:32')).toBe('"H"');
+
+    await manager.stop();
+  });
+});

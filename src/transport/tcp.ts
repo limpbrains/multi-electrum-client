@@ -34,6 +34,7 @@ import type { Endpoint } from '../client.js';
 import { TransportError } from '../errors/types.js';
 import { registerTransport } from './factory.js';
 import { TransportLifecycle } from './lifecycle.js';
+import { ListenerSet } from '../util/listeners.js';
 import { assertMaxLineLength, LineFramer } from './lineFramer.js';
 import type { Transport, TransportEvent, TransportListener } from './types.js';
 import { Utf8Stream } from './utf8.js';
@@ -99,7 +100,7 @@ interface InternalOpts extends TcpTransportOpts {
 export class TcpTransport implements Transport {
   readonly endpoint: Endpoint;
   private socket: TcpSocketLike | null = null;
-  private readonly listeners = new Set<TransportListener>();
+  private readonly listeners = new ListenerSet<TransportEvent>();
   /**
    * Serializes connect / close and stamps each attempt with a generation
    * so a superseded socket's handlers go inert. See ./lifecycle.ts.
@@ -315,8 +316,28 @@ export class TcpTransport implements Transport {
     let connected = false;
     try {
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
+        // One settlement per attempt, re-entrancy-proof: an injected
+        // socket (the RN / custom `socketFactory` case) may emit
+        // 'error' SYNCHRONOUSLY from destroy(), and without this guard
+        // the pre-open error handler recursed — handler → destroy() →
+        // 'error' → handler — until the stack overflowed. The WS
+        // transport guards the same class with its `settled` flag.
+        let settled = false;
+        /**
+         * One settlement per attempt: returns false when another path
+         * already settled (re-entrancy included — an injected socket
+         * can emit 'error' synchronously from destroy()), else claims
+         * the settlement and clears the shared timer/abort hooks.
+         */
+        const claimSettle = (): boolean => {
+          if (settled) return false;
+          settled = true;
           this.lifecycle.setAbort(gen, null);
+          clearTimeout(timer);
+          return true;
+        };
+        const timer = setTimeout(() => {
+          if (!claimSettle()) return;
           // Retire BEFORE destroying, for the same reason the connect-error
           // path does: `destroy()` on an injected socket can synchronously
           // flush buffered `data`, which would otherwise still find this
@@ -332,8 +353,7 @@ export class TcpTransport implements Transport {
           reject(terminal);
         }, this.connectTimeoutMs);
         this.lifecycle.setAbort(gen, () => {
-          this.lifecycle.setAbort(gen, null);
-          clearTimeout(timer);
+          if (!claimSettle()) return;
           reject(new TransportError('closed during connect'));
           try {
             socket.destroy();
@@ -342,20 +362,17 @@ export class TcpTransport implements Transport {
           }
         });
         failAttempt = (e: TransportError) => {
-          this.lifecycle.setAbort(gen, null);
-          clearTimeout(timer);
+          if (!claimSettle()) return;
           reject(e);
         };
         socket.on(this.readyEvent, () => {
-          this.lifecycle.setAbort(gen, null);
-          clearTimeout(timer);
+          if (!claimSettle()) return;
           connected = true;
           resolve();
         });
         socket.on('error', (err) => {
           if (!connected) {
-            this.lifecycle.setAbort(gen, null);
-            clearTimeout(timer);
+            if (!claimSettle()) return;
             // Retire and destroy HERE, not in the catch that follows the
             // rejection: `reject` only schedules, while an injected
             // socket (the RN / custom `socketFactory` case this type
@@ -459,26 +476,14 @@ export class TcpTransport implements Transport {
   }
 
   on(listener: TransportListener): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
+    return this.listeners.add(listener);
   }
 
   private emit(ev: TransportEvent): void {
-    // Snapshot: a Set iterator revisits an entry removed and re-added
-    // while it runs, so a listener that unsubscribes and resubscribes
-    // itself from inside its own callback was called again, forever.
-    for (const l of [...this.listeners]) {
-      try {
-        l(ev);
-      } catch {
-        // A consumer callback must not break the transport: swallowing
-        // here keeps the remaining listeners (and the socket's own
-        // teardown) running. Listener bugs surface through the
-        // manager's `error` event, which wraps its own callbacks.
-      }
-    }
+    // Revisit safety, throwing-listener isolation and copy-on-write
+    // snapshots all live in ListenerSet — shared with the other
+    // transport so the next emitter cannot fork the semantics.
+    this.listeners.emit(ev);
   }
 }
 
